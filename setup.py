@@ -35,7 +35,7 @@ setuptools.setup(
     description="SPAE: Stellar Parameters, Abundances, and Errors",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/simon-schueler/SPAE",
+    url="https://github.com/simon-schuler/SPAE",
     packages=setuptools.find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",
