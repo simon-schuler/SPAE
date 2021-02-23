@@ -3,7 +3,7 @@ import emcee
 import time
 from .abunds import abunds_func, obj_func
 
-def run_spae(x_0=(5777,4.44,0.01,1.38), n_dim=4, n_walkers=40, n_steps=1000):
+def run_spae(sun_el,sun_abs,x_0=(5777,4.44,0.01,1.38), n_dim=4, n_walkers=40, n_steps=1000):
 
 	t_0 = time.time()
 

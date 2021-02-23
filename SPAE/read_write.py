@@ -39,6 +39,35 @@ def param_file(linelist,atmosphere=0,molecules=1,lines=0,flux=0,damp=0,plot=0,un
         file.write('units          ' + str(units) + '\n')
 
 
+#Function for creating the solar and stellar linelists
+def linelist_create(star_in, sun_in, direc_path):
+    
+    with open(direc_path + '/linelist_star.txt', 'w') as out_star: 
+        with open(direc_path + '/linelist_sun.txt', 'w') as out_sun: 
+            with open(star_in) as file_star: 
+                with open(sun_in) as file_sun: 
+                    
+                    line_star = file_star.readline()
+                    out_star.write(line_star) #accounts for comment line in linelist files
+                    
+                    line_sun = file_sun.readline()
+                    out_sun.write(line_sun) #accounts for comment line in linelist files
+                    
+                    line = file_star.readlines()
+                    line_s = file_sun.readlines()
+                    
+                    for line_star in line:
+                        line_star_split = line_star.split()
+                        #if len(line_star_split) < 2: continue
+                        for line_sun in line_s:
+                            line_sun_split = line_sun.split()
+                            #if len(line_sun_split) < 2: continue
+                            if line_star_split[0] == line_sun_split[0] and line_star_split[1] == line_sun_split[1]:
+                                out_star.write(line_star)
+                                out_sun.write(line_sun)
+                                continue
+
+
 #Reads Moog output files, parsing elements and colums
 def read_file(filename):
     count = 0

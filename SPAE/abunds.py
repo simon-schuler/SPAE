@@ -1,7 +1,10 @@
 #Functions to derive absolute abundances with MOOGSILENT and abundances relateive to the Sun ([x/H])
 
+from scipy.stats import linregress
 import numpy as np
 import os
+
+from .read_write import read_file
 
 #Function to derive abundances
 def abunds_func(x):
@@ -49,13 +52,13 @@ def rel_abs(el_found,abundances,sun_el,sun_abs,el):
     sun_abunds = sun_abs[j]
     
 
-    for line in star_abunds:
-        wave_dif = np.abs(line['wavelength'] - sun_abunds['wavelength'])
-        idx = np.argmin(wave_dif)
-        
-        if wave_dif[idx] < 0.2:
+    for k, line in enumerate(star_abunds):
+        if line['wavelength'] - sun_abunds[k]['wavelength'] == 0:
             rel_abunds = np.append(rel_abunds, line)
-            rel_abunds[-1]['abund'] -= sun_abunds['abund'][idx]
+            rel_abunds[-1]['abund'] -= sun_abunds[k]['abund']
+        else:
+            print('Stellar and solar linelists do not match at wavelength ' + str(sun_abunds[k]['wavelength']) + '!')
+
             
     return rel_abunds
 
