@@ -1,10 +1,12 @@
-#Functions to derive absolute abundances with MOOGSILENT and abundances relateive to the Sun ([x/H])
+#Functions to derive absolute abundances with MOOGSILENT and abundances relative to the Sun ([x/H])
 
 from scipy.stats import linregress
 import numpy as np
 import os
 
 from .read_write import read_file
+import .mspawn as mspawn
+
 
 #Function to derive abundances
 def abunds_func(x):
@@ -23,7 +25,13 @@ def abunds_func(x):
     model = model + ' -v%.2f' % micro
 
     #will want to have path to MOOGSILENT to be a user input
-    os.system(model)
+    # Old version - use system calls
+    # os.system(model)
+    # New version - use mspawn python version
+    output = mspawn.mspawn(teff, logg, feh)
+    mspawn.print_output(output, "star.mod", teff, logg, feh, vt)
+
+    # Call moog
     os.system('/usr/local/moognov2019silent/MOOGSILENT') #helium
     el_found, abundances = read_file("moog_out.2")
 
