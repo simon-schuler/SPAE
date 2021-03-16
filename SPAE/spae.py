@@ -3,7 +3,7 @@ import emcee
 import time
 from .abunds import abunds_func, obj_func
 
-def run_spae(sun_el,sun_abs,x_0=(5777,4.44,0.01,1.38), n_dim=4, n_walkers=40, n_steps=1000):
+def run_spae(sun_el=None,sun_abs=None,x_0=(5777,4.44,0.01,1.38), n_dim=4, n_walkers=40, n_steps=1000):
 
 	t_0 = time.time()
 
@@ -22,8 +22,8 @@ def run_spae(sun_el,sun_abs,x_0=(5777,4.44,0.01,1.38), n_dim=4, n_walkers=40, n_
 
 	flat_blob = sampler.get_blobs().reshape((n_walkers*n_steps))
 
-	print('Runtime:', time.time() - t_0)
-	print('Size of Full Array:', len(flat_blob))
-	print('Acceptance Fractions:', sampler.acceptance_fraction)
+	log = 'Runtime: ' + str(time.time() - t_0) + '\n'
+	log = log + 'Size of Full Array: ' + str(len(flat_blob)) + '\n'
+	log = log + 'Acceptance Fractions:' + np.array_str(sampler.acceptance_fraction) + '\n'
 
-	return results, flat_blob
+	return sampler, flat_blob, log

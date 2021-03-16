@@ -102,22 +102,22 @@ def obj_func(x,n_elems,sun_el=None,sun_abs=None):
         abunds_fe2 = rel_abs(el_found,abundances,sun_el,sun_abs,'Fe II ')
         fe_mean = feh
 
-    fe_std = np.std(np.append(abunds_fe1['abund'], abunds_fe2['abund]']))
+    fe_std = np.std(np.append(abunds_fe1['abund'], abunds_fe2['abund']))
 
     ep_slope, ep_intercept, ep_r, ep_p, ep_stderr = linregress(abunds_fe1['EP'], abunds_fe1['abund'])
     rew_slope, rew_intercept, rew_r, rew_p, rew_stderr = linregress(abunds_fe1['logRWin'], abunds_fe1['abund'])
 
-    fe1_likely = np.sum(-(abunds_fe1['abund'] - feh_mean)**2 / (2*fe_std**2)) - np.log(fe_std) * len(abunds_fe1['abund'])
-    fe2_likely = np.sum(-(abunds_fe2['abund'] - feh_mean)**2 / (2*fe_std**2)) - np.log(fe_std) * len(abunds_fe2['abund'])
+    fe1_likely = np.sum(-(abunds_fe1['abund'] - fe_mean)**2 / (2*fe_std**2)) - np.log(fe_std) * len(abunds_fe1['abund'])
+    fe2_likely = np.sum(-(abunds_fe2['abund'] - fe_mean)**2 / (2*fe_std**2)) - np.log(fe_std) * len(abunds_fe2['abund'])
 
     params_obj = tuple((fe1_likely + fe2_likely, ep_r, rew_r))
 
     # Cycle through other lines to get their mean an std
     for i, el in enumerate(el_found):
         if sun_el is None or sun_abs is None:
-            abunds_element = rel_abs(el_found,abundances,sun_el,sun_abs,el)
-        else:
             abunds_element = abundances[i]
+        else:
+            abunds_element = rel_abs(el_found,abundances,sun_el,sun_abs,el)
         n_lines = len(abunds_element['abund'])
         if n_lines == 1:
             params_obj = params_obj + (np.mean(abunds_element['abund']), 0)
