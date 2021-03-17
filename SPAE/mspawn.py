@@ -112,7 +112,7 @@ def print_output(output, outfile, teff, logg, feh, vt):
 
 
 
-def create_kurucz_array(files):
+def create_kurucz_array():
 
     data_dir = "../data/"
 
