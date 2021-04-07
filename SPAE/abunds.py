@@ -5,7 +5,7 @@ import numpy as np
 import os
 
 from .read_write import read_file
-import .mspawn as mspawn
+from . import atmos as atmos
 
 
 #Function to derive abundances
@@ -27,9 +27,9 @@ def abunds_func(x):
     #will want to have path to MOOGSILENT to be a user input
     # Old version - use system calls
     # os.system(model)
-    # New version - use mspawn python version
-    output = mspawn.mspawn(teff, logg, feh)
-    mspawn.print_output(output, "star.mod", teff, logg, feh, vt)
+    # New version - use mspawn python version (atmos)
+    output = atmos.atmos(teff, logg, feh)
+    atmos.print_output(output, "star.mod", teff, logg, feh, vt)
 
     # Call moog
     os.system('/usr/local/moognov2019silent/MOOGSILENT') #helium

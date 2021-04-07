@@ -27,7 +27,7 @@ def load_data():
 
 
 
-def mspawn(teff, logg, feh):
+def atmos(teff, logg, feh):
     global atmosphere_data
     global teff_set
     global logg_set
