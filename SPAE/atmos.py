@@ -1,89 +1,66 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.interpolate import LinearNDInterpolator
+import pickle
+from scipy.interpolate import RegularGridInterpolator
 
-atmosphere_data = None
-teff_set = None
-logg_set = None
-feh_set = None
+atmosphere_interpolator = None
 
 
 def load_data():
-    global atmosphere_data
-    global teff_set
-    global logg_set
-    global feh_set
+    """Load up the pickled interpolator."""
+    global atmosphere_interpolator
 
-    atmosphere_data = np.load("../data/kurucz_data.npy")
-
-    new_data = atmosphere_data.view(np.float64).reshape(atmosphere_data.shape + (-1,))
-
-    points = new_data[:,7:10]
-    points = np.unique(points, axis=0)
-
-    teff_set = np.unique(points[:,0])
-    logg_set = np.unique(points[:,1])
-    feh_set = np.unique(points[:,2])
-
+    filename = "../data/Kurucz_grid_interpolator.pickle"
+    atmosphere_interpolator = pickle.load(open(filename, "rb"))
 
 
 def atmos(teff, logg, feh):
-    global atmosphere_data
-    global teff_set
-    global logg_set
-    global feh_set
+    """Calculate the interpolated atmosphere for a set of stellar parameters.
 
-    if atmosphere_data is None: load_data()
+    Parameters
+    ----------
+    teff : float
+        Effective temperature of the star
+    logg : float
+        Surface gravity of the star
+    feh : float
+        [Fe/H] of the star
 
+    Returns
+    -------
+    model_atmosphere : list of [RHOX,T,P,XNE]
+        Provides the interpolated model atmosphere
 
-    # Find closest points
-    idx = np.argsort(np.abs(teff - teff_set))
-    teff_set = np.sort(teff_set[idx[0:2]])
+    """
+    global atmosphere_interpolator
 
-    idx = np.argsort(np.abs(logg - logg_set))
-    logg_set = np.sort(logg_set[idx[0:2]])
+    if atmosphere_interpolator is None:
+        load_data()
 
-    idx = np.argsort(np.abs(feh - feh_set))
-    feh_set = np.sort(feh_set[idx[0:2]])
+    points = [[teff, logg, feh, x] for x in np.arange(72)]
 
-    # Create a small data set
-    small_data = np.array([], dtype=atmosphere_data.dtype)
-
-    for teff_test in teff_set:
-        for logg_test in logg_set:
-            for feh_test in feh_set:
-                idx = np.where(atmosphere_data['teff'] == teff_test)[0]
-                idx = np.intersect1d(idx, np.where(atmosphere_data['logg'] == logg_test)[0])
-                idx = np.intersect1d(idx, np.where(atmosphere_data['feh'] == feh_test)[0])
-
-                small_data = np.append(small_data, atmosphere_data[idx])
-
-    # Run Interpolation
-    new_data = small_data.view(np.float64).reshape(small_data.shape + (-1,))
-
-    points = new_data[:,7:11]
-    values = new_data[:,0:7]
-
-    output_data = find_fit(teff, logg, feh, points, values)
-
-    return output_data
-
-
-def find_fit(teff, logg, feh, points, values):
-
-    linInter = LinearNDInterpolator(points, values, fill_value=0)
-
-    output_data = np.zeros((72, 7))
-
-    for i in range(72):
-        val = linInter((teff, logg, feh, i))
-        output_data[i] = linInter((teff, logg, feh, i))
-
-    return output_data
+    return atmosphere_interpolator(points)
 
 
 def print_output(output, outfile, teff, logg, feh, vt):
+    """Print the interpolated atmosphere to a file.
 
+    Parameters
+    ----------
+    output : float
+        List of [RHOX,T,P,XNE] describing model atmosphere
+    outfile : string
+        Name of the output file
+    teff : float
+        Effective temperature of the star
+    logg : float
+        Surface gravity of the star
+    feh : float
+        [Fe/H] of the star
+    vt : float
+        Velocity of microturbulence of the star
+
+    """
     vt *= 1e5
 
     with open(outfile, 'w') as f:
@@ -92,13 +69,10 @@ def print_output(output, outfile, teff, logg, feh, vt):
         f.write("NTAU            72\n")
 
         for i, line in enumerate(output):
-            f.write(" {:.8e}   {:.1f} {:.3e} {:.3e} {:.3e} {:.3e} {:.3e}\n".format(line[0],
-                                                                                   line[1],
-                                                                                   line[2],
-                                                                                   line[3],
-                                                                                   line[4],
-                                                                                   line[5],
-                                                                                   line[6]))
+            f.write(" {:.8e}   {:.1f} {:.3e} {:.3e}\n".format(line[0],
+                                                              line[1],
+                                                              line[2],
+                                                              line[3]))
 
         f.write("     {:.2e}\n".format(vt))
         f.write("NATOMS           1  {:.2f}\n".format(feh))

@@ -2,6 +2,8 @@ Tests
 Versions
 notes.txt
 test_notes.txt
+data/*.DAT
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
