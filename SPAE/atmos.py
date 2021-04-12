@@ -65,7 +65,7 @@ def print_output(output, outfile, teff, logg, feh, vt):
 
     with open(outfile, 'w') as f:
         f.write("KURUCZ\n")
-        f.write("#OVER72: T= {},[g]={:.2f},[Fe/H]={:.2f},vt={:.2e}\n".format(teff,logg,feh,vt))
+        f.write("#OVER72: T= {:.0f},[g]={:.2f},[Fe/H]={:.2f},vt={:.2e}\n".format(teff,logg,feh,vt))
         f.write("NTAU            72\n")
 
         for i, line in enumerate(output):
@@ -75,7 +75,7 @@ def print_output(output, outfile, teff, logg, feh, vt):
                                                               line[3]))
 
         f.write("     {:.2e}\n".format(vt))
-        f.write("NATOMS           1  {:.2f}\n".format(feh))
+        f.write("NATOMS           1  {:.2f}\n".format(feh)) #these should be editable to meet users needs
         f.write("      3.00     3.30\n")
         f.write("NMOL            19\n")
         f.write("     607.0     108.0     106.0     107.0\n")
@@ -88,7 +88,7 @@ def print_output(output, outfile, teff, logg, feh, vt):
 
 def create_kurucz_array():
 
-    data_dir = "../data/"
+    data_dir = "/usr/local/mspawn/"
 
     files = ['AM01K2.DAT', 'AM02K2.DAT', 'AM03K2.DAT', 'AM05K2.DAT', 'AM10K2.DAT',
              'AM15K2.DAT', 'AM20K2.DAT', 'AM25K2.DAT', 'AM30K2.DAT', 'AM35K2.DAT',
