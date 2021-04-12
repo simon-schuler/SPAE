@@ -5,10 +5,10 @@ from scipy.interpolate import LinearNDInterpolator
 import pickle
 
 try:
- import importlib.resources as pkg_resources
+    import importlib.resources as pkg_resources
 except ImportError:
- # Try backported to PY<37 `importlib_resources`.
- import importlib_resources as pkg_resources
+    # Try backported to PY<37 `importlib_resources`.
+    import importlib_resources as pkg_resources
 
 from . import data
 
@@ -25,60 +25,52 @@ def load_data():
 
 
 def atmos(teff, logg, feh):
+    """Calculate the interpolated atmosphere for a set of stellar parameters.
+
+    Parameters
+    ----------
+    teff : float
+        Effective temperature of the star
+    logg : float
+        Surface gravity of the star
+    feh : float
+        [Fe/H] of the star
+
+    Returns
+    -------
+    model_atmosphere : list of [RHOX,T,P,XNE]
+        Provides the interpolated model atmosphere
+
+    """
     global atmosphere_interpolator
 
     if atmosphere_interpolator is None:
         load_data()
 
+    points = [[teff, logg, feh, x] for x in np.arange(72)]
 
-    # Find closest points
-    idx = np.argsort(np.abs(teff - teff_set))
-    teff_tmp = np.sort(teff_set[idx[0:2]])
-
-    idx = np.argsort(np.abs(logg - logg_set))
-    logg_tmp = np.sort(logg_set[idx[0:2]])
-
-    idx = np.argsort(np.abs(feh - feh_set))
-    feh_tmp = np.sort(feh_set[idx[0:2]])
-
-    # Create a small data set
-    small_data = np.array([], dtype=atmosphere_data.dtype)
-
-    for teff_test in teff_tmp:
-        for logg_test in logg_tmp:
-            for feh_test in feh_tmp:
-                idx = np.where(atmosphere_data['teff'] == teff_test)[0]
-                idx = np.intersect1d(idx, np.where(atmosphere_data['logg'] == logg_test)[0])
-                idx = np.intersect1d(idx, np.where(atmosphere_data['feh'] == feh_test)[0])
-
-                small_data = np.append(small_data, atmosphere_data[idx])
-
-    # Run Interpolation
-    new_data = small_data.view(np.float64).reshape(small_data.shape + (-1,))
-
-    points = new_data[:,7:11]
-    values = new_data[:,0:7]
-
-    output_data = find_fit(teff, logg, feh, points, values)
-
-    return output_data
-
-
-def find_fit(teff, logg, feh, points, values):
-
-    linInter = LinearNDInterpolator(points, values, fill_value=0)
-
-    output_data = np.zeros((72, 7))
-
-    for i in range(72):
-        val = linInter((teff, logg, feh, i))
-        output_data[i] = linInter((teff, logg, feh, i))
-
-    return output_data
+    return atmosphere_interpolator(points)
 
 
 def print_output(output, outfile, teff, logg, feh, vt):
+    """Print the interpolated atmosphere to a file.
 
+    Parameters
+    ----------
+    output : float
+        List of [RHOX,T,P,XNE] describing model atmosphere
+    outfile : string
+        Name of the output file
+    teff : float
+        Effective temperature of the star
+    logg : float
+        Surface gravity of the star
+    feh : float
+        [Fe/H] of the star
+    vt : float
+        Velocity of microturbulence of the star
+
+    """
     vt *= 1e5
 
     with open(outfile, 'w') as f:
