@@ -2,42 +2,33 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 from scipy.interpolate import LinearNDInterpolator
+import pickle
 
-import SPAE
+try:
+ import importlib.resources as pkg_resources
+except ImportError:
+ # Try backported to PY<37 `importlib_resources`.
+ import importlib_resources as pkg_resources
 
-atmosphere_data = None
-teff_set = None
-logg_set = None
-feh_set = None
+from . import data
+
+atmosphere_interpolator = None
 
 
 def load_data():
-    global atmosphere_data
-    global teff_set
-    global logg_set
-    global feh_set
+    """Load up the pickled interpolator."""
+    global atmosphere_interpolator
 
-    path = Path(SPAE.__file__).parent / '../data/kurucz_data.npy'
-    atmosphere_data = np.load(path)
-
-    new_data = atmosphere_data.view(np.float64).reshape(atmosphere_data.shape + (-1,))
-
-    points = new_data[:,7:10]
-    points = np.unique(points, axis=0)
-
-    teff_set = np.unique(points[:,0])
-    logg_set = np.unique(points[:,1])
-    feh_set = np.unique(points[:,2])
-
+    filename = "Kurucz_grid_interpolator.pickle"
+    atmosphere_interpolator = pickle.load(pkg_resources.open_binary(data,
+                                                                    filename))
 
 
 def atmos(teff, logg, feh):
-    global atmosphere_data
-    global teff_set
-    global logg_set
-    global feh_set
+    global atmosphere_interpolator
 
-    if atmosphere_data is None: load_data()
+    if atmosphere_interpolator is None:
+        load_data()
 
 
     # Find closest points
