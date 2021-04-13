@@ -15,19 +15,7 @@ def abunds_func(x):
     if not in_bounds(x):
         return -np.inf, -np.inf
 
-    model = '/usr/local/mspawn/mspawn -wstar.mod -t%.3f' % teff + ' -g%.3f' % logg
-
-    if feh >= 0:
-        model = model + ' -p%.3f' % feh
-    else:
-        model = model + ' -m%.3f' % abs(feh)
-
-    model = model + ' -v%.2f' % micro
-
     #will want to have path to MOOGSILENT to be a user input
-    # Old version - use system calls
-    # os.system(model)
-    # New version - use mspawn python version (atmos)
     output = atmos.atmos(teff, logg, feh)
     atmos.print_output(output, "star.mod", teff, logg, feh, micro)
 
