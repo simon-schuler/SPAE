@@ -29,7 +29,7 @@ def abunds_func(x):
     # os.system(model)
     # New version - use mspawn python version (atmos)
     output = atmos.atmos(teff, logg, feh)
-    atmos.print_output(output, "star.mod", teff, logg, feh, vt)
+    atmos.print_output(output, "star.mod", teff, logg, feh, micro)
 
     # Call moog
     os.system('/usr/local/moognov2019silent/MOOGSILENT') #helium
