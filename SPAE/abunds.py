@@ -15,21 +15,9 @@ def abunds_func(x):
     if not in_bounds(x):
         return -np.inf, -np.inf
 
-    model = '/usr/local/mspawn/mspawn -wstar.mod -t%.3f' % teff + ' -g%.3f' % logg
-
-    if feh >= 0:
-        model = model + ' -p%.3f' % feh
-    else:
-        model = model + ' -m%.3f' % abs(feh)
-
-    model = model + ' -v%.2f' % micro
-
     #will want to have path to MOOGSILENT to be a user input
-    # Old version - use system calls
-    # os.system(model)
-    # New version - use mspawn python version (atmos)
     output = atmos.atmos(teff, logg, feh)
-    atmos.print_output(output, "star.mod", teff, logg, feh, vt)
+    atmos.print_output(output, "star.mod", teff, logg, feh, micro)
 
     # Call moog
     os.system('/usr/local/moognov2019silent/MOOGSILENT') #helium
@@ -92,6 +80,8 @@ def obj_func(x,n_elems,sun_el=None,sun_abs=None):
         return (-np.inf,) + tuple(np.zeros(2*n_elems+2))
 
     el_found, abundances = abunds_func(x)
+    if len(abundances) < 2:
+        return (-np.inf,) + tuple(np.zeros(2*n_elems+2))
 
     if sun_el is None or sun_abs is None:
         abunds_fe1 = abundances[0]
