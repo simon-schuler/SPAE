@@ -1,7 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
-from scipy.interpolate import LinearNDInterpolator
 import pickle
 
 try:
