@@ -80,7 +80,7 @@ def obj_func(x,n_elems,sun_el=None,sun_abs=None):
         return (-np.inf,) + tuple(np.zeros(2*n_elems+2))
 
     el_found, abundances = abunds_func(x)
-    if len(abundances) < 2 or if np.isinf(el_found):
+    if len(abundances) < 2 or np.isinf(el_found):
         return (-np.inf,) + tuple(np.zeros(2*n_elems+2))
 
     if sun_el is None or sun_abs is None:
