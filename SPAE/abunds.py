@@ -28,7 +28,7 @@ def abunds_func(x):
 
 
 #Function for deriving relative abundances
-def rel_abs(el_found,abundances,sun_el,sun_abs,el):
+def rel_abunds(el_found,abundances,sun_el,sun_abs,el):
     rel_abunds = np.array([],dtype = abundances[0].dtype)
 
     for i in range(len(el_found)):
@@ -52,6 +52,18 @@ def rel_abs(el_found,abundances,sun_el,sun_abs,el):
 
 
     return rel_abunds
+
+
+#Function for deriving absolute abundances
+def abs_abunds(el_found,abundances,el):
+
+    for i in range(len(el_found)):
+        if el_found[i] == el:
+            break
+
+    star_abunds = abundances[i]
+
+    return star_abunds
 
 
 def in_bounds(x):
@@ -84,12 +96,12 @@ def obj_func(x,n_elems,sun_el=None,sun_abs=None):
         return (-np.inf,) + tuple(np.zeros(2*n_elems+2))
 
     if sun_el is None or sun_abs is None:
-        abunds_fe1 = abundances[0]
-        abunds_fe2 = abundances[1]
+        abunds_fe1 = abs_abunds(el_found, abundances, 'Fe I ')
+        abunds_fe2 = abs_abunds(el_found, abundances, 'Fe II ')
         fe_mean = feh + 7.50
     else:
-        abunds_fe1 = rel_abs(el_found,abundances,sun_el,sun_abs,'Fe I ')
-        abunds_fe2 = rel_abs(el_found,abundances,sun_el,sun_abs,'Fe II ')
+        abunds_fe1 = rel_abunds(el_found,abundances,sun_el,sun_abs,'Fe I ')
+        abunds_fe2 = rel_abunds(el_found,abundances,sun_el,sun_abs,'Fe II ')
         fe_mean = feh
 
     fe_std = np.std(np.append(abunds_fe1['abund'], abunds_fe2['abund']))
@@ -105,9 +117,9 @@ def obj_func(x,n_elems,sun_el=None,sun_abs=None):
     # Cycle through other lines to get their mean an std
     for i, el in enumerate(el_found):
         if sun_el is None or sun_abs is None:
-            abunds_element = abundances[i]
+            abunds_element = abs_abunds(el_found,abundances,el)
         else:
-            abunds_element = rel_abs(el_found,abundances,sun_el,sun_abs,el)
+            abunds_element = rel_abunds(el_found,abundances,sun_el,sun_abs,el)
         n_lines = len(abunds_element['abund'])
         if n_lines == 1:
             params_obj = params_obj + (np.mean(abunds_element['abund']), 0)
