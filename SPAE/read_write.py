@@ -42,8 +42,8 @@ def param_file(linelist,atmosphere=0,molecules=1,lines=0,flux=0,damp=0,plot=0,un
 #Function for creating the solar and stellar linelists
 def linelist_create(star_in, sun_in, direc_path):
     
-    with open(direc_path + '/linelist_star.txt', 'w') as out_star: 
-        with open(direc_path + '/linelist_sun.txt', 'w') as out_sun: 
+    with open(direc_path + 'linelist_star.txt', 'w') as out_star: 
+        with open(direc_path + 'linelist_sun.txt', 'w') as out_sun: 
             with open(star_in) as file_star: 
                 with open(sun_in) as file_sun: 
                     
