@@ -9,7 +9,7 @@ from . import atmos as atmos
 
 
 #Function to derive abundances
-def abunds_func(x):
+def abunds_func(x, print_atmosphere=False, print_moog=False):
     teff, logg, feh, micro = x
 
     if not in_bounds(x):
@@ -17,7 +17,8 @@ def abunds_func(x):
 
     #will want to have path to MOOGSILENT to be a user input
     output = atmos.atmos(teff, logg, feh)
-    atmos.print_output(output, "star.mod", teff, logg, feh, micro)
+    if print_atmosphere:
+        atmos.print_output(output, "star.mod", teff, logg, feh, micro)
 
     # Call moog
     os.system('/usr/local/moognov2019silent/MOOGSILENT') #helium
