@@ -1,0 +1,191 @@
+{
+	"auto_complete":
+	{
+		"selected_items":
+		[
+		]
+	},
+	"buffers":
+	[
+	],
+	"build_system": "",
+	"build_system_choices":
+	[
+	],
+	"build_varint": "",
+	"command_palette":
+	{
+		"height": 0.0,
+		"last_filter": "",
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"console":
+	{
+		"height": 0.0,
+		"history":
+		[
+		]
+	},
+	"distraction_free":
+	{
+		"menu_visible": true,
+		"show_minimap": false,
+		"show_open_files": false,
+		"show_tabs": false,
+		"side_bar_visible": false,
+		"status_bar_visible": false
+	},
+	"file_history":
+	[
+		"/Users/schuler/Dropbox (Tampa)/Research/Projects/MovingGroups/G21_22/star_ms.mod",
+		"/Users/schuler/Dropbox (Tampa)/Research/moore_solar.txt",
+		"/Users/schuler/Dropbox (Tampa)/Research/Projects/MovingGroups/G21_22/Europium/eu_4129_g10848.par",
+		"/Users/schuler/Dropbox (Tampa)/Research/Projects/MovingGroups/G21_22/Europium/eu_4129_hip36878.par",
+		"/Users/schuler/Dropbox (Tampa)/Research/Projects/MovingGroups/G21_22/Europium/eu_4129_g11964.par",
+		"/Users/schuler/Dropbox (Tampa)/Research/Projects/MovingGroups/G21_22/Europium/eu_6437_g10848.par",
+		"/Users/schuler/Dropbox (Tampa)/Research/Projects/MovingGroups/G21_22/Europium/eu_6437_g8242.par",
+		"/Users/schuler/Dropbox (Tampa)/Research/Projects/MovingGroups/G21_22/Europium/eu_3724_g0238.par",
+		"/Users/schuler/Dropbox (Tampa)/Research/Projects/MovingGroups/G21_22/Europium/eu_6437_g0238.par",
+		"/Users/schuler/Dropbox (Tampa)/Research/Projects/MovingGroups/G21_22/Europium/eu_6173_g0238.par",
+		"/Users/schuler/Dropbox (Tampa)/Research/Projects/MovingGroups/G21_22/Europium/eu_3819_sun.par",
+		"/Users/schuler/Dropbox (Tampa)/Research/Projects/MovingGroups/G21_22/star.mod",
+		"/Users/schuler/Dropbox (Tampa)/Research/Projects/MovingGroups/G21_22/HIP36878/PythonMethod/linelist_elems_py.txt",
+		"/Users/schuler/Dropbox (Tampa)/Research/Projects/MovingGroups/G21_22/moog_out.2",
+		"/usr/local/mspawn/mspawn.c",
+		"/Users/schuler/Dropbox (Tampa)/Research/Projects/MovingGroups/G21_22/Europium/eu_4129_sun.par",
+		"/Users/schuler/Dropbox (Tampa)/Research/Projects/MovingGroups/G21_22/moog_outtt.2",
+		"/usr/local/moognov2019silent/Drawcurs.f",
+		"/usr/local/moognov2019silent/Fluxplot.f",
+		"/usr/local/moognov2019silent/Binplot.f",
+		"/usr/local/moognov2019silent/Makeplot.f",
+		"/usr/local/moognov2019silent/Abunplot.f",
+		"/usr/local/moognov2019silent/Defcolor.f",
+		"/usr/local/moognov2019silent/Specplot.f",
+		"/usr/local/moognov2019silent/Cogplot.f",
+		"/usr/local/moognov2019silent/Pointcurs.f",
+		"/Users/schuler/Dropbox (Tampa)/Research/Misc/massey-1.txt"
+	],
+	"find":
+	{
+		"height": 39.0
+	},
+	"find_in_files":
+	{
+		"height": 0.0,
+		"where_history":
+		[
+		]
+	},
+	"find_state":
+	{
+		"case_sensitive": false,
+		"find_history":
+		[
+		],
+		"highlight": true,
+		"in_selection": false,
+		"preserve_case": false,
+		"regex": false,
+		"replace_history":
+		[
+		],
+		"reverse": false,
+		"show_context": true,
+		"use_buffer2": true,
+		"whole_word": false,
+		"wrap": true
+	},
+	"groups":
+	[
+		{
+			"sheets":
+			[
+			]
+		}
+	],
+	"incremental_find":
+	{
+		"height": 24.0
+	},
+	"input":
+	{
+		"height": 0.0
+	},
+	"layout":
+	{
+		"cells":
+		[
+			[
+				0,
+				0,
+				1,
+				1
+			]
+		],
+		"cols":
+		[
+			0.0,
+			1.0
+		],
+		"rows":
+		[
+			0.0,
+			1.0
+		]
+	},
+	"menu_visible": true,
+	"output.find_results":
+	{
+		"height": 0.0
+	},
+	"pinned_build_system": "",
+	"project": "spae.sublime-project",
+	"replace":
+	{
+		"height": 44.0
+	},
+	"save_all_on_build": true,
+	"select_file":
+	{
+		"height": 0.0,
+		"last_filter": "",
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"select_project":
+	{
+		"height": 0.0,
+		"last_filter": "",
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"select_symbol":
+	{
+		"height": 0.0,
+		"last_filter": "",
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"selected_group": 0,
+	"settings":
+	{
+	},
+	"show_minimap": false,
+	"show_open_files": false,
+	"show_tabs": true,
+	"side_bar_visible": true,
+	"side_bar_width": 227.0,
+	"status_bar_visible": true,
+	"template_settings":
+	{
+	}
+}

@@ -9,7 +9,7 @@ from . import atmos as atmos
 
 
 #Function to derive abundances
-def abunds_func(x, print_atmosphere=False, print_moog=False):
+def abunds_func(x, print_atmosphere=True, print_moog=False):
     teff, logg, feh, micro = x
 
     if not in_bounds(x):
