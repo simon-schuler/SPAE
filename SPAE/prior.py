@@ -11,7 +11,7 @@ except ImportError:
 prior_kde = None
 
 
-def load_prior(x):
+def load_prior():
     """Load the prior data and initialize the prior array."""
     global prior_kde
 
