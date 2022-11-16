@@ -6,6 +6,7 @@ import os
 
 from .read_write import read_file
 from . import atmos as atmos
+from . import prior
 
 
 #Function to derive abundances
@@ -82,15 +83,21 @@ def in_bounds(x):
     return True
 
 
-
-
-#Function defining the objective function
-def obj_func(x,n_elems,sun_el=None,sun_abs=None):
+def obj_func(x, n_elems, sun_el=None, sun_abs=None, include_prior=False):
+    """Define the objective function."""
     teff, logg, feh, micro = x
 
     # Check if stellar parameters are within valid ranges
     if not in_bounds(x):
         return (-np.inf,) + tuple(np.zeros(2*n_elems+2))
+
+    # Calculate the prior
+    if include_prior:
+        p = teff, logg
+        ln_prior = prior.ln_prior(p)
+    else:
+        ln_prior = 0
+
 
     el_found, abundances = abunds_func(x)
     if len(abundances) < 2:
@@ -113,7 +120,12 @@ def obj_func(x,n_elems,sun_el=None,sun_abs=None):
     fe1_likely = np.sum(-(abunds_fe1['abund'] - fe_mean)**2 / (2*fe_std**2)) - np.log(fe_std) * len(abunds_fe1['abund'])
     fe2_likely = np.sum(-(abunds_fe2['abund'] - fe_mean)**2 / (2*fe_std**2)) - np.log(fe_std) * len(abunds_fe2['abund'])
 
-    params_obj = tuple((fe1_likely + fe2_likely, ep_r, rew_r))
+    ln_likelihood = fe1_likely + fe2_likely
+
+    ln_posterior = ln_prior + ln_likelihood
+
+    # Calculate posterior probability
+    params_obj = tuple((ln_posterior, ep_r, rew_r))
 
     # Cycle through other lines to get their mean an std
     for i, el in enumerate(el_found):
