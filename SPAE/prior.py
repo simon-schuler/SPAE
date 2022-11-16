@@ -26,7 +26,7 @@ def load_prior(x):
     return
 
 
-def ln_prob(p):
+def ln_prior(p):
     """Calculate the log prior from the KDE representation."""
     global prior_kde
 
