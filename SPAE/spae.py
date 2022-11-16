@@ -5,7 +5,8 @@ from .abunds import abunds_func, obj_func, in_bounds
 from .read_write import param_file
 
 
-def run_spae(sun_el=None,sun_abs=None,x_0=(5777,4.44,0.01,1.38), n_dim=4, n_walkers=40, n_steps=1000):
+def run_spae(sun_el=None,sun_abs=None,x_0=(5777,4.44,0.01,1.38),
+		     n_dim=4, n_walkers=40, n_steps=1000, include_prior=False):
 
 	t_0 = time.time()
 
@@ -19,7 +20,7 @@ def run_spae(sun_el=None,sun_abs=None,x_0=(5777,4.44,0.01,1.38), n_dim=4, n_walk
 	    blobs_dtype.append((el+'_sigma_mean', 'f8'))
 
 
-	sampler = emcee.EnsembleSampler(n_walkers, n_dim, obj_func, blobs_dtype=blobs_dtype, args=(len(el_found),sun_el,sun_abs))
+	sampler = emcee.EnsembleSampler(n_walkers, n_dim, obj_func, blobs_dtype=blobs_dtype, args=(len(el_found),sun_el,sun_abs,include_prior))
 	results = sampler.run_mcmc(x_ball, n_steps, progress=True)
 
 	flat_blob = sampler.get_blobs().reshape((n_walkers*n_steps))
@@ -32,9 +33,9 @@ def run_spae(sun_el=None,sun_abs=None,x_0=(5777,4.44,0.01,1.38), n_dim=4, n_walk
 
 def run_one(teff, logg, feh, micro, linelist):
 	"""Creates model atmosphere, MOOG parameter file, and runs abfind in MOOG.
-	
-	Creates model atmosphere, star.mod, by interpolating the Kurucz model atmosphere 
-	grids. Creates MOOG parameter file, batch.par. Outputs two files from MOOG, a 
+
+	Creates model atmosphere, star.mod, by interpolating the Kurucz model atmosphere
+	grids. Creates MOOG parameter file, batch.par. Outputs two files from MOOG, a
 	summary of the abundance calculations and the derived abundances.
 
 	Args:
@@ -47,16 +48,15 @@ def run_one(teff, logg, feh, micro, linelist):
 	"""
 
 	params = (teff, logg, feh, micro)
-	
+
 	if not in_bounds(params):
 		print('Your parameters are not in the bounds of the model grids.')
 		print()
 		print(run_one.__doc__)
 		return
-	
+
 	param_file(linelist)
 
 	el_found, abundances = abunds_func(params)
 
 	return
-
