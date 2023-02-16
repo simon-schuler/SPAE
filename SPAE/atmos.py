@@ -209,17 +209,18 @@ def create_kurucz_pickle(filename_npy):
     # Load Kurucz structured numpy array
 
     filename_kurucz_array = "kurucz_data.npy"
-    kurucz_array = np.load(pkg_resources.open_binary(data, filename)
+    kurucz_array = np.load(pkg_resources.open_binary(data,
+                                                     filename_kurucz_array))
 
     # Convert to 2D numpy array
-    atmosphere_data = data[['rho_X',
-                            'T',
-                            'P',
-                            'rho_e',
-                            'kappa',
-                            'rad_acc',
-                            'V_macro']].copy().view((float,
-                                                     len(kurucz_array.dtype.names)))
+    atmosphere_data = kurucz_array[['rho_X',
+                                    'T',
+                                    'P',
+                                    'rho_e',
+                                    'kappa',
+                                    'rad_acc',
+                                    'V_macro']].copy().view((float,
+                                                             len(kurucz_array.dtype.names)))
 
     # Create list of unique teff, logg, and feh values
     teff_set = np.unique(kurucz_array['teff'])
@@ -235,11 +236,11 @@ def create_kurucz_pickle(filename_npy):
 
     # Cycle through teff, logg, and feh values, setting array for interpolation
     for i, teff in enumerate(teff_set):
-        idx_teff = np.where(data['teff'] == teff)[0]
+        idx_teff = np.where(kurucz_array['teff'] == teff)[0]
         for j, logg in enumerate(logg_set):
-            idx_logg = np.where(data['logg'] == logg)[0]
+            idx_logg = np.where(kurucz_array['logg'] == logg)[0]
             for k, feh in enumerate(feh_set):
-                idx_feh = np.where(data['feh'] == feh)[0]
+                idx_feh = np.where(kurucz_array['feh'] == feh)[0]
 
                 idx = np.intersect1d(idx_teff, idx_logg)
                 idx = np.intersect1d(idx, idx_feh)
@@ -257,5 +258,4 @@ def create_kurucz_pickle(filename_npy):
                                                    np.arange(72)),
                                                   interpolation_array)
 
-    filename = "Kurucz_grid_interpolator.pickle"
-    pickle.dump(kurucz_interpolator, pkg_resources.open_binary(data, filename))
+    return kurucz_interpolator
