@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
+from scipy.interpolate import RegularGridInterpolator
 import pickle
 
 try:
@@ -201,3 +202,60 @@ def create_kurucz_array():
         full_data = np.append(full_data, new_array)
 
     return full_data
+
+
+def create_kurucz_pickle(filename_npy):
+    """Create pickle file for Kurucz data interpolation."""
+    # Load Kurucz structured numpy array
+
+    filename_kurucz_array = "kurucz_data.npy"
+    kurucz_array = np.load(pkg_resources.open_binary(data,
+                                                     filename_kurucz_array))
+
+    # Convert to 2D numpy array
+    atmosphere_data = kurucz_array[['rho_X',
+                                    'T',
+                                    'P',
+                                    'rho_e',
+                                    'kappa',
+                                    'rad_acc',
+                                    'V_macro']].copy().view((float,
+                                                             len(kurucz_array.dtype.names)))
+
+    # Create list of unique teff, logg, and feh values
+    teff_set = np.unique(kurucz_array['teff'])
+    logg_set = np.unique(kurucz_array['logg'])
+    feh_set = np.unique(kurucz_array['feh'])
+
+    # Create empty array of interpolation values
+    interpolation_array = np.zeros((len(teff_set),
+                                    len(logg_set),
+                                    len(feh_set),
+                                    72,
+                                    7))
+
+    # Cycle through teff, logg, and feh values, setting array for interpolation
+    for i, teff in enumerate(teff_set):
+        idx_teff = np.where(kurucz_array['teff'] == teff)[0]
+        for j, logg in enumerate(logg_set):
+            idx_logg = np.where(kurucz_array['logg'] == logg)[0]
+            for k, feh in enumerate(feh_set):
+                idx_feh = np.where(kurucz_array['feh'] == feh)[0]
+
+                idx = np.intersect1d(idx_teff, idx_logg)
+                idx = np.intersect1d(idx, idx_feh)
+
+                # If no data, move on, default will be zeros
+                if len(idx) == 0:
+                    continue
+
+                interpolation_array[i, j, k] = atmosphere_data[idx][:, 0:7]
+
+    # Create Kurucz interpolator object
+    kurucz_interpolator = RegularGridInterpolator((teff_set,
+                                                   logg_set,
+                                                   feh_set,
+                                                   np.arange(72)),
+                                                  interpolation_array)
+
+    return kurucz_interpolator
