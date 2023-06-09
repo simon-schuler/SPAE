@@ -11,7 +11,7 @@ except ImportError:
 prior_kde = None
 
 
-def load_prior(**prior_kwargs):
+def load_prior(prior_kwargs={}):
     """Load the prior data and initialize the prior array."""
     global prior_kde
 
@@ -35,7 +35,7 @@ def load_prior(**prior_kwargs):
     return
 
 
-def ln_prior(p, **prior_kwargs):
+def ln_prior(p, prior_kwargs={}):
     """Calculate the log prior from the KDE representation."""
     global prior_kde
 
