@@ -84,7 +84,7 @@ def in_bounds(x):
 
 
 def obj_func(x, n_elems, sun_el=None, sun_abs=None, include_prior=False,
-             **prior_kwargs):
+             prior_kwargs={}):
     """Define the objective function."""
     teff, logg, feh, micro = x
 

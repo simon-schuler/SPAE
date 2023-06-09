@@ -7,7 +7,7 @@ from .read_write import param_file
 
 def run_spae(sun_el=None,sun_abs=None,x_0=(5777,4.44,0.01,1.38),
 		     n_dim=4, n_walkers=40, n_steps=1000, include_prior=False,
-			 **prior_kwargs):
+			 prior_kwargs={}):
 
 	t_0 = time.time()
 
