@@ -6,7 +6,8 @@ from .read_write import param_file
 
 
 def run_spae(sun_el=None,sun_abs=None,x_0=(5777,4.44,0.01,1.38),
-		     n_dim=4, n_walkers=40, n_steps=1000, include_prior=False):
+		     n_dim=4, n_walkers=40, n_steps=1000, include_prior=False,
+			 **prior_kwargs):
 
 	t_0 = time.time()
 
@@ -20,7 +21,15 @@ def run_spae(sun_el=None,sun_abs=None,x_0=(5777,4.44,0.01,1.38),
 	    blobs_dtype.append((el+'_sigma_mean', 'f8'))
 
 
-	sampler = emcee.EnsembleSampler(n_walkers, n_dim, obj_func, blobs_dtype=blobs_dtype, args=(len(el_found),sun_el,sun_abs,include_prior))
+	sampler = emcee.EnsembleSampler(n_walkers,
+									n_dim,
+									obj_func,
+									blobs_dtype=blobs_dtype,
+									args=(len(el_found),
+										  sun_el,
+										  sun_abs,
+										  include_prior,
+										  prior_kwargs))
 	results = sampler.run_mcmc(x_ball, n_steps, progress=True)
 
 	flat_blob = sampler.get_blobs().reshape((n_walkers*n_steps))

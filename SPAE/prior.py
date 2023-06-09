@@ -11,13 +11,22 @@ except ImportError:
 prior_kde = None
 
 
-def load_prior():
+def load_prior(**prior_kwargs):
     """Load the prior data and initialize the prior array."""
     global prior_kde
 
     # Load up prior data and create input array
     filename = "Brewer_data.npy"
     prior_data = np.load(pkg_resources.open_binary(data, filename))
+
+    # Cycle through kwargs
+    for key, value in prior_kwargs.items():
+        if key == 'log_Rhk_min' and value is not None:
+            prior_data = prior_data[prior_data['logRhk'] > value]
+        if key == 'log_Rhk_max' and value is not None:
+            prior_data = prior_data[prior_data['logRhk'] < value]
+
+    # Create array of inputs for prior
     prior_inputs = np.array([prior_data['Teff'] / 1e3, prior_data['logg']])
 
     # Generate KDE from input data
@@ -26,13 +35,13 @@ def load_prior():
     return
 
 
-def ln_prior(p):
+def ln_prior(p, **prior_kwargs):
     """Calculate the log prior from the KDE representation."""
     global prior_kde
 
     # Check to make sure prior is loaded
     if prior_kde is None:
-        load_prior()
+        load_prior(prior_kwargs)
 
     T_eff, logg = p
 

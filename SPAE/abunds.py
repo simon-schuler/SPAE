@@ -83,7 +83,8 @@ def in_bounds(x):
     return True
 
 
-def obj_func(x, n_elems, sun_el=None, sun_abs=None, include_prior=False):
+def obj_func(x, n_elems, sun_el=None, sun_abs=None, include_prior=False,
+             **prior_kwargs):
     """Define the objective function."""
     teff, logg, feh, micro = x
 
@@ -94,7 +95,7 @@ def obj_func(x, n_elems, sun_el=None, sun_abs=None, include_prior=False):
     # Calculate the prior
     if include_prior:
         p = teff, logg
-        ln_prior = prior.ln_prior(p)
+        ln_prior = prior.ln_prior(p, prior_kwargs)
     else:
         ln_prior = 0
 
