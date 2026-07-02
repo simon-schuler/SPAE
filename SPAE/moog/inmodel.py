@@ -72,7 +72,7 @@ def inmodel(state, eqlib_func=None) -> None:
 
     state.modelnum += 1
 
-    with open(state.infile) as f:
+    with open(state.fmodel) as f:
         # -----------------------------------------------------------------
         # 1. Model type keyword (first 10 chars, right-padded with spaces)
         # -----------------------------------------------------------------
