@@ -7,6 +7,9 @@ ionization potentials, and Kurucz ATLAS9 partition function tables.
 Arrays are 0-indexed; element Z maps to index Z-1.
 """
 
+import os as _os
+import csv as _csv
+import warnings as _warnings
 import numpy as np
 
 # ---------------------------------------------------------------------------
@@ -30,7 +33,7 @@ ELEMENT_NAMES = [
 # Asplund et al. (2009, ARA&A, 47, 481)
 # Shape (95,); index = Z-1
 # ---------------------------------------------------------------------------
-XSOLAR = np.array([
+_XSOLAR_DEFAULT = np.array([
     12.00, 10.93,  1.05,  1.38,  2.70,  8.43,  7.83,  8.69,  4.56,  7.93,
      6.24,  7.60,  6.45,  7.51,  5.41,  7.12,  5.50,  6.40,  5.03,  6.34,
      3.15,  4.95,  3.93,  5.64,  5.43,  7.50,  4.99,  6.22,  4.19,  4.56,
@@ -600,46 +603,46 @@ NUDATA = np.array(_NUDATA_FLAT, dtype=np.int64).reshape(380, 6)
 
 # ---------------------------------------------------------------------------
 # partflag: which species have updated partition functions
-# Shape (95, 4);  PARTFLAG[Z-1, ion-1] = row index into NEWPARTDATA (1-based)
+# Shape (95, 4);  _PARTFLAG_DEFAULT[Z-1, ion-1] = row index into NEWPARTDATA (1-based)
 #                 0 means use ucalc (ATLAS9 encoded scheme)
 # From Batom.f: partflag(Z, ion) with Fortran 1-based indexing.
 # ---------------------------------------------------------------------------
-PARTFLAG = np.zeros((95, 4), dtype=int)
-PARTFLAG[23, 1] = 1   # Cr  II
-PARTFLAG[36, 0] = 2   # Rb  I
-PARTFLAG[41, 1] = 3   # Mo  II
-PARTFLAG[58, 0] = 4   # Pr  I
-PARTFLAG[58, 1] = 5   # Pr  II
-PARTFLAG[59, 0] = 6   # Nd  I
-PARTFLAG[59, 1] = 7   # Nd  II
-PARTFLAG[62, 2] = 21  # Eu  III
-PARTFLAG[63, 0] = 8   # Gd  I
-PARTFLAG[64, 0] = 9   # Tb  I
-PARTFLAG[64, 1] = 10  # Tb  II
-PARTFLAG[64, 2] = 22  # Tb  III
-PARTFLAG[65, 0] = 11  # Dy  I
-PARTFLAG[65, 1] = 12  # Dy  II
-PARTFLAG[65, 2] = 23  # Dy  III
-PARTFLAG[66, 1] = 13  # Ho  II
-PARTFLAG[66, 2] = 24  # Ho  III
-PARTFLAG[67, 0] = 14  # Er  I
-PARTFLAG[67, 1] = 15  # Er  II
-PARTFLAG[67, 2] = 25  # Er  III
-PARTFLAG[69, 0] = 16  # Yb  I
-PARTFLAG[70, 1] = 17  # Lu  II
-PARTFLAG[76, 1] = 28  # Ir  II
-PARTFLAG[89, 0] = 18  # Th  I
-PARTFLAG[89, 1] = 19  # Th  II
-PARTFLAG[89, 2] = 26  # Th  III
-PARTFLAG[91, 1] = 20  # U   II
-PARTFLAG[91, 2] = 27  # U   III
+_PARTFLAG_DEFAULT = np.zeros((95, 4), dtype=int)
+_PARTFLAG_DEFAULT[23, 1] = 1   # Cr  II
+_PARTFLAG_DEFAULT[36, 0] = 2   # Rb  I
+_PARTFLAG_DEFAULT[41, 1] = 3   # Mo  II
+_PARTFLAG_DEFAULT[58, 0] = 4   # Pr  I
+_PARTFLAG_DEFAULT[58, 1] = 5   # Pr  II
+_PARTFLAG_DEFAULT[59, 0] = 6   # Nd  I
+_PARTFLAG_DEFAULT[59, 1] = 7   # Nd  II
+_PARTFLAG_DEFAULT[62, 2] = 21  # Eu  III
+_PARTFLAG_DEFAULT[63, 0] = 8   # Gd  I
+_PARTFLAG_DEFAULT[64, 0] = 9   # Tb  I
+_PARTFLAG_DEFAULT[64, 1] = 10  # Tb  II
+_PARTFLAG_DEFAULT[64, 2] = 22  # Tb  III
+_PARTFLAG_DEFAULT[65, 0] = 11  # Dy  I
+_PARTFLAG_DEFAULT[65, 1] = 12  # Dy  II
+_PARTFLAG_DEFAULT[65, 2] = 23  # Dy  III
+_PARTFLAG_DEFAULT[66, 1] = 13  # Ho  II
+_PARTFLAG_DEFAULT[66, 2] = 24  # Ho  III
+_PARTFLAG_DEFAULT[67, 0] = 14  # Er  I
+_PARTFLAG_DEFAULT[67, 1] = 15  # Er  II
+_PARTFLAG_DEFAULT[67, 2] = 25  # Er  III
+_PARTFLAG_DEFAULT[69, 0] = 16  # Yb  I
+_PARTFLAG_DEFAULT[70, 1] = 17  # Lu  II
+_PARTFLAG_DEFAULT[76, 1] = 28  # Ir  II
+_PARTFLAG_DEFAULT[89, 0] = 18  # Th  I
+_PARTFLAG_DEFAULT[89, 1] = 19  # Th  II
+_PARTFLAG_DEFAULT[89, 2] = 26  # Th  III
+_PARTFLAG_DEFAULT[91, 1] = 20  # U   II
+_PARTFLAG_DEFAULT[91, 2] = 27  # U   III
 
 # ---------------------------------------------------------------------------
 # newpartdata: updated partition function polynomial coefficients
 # Shape (28, 6); row index is 1-based in Fortran → use row-1 in Python
 # log10(U) = sum_{j=1}^{6} C_j * log10(T)^(j-1)
 # ---------------------------------------------------------------------------
-NEWPARTDATA = np.array([
+_NEWPARTDATA_DEFAULT = np.array([
     [ 2.66384894e+3, -1.68227473e+3,  4.22830259e+2, -5.28071678e+1,  3.27472214e+0, -8.05963460e-2],  # 01 Cr II
     [ 5.03676283e+3, -3.16069504e+3,  7.89175381e+2, -9.79501783e+1,  6.04047992e+0, -1.47981323e-1],  # 02 Rb I
     [ 4.16034835e+3, -2.65480884e+3,  6.74631372e+2, -8.52665787e+1,  5.35745654e+0, -1.33793443e-1],  # 03 Mo II
@@ -669,3 +672,79 @@ NEWPARTDATA = np.array([
     [ 5.18480529e+3, -3.02564444e+3,  7.03396006e+2, -8.14028851e+1,  4.68959696e+0, -1.07563314e-1],  # 27 U  III
     [ 2.33935909e+2, -1.43786065e+2,  3.57641903e+1, -4.45430703e+0,  2.77258541e-1, -6.86047013e-3],  # 28 Ir II
 ])
+
+# ---------------------------------------------------------------------------
+# Data directory for updatable reference files
+# ---------------------------------------------------------------------------
+_DATA_DIR = _os.path.join(_os.path.dirname(__file__), 'data')
+
+
+def load_solar_abundances(path: str = None) -> np.ndarray:
+    """
+    Load solar photospheric abundances from a CSV file.
+
+    The file must have columns Z and log_abundance (plus optional symbol).
+    Comment lines starting with '#' are skipped.
+    Returns an array of shape (95,) indexed by Z-1.
+
+    Defaults to moog/data/solar_abundances.csv (Asplund 2009).
+    Pass a different path to switch abundance scales at runtime.
+    """
+    if path is None:
+        path = _os.path.join(_DATA_DIR, 'solar_abundances.csv')
+    result = _XSOLAR_DEFAULT.copy()
+    with open(path) as fh:
+        reader = _csv.DictReader(line for line in fh if not line.startswith('#'))
+        for row in reader:
+            z = int(row['Z'])
+            if 1 <= z <= 95:
+                result[z - 1] = float(row['log_abundance'])
+    return result
+
+
+def load_partition_polynomials(path: str = None):
+    """
+    Load partition function polynomial coefficients from a CSV file.
+
+    The file must have columns: Z, ion, label, C1, C2, C3, C4, C5, C6
+    Comment lines starting with '#' are skipped.
+    Rows are assigned sequential 1-based indices in file order; PARTFLAG is
+    rebuilt automatically from the Z/ion columns — no manual index management.
+
+    Returns (newpartdata, partflag):
+      newpartdata  ndarray (n, 6) of polynomial coefficients
+      partflag     ndarray (95, 4) int, 1-based row indices (0 = use ATLAS9)
+
+    Defaults to moog/data/partition_polynomials.csv (Irwin 1981).
+    """
+    if path is None:
+        path = _os.path.join(_DATA_DIR, 'partition_polynomials.csv')
+    rows = []
+    pflag = np.zeros((95, 4), dtype=int)
+    with open(path) as fh:
+        reader = _csv.DictReader(line for line in fh if not line.startswith('#'))
+        for i, row in enumerate(reader):
+            z = int(row['Z'])
+            ion = int(row['ion'])
+            coeffs = [float(row[f'C{j}']) for j in range(1, 7)]
+            rows.append(coeffs)
+            if 1 <= z <= 95 and 1 <= ion <= 4:
+                pflag[z - 1, ion - 1] = i + 1
+    return np.array(rows, dtype=float), pflag
+
+
+# Load from data files; fall back to hardcoded defaults if files are missing.
+try:
+    XSOLAR = load_solar_abundances()
+except FileNotFoundError:
+    _warnings.warn(
+        'moog/data/solar_abundances.csv not found; using hardcoded Asplund (2009) defaults.')
+    XSOLAR = _XSOLAR_DEFAULT.copy()
+
+try:
+    NEWPARTDATA, PARTFLAG = load_partition_polynomials()
+except FileNotFoundError:
+    _warnings.warn(
+        'moog/data/partition_polynomials.csv not found; using hardcoded Irwin (1981) defaults.')
+    NEWPARTDATA = _NEWPARTDATA_DEFAULT.copy()
+    PARTFLAG = _PARTFLAG_DEFAULT.copy()
