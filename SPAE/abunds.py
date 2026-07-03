@@ -1,12 +1,52 @@
 #Functions to derive absolute abundances with MOOGSILENT and abundances relative to the Sun ([x/H])
 
+from collections import defaultdict
+
 from scipy.stats import linregress
 import numpy as np
-import os
 
-from .read_write import read_file
 from . import atmos as atmos
 from . import prior
+from .moog.state import State
+from .moog.abfind import abfind_from_files
+from .moog.atomic_data import ELEMENT_NAMES
+
+
+_ION_LABELS = {0: 'I', 1: 'II', 2: 'III'}
+
+_RESULT_DTYPE = np.dtype([
+    ('wavelength', 'f8'), ('ID', 'f8'), ('EP', 'f8'), ('logGF', 'f8'),
+    ('EWin', 'f8'), ('logRWin', 'f8'), ('abund', 'f8'), ('delavg', 'f8'),
+])
+
+
+def _species_name(atom1):
+    """Map atom1 float (e.g. 26.0=Fe I, 26.1=Fe II) to MOOG-style label."""
+    z = int(atom1 + 0.0001)
+    ion = round((atom1 % 1) * 10)
+    sym = ELEMENT_NAMES[z - 1]      # 2-char symbol, space-padded for 1-char elements
+    return f"{sym} {_ION_LABELS.get(ion, str(ion + 1))} "
+
+
+def _pymoog_to_spae(result):
+    """Convert abfind() result dict to (el_found, abundances) matching read_file format."""
+    groups = defaultdict(list)
+    for line in result['lines']:
+        groups[line['species']].append(line)
+
+    el_found = []
+    abundances = []
+    for atom1 in sorted(groups.keys()):
+        rows = []
+        for ln in groups[atom1]:
+            ew_ma  = ln['ew_obs']                                  # mÅ
+            logrw  = np.log10(ew_ma * 1e-3 / ln['wave'])
+            rows.append((ln['wave'], atom1, ln['ep'], ln['loggf'],
+                         ew_ma, logrw, ln['abund'], ln['delavg']))
+        el_found.append(_species_name(atom1))
+        abundances.append(np.array(rows, dtype=_RESULT_DTYPE))
+
+    return el_found, abundances
 
 
 #Function to derive abundances
@@ -21,9 +61,8 @@ def abunds_func(x, print_atmosphere=True, print_moog=False):
     if print_atmosphere:
         atmos.print_output(output, "star.mod", teff, logg, feh, micro)
 
-    # Call moog
-    os.system('/usr/local/moognov2019silent/MOOGSILENT') #helium
-    el_found, abundances = read_file("moog_out.2")
+    state = State()
+    el_found, abundances = _pymoog_to_spae(abfind_from_files(state))
 
     return el_found, abundances
 
