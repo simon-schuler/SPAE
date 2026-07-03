@@ -336,9 +336,15 @@ class State:
     prot: np.ndarray = _zeros(1000)   # rotation-broadened
     pmac: np.ndarray = _zeros(1000)   # macroturbulence-broadened
 
-    # abfind statistics output
-    average: float = 0.0
-    deviate: float = 0.0
+    # abfind statistics output (Pstuff.com)
+    average:  float = 0.0
+    deviate:  float = 0.0
+    xxm1: float = 0.0;  xxb1: float = 0.0;  xxr1: float = 0.0  # EP trend
+    xxm2: float = 0.0;  xxb2: float = 0.0;  xxr2: float = 0.0  # RW trend
+    xxm3: float = 0.0;  xxb3: float = 0.0;  xxr3: float = 0.0  # wavelength trend
+    deltaep:  float = 0.0
+    deltarw:  float = 0.0
+    deltawv:  float = 0.0
 
     # Observed spectrum (for synth overlay)
     xobs: np.ndarray = field(default_factory=lambda: np.zeros(500000, dtype=np.float32))
