@@ -50,6 +50,8 @@ def _write_abund_block(f2, state, lines, species_dict, match_all_ions=False):
         name, roman, iatom = _species_parts(sp_key)
         input_abund = math.log10(state.xabund[iatom - 1]) + 12.0
 
+        # blank line between species blocks for readability
+        f2.write("\n")
         # format 3002: a2 element + a4 ionization (" I  ", " II ", etc.)
         f2.write(
             f"Abundance Results for Species {name:2s} {roman:<3s}"
