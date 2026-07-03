@@ -325,6 +325,8 @@ class State:
     # ------------------------------------------------------------------ #
 
     # Smoothing profile parameters (used by smooth.py / synth driver)
+    smtype:      str   = 'n'   # smoothing type: n/g/l/v/c/m/d/r/p
+    addflux:     float = 0.0   # veiling (extra continuum fraction)
     vsini:       float = 0.0   # projected rotation velocity [km/s]
     limbdark:    float = 0.0   # limb darkening coefficient
     vmac:        float = 0.0   # macroturbulence [km/s]
