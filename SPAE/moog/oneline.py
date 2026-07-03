@@ -38,10 +38,13 @@ def oneline(state, imode: int) -> None:
     else:
         st1 = state.wavestep
 
+    # Set COMMON wave variable before any opacity/cdcalc calls (Fortran Oneline.f line 34)
+    state.wave = state.wave1[lim1]
+
     # Continuum: recompute only when wavelength shifts by more than 30 Å
-    if abs(state.wave1[lim1] - state.waveold) > 30.0:
-        state.waveold = state.wave1[lim1]
-        opacit(state, 2, state.wave1[lim1])
+    if abs(state.wave - state.waveold) > 30.0:
+        state.waveold = state.wave
+        opacit(state, 2, state.wave)
         cdcalc(state, 1)
         first = 0.4343 * state.cd[0]
         state.flux, _ = rinteg(state.xref[:ntau], state.cd[:ntau], ntau, first)

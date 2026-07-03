@@ -236,9 +236,11 @@ def eqlib(state) -> None:
     Parameters
     ----------
     state : State
-        MOOG State dataclass.  Requires that ntau, t, ne, nhtot, xabund,
-        amol, nmol, datmol, and molopt are already populated.
+        MOOG State dataclass.  Requires ntau, t, ne, nhtot, xabund, molopt.
     """
+    # Fortran BLOCK DATA constants (analogous to compile-time initialisation)
+    init_mol_data(state)
+
     ntau = state.ntau
     nmol = state.nmol
 
