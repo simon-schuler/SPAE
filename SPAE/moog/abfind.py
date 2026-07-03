@@ -235,7 +235,7 @@ def abfind_from_files(state) -> dict:
 
     state.fparam must point to a valid batch.par before calling.
     """
-    params(state)
+    params(state, state.fparam)
     inmodel(state)
     inlines(state, 1)
     eqlib(state)

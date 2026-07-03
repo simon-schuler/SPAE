@@ -126,6 +126,6 @@ def synth_from_files(state, **kwargs) -> dict:
     state.fparam must point to a valid batch.par before calling.
     Smoothing kwargs are forwarded to synth().
     """
-    params(state)
+    params(state, state.fparam)
     inmodel(state)
     return synth(state, **kwargs)
