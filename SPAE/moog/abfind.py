@@ -141,8 +141,12 @@ def abfind(state) -> dict:
     """
     state.mode = 2
 
-    # Build curve-of-growth lookup table
+    # Build curve-of-growth lookup table (clobbers nlines=1 and wave1[0])
     fakeline(state)
+
+    # Fortran Abfind.f line 61: re-read linelist after fakeline to restore
+    # nlines and real line parameters (fakeline leaves nlines=1 with fake Fe I)
+    inlines(state, 1)
 
     # Doppler widths, damping, line-centre opacities for all lines
     state.waveold = 0.0   # force continuum recompute on first line
