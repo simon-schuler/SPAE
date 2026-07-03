@@ -202,6 +202,7 @@ class State:
     rwhigh: float = 0.0
     rwstep: float = 0.0
     cogatom: float = 0.0
+    xratio:  float = 0.001   # weedout strength/continuum opacity ratio cutoff
 
     # Damping totals
     gammatot: float = 0.0

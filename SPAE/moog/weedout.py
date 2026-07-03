@@ -97,16 +97,19 @@ def weedout(state, xratio: float) -> dict:
     }
 
 
-def weedout_from_files(state, xratio: float) -> dict:
+def weedout_from_files(state, xratio: float = None) -> dict:
     """
     Full pipeline: read params → model → eqlib → lines → weedout.
 
     Note: eqlib is called before inlines here, matching Weedout.f.
     state.fparam must point to a valid batch.par (or equivalent) before calling.
     xratio is the minimum line/continuum opacity ratio to keep a line.
+    If None, reads xratio from state.xratio (set by 'weedlimits' in batch.par).
     """
     params(state, state.fparam)
     inmodel(state)
     eqlib(state)        # called before inlines — matches Weedout.f ordering
     inlines(state, 1)
+    if xratio is None:
+        xratio = state.xratio
     return weedout(state, xratio)

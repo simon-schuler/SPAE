@@ -236,6 +236,11 @@ def params(state, param_file: str = 'batch.par') -> None:
             state.wavestep = float(vals[3])
             state.cogatom  = float(vals[4])
 
+        elif keyword == 'weedlimits':
+            vals = raw_lines[i].split()
+            i += 1
+            state.xratio = float(vals[0])
+
         # ---- abundance overrides ----
         elif keyword == 'abundances':
             vals = rest.split()

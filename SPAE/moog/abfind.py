@@ -217,9 +217,15 @@ def abfind(state) -> dict:
             'average': sp_stats['average'],
             'deviate': sp_stats['deviate'],
             'n':       sp_stats['kount'],
-            'ep_slope':  sp_stats['ep_slope'],
-            'rw_slope':  sp_stats['rw_slope'],
-            'wv_slope':  sp_stats['wv_slope'],
+            'ep_slope':     sp_stats['ep_slope'],
+            'ep_intercept': sp_stats['ep_intercept'],
+            'ep_r':         sp_stats['ep_r'],
+            'rw_slope':     sp_stats['rw_slope'],
+            'rw_intercept': sp_stats['rw_intercept'],
+            'rw_r':         sp_stats['rw_r'],
+            'wv_slope':     sp_stats['wv_slope'],
+            'wv_intercept': sp_stats['wv_intercept'],
+            'wv_r':         sp_stats['wv_r'],
         }
 
     return {'lines': lines_out, 'species': species_out}

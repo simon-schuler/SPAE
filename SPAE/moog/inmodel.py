@@ -267,6 +267,7 @@ def inmodel(state, eqlib_func=None) -> None:
         parts = natoms_line.split()
         natoms  = int(parts[0])
         abscale = float(parts[1])
+        state.abscale = abscale
 
         overrides = {}
         if natoms != 0:
