@@ -3,6 +3,11 @@ Versions
 notes.txt
 test_notes.txt
 SPAE/data/*.DAT
+SPAE/data/*.pickle
+.DS_Store
+git.notes
+run_moog.txt
+spae.notes
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
