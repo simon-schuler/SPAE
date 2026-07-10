@@ -3,7 +3,7 @@ import numpy as np
 import emcee
 import time
 from multiprocessing import Pool
-from .abunds import abunds_func, obj_func, in_bounds
+from .abunds import abunds_func, obj_func, in_bounds, _EP_SLOPE_SCALE, _REW_SLOPE_SCALE
 from .moog.inlines import parse_linelist
 from . import atmos as _atmos
 
@@ -15,20 +15,24 @@ def _worker_init():
 
 def run_spae(linelist, sun_el=None, sun_abs=None, x_0=(5777, 4.44, 0.01, 1.38),
              n_dim=4, n_walkers=40, n_steps=1000, include_prior=False,
-             n_cores=None):
+             n_cores=None, ep_slope_scale=_EP_SLOPE_SCALE, rew_slope_scale=_REW_SLOPE_SCALE):
     """Run the SPAE MCMC sampler.
 
     Parameters
     ----------
-    linelist     : str   — absolute path to the MOOG line list for the star
-    sun_el       : list  — element labels from sun_abs() for differential mode
-    sun_abs      : list  — solar abundances from sun_abs()
-    x_0          : tuple — initial guess (teff, logg, feh, micro)
-    n_walkers    : int   — number of emcee walkers (default 40)
-    n_steps      : int   — MCMC steps per walker (default 1000)
-    include_prior: bool  — include spectroscopic prior on Teff/logg
-    n_cores      : int or None — CPU cores for parallel likelihood evaluation;
-                   None uses all available cores, 1 disables multiprocessing
+    linelist       : str   — absolute path to the MOOG line list for the star
+    sun_el         : list  — element labels from sun_abs() for differential mode
+    sun_abs        : list  — solar abundances from sun_abs()
+    x_0            : tuple — initial guess (teff, logg, feh, micro)
+    n_walkers      : int   — number of emcee walkers (default 40)
+    n_steps        : int   — MCMC steps per walker (default 1000)
+    include_prior  : bool  — include spectroscopic prior on Teff/logg
+    n_cores        : int or None — CPU cores for parallel likelihood evaluation;
+                     None uses all available cores, 1 disables multiprocessing
+    ep_slope_scale : float — penalty scale (dex/eV) on the Fe I EP slope;
+                     smaller = tighter excitation-balance constraint
+    rew_slope_scale: float — penalty scale (dex/dex) on the Fe I REW slope;
+                     smaller = tighter ionization/curve-of-growth constraint
     """
     t_0 = time.time()
 
@@ -50,7 +54,8 @@ def run_spae(linelist, sun_el=None, sun_abs=None, x_0=(5777, 4.44, 0.01, 1.38),
 
     sampler_kwargs = dict(
         blobs_dtype=blobs_dtype,
-        args=(len(el_found), linelist, sun_el, sun_abs, include_prior),
+        args=(len(el_found), linelist, sun_el, sun_abs, include_prior,
+              ep_slope_scale, rew_slope_scale),
     )
 
     if n_cores > 1:

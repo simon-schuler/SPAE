@@ -108,7 +108,7 @@ def abs_abunds(el_found,abundances,el):
 # Penalty term: -(slope / scale)^2 / 2  (Gaussian prior centred on zero slope)
 # Larger value = weaker penalty.  Set to np.inf to disable a term entirely.
 _EP_SLOPE_SCALE  = 0.010   # dex / eV
-_REW_SLOPE_SCALE = 0.050   # dex / dex
+_REW_SLOPE_SCALE = 0.010   # dex / dex
 
 
 def in_bounds(x):
@@ -126,7 +126,8 @@ def in_bounds(x):
     return True
 
 
-def obj_func(x, n_elems, linelist, sun_el=None, sun_abs=None, include_prior=False):
+def obj_func(x, n_elems, linelist, sun_el=None, sun_abs=None, include_prior=False,
+             ep_slope_scale=_EP_SLOPE_SCALE, rew_slope_scale=_REW_SLOPE_SCALE):
     """Define the objective function."""
     teff, logg, feh, micro = x
 
@@ -164,8 +165,8 @@ def obj_func(x, n_elems, linelist, sun_el=None, sun_abs=None, include_prior=Fals
     fe2_likely = np.sum(-(abunds_fe2['abund'] - fe_mean)**2 / (2*fe_std**2)) - np.log(fe_std) * len(abunds_fe2['abund'])
 
     ln_likelihood = (fe1_likely + fe2_likely
-                     - (ep_slope  / _EP_SLOPE_SCALE )**2 / 2
-                     - (rew_slope / _REW_SLOPE_SCALE)**2 / 2)
+                     - (ep_slope  / ep_slope_scale )**2 / 2
+                     - (rew_slope / rew_slope_scale)**2 / 2)
 
     ln_posterior = ln_prior + ln_likelihood
 
