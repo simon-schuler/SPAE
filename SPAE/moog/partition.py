@@ -109,6 +109,47 @@ def ucalc(j: int, temp: float) -> float:
     return max(pmin, p1 + (p2 - p1) * dt)
 
 
+def ucalc_vec(j: int, temps: np.ndarray) -> np.ndarray:
+    """ucalc vectorized over an array of temperatures (same algorithm as ucalc)."""
+    temps = np.asarray(temps, dtype=float)
+    Z   = j // 4
+    ion = j  % 4
+    if ion == 0:   chix = XCHI1[Z]
+    elif ion == 1: chix = XCHI2[Z]
+    elif ion == 2: chix = XCHI3[Z]
+    else:          return np.ones(len(temps))
+    if chix <= 0.0 or chix >= 90.0:
+        return np.ones(len(temps))
+    t2000 = chix * 2000.0 / 11.0
+    if t2000 <= 0.0:
+        return np.ones(len(temps))
+
+    it = np.clip(np.floor(temps / t2000 - 0.5).astype(int), 1, 9)
+    dt = temps / t2000 - it - 0.5
+    i  = (it + 1) // 2          # 1-based NUDATA row, range 1-5
+
+    val    = NUDATA[j, i - 1].astype(int)
+    k1     = val // 100000
+    k2     = val  % 100000
+    k3     = k2  // 10
+    kscale = k2   % 10
+    kscale = np.where((kscale >= 1) & (kscale <= 4), kscale, 1)
+    scale  = _SCALE[kscale - 1]
+
+    even = (it % 2 == 0)
+    # For even it, need NUDATA[j, i] (next row); i<=4 when even (it<=8)
+    i_safe   = np.minimum(i, 4)
+    val_next = np.where(even, NUDATA[j, i_safe].astype(int), 0)
+    kscale2  = val_next % 10
+    kscale2  = np.where((kscale2 >= 1) & (kscale2 <= 4), kscale2, 1)
+    k1_next  = val_next // 100000
+
+    p1 = np.where(even, k3 * scale,                        k1 * scale)
+    p2 = np.where(even, k1_next * _SCALE[kscale2 - 1],    k3 * scale)
+
+    return np.maximum(1.0, p1 + (p2 - p1) * dt)
+
+
 def partnew(iatom: int, ion: int, temp: float) -> float:
     """
     Partition function from Irwin (1981) polynomial fit.
@@ -151,6 +192,22 @@ def partnew(iatom: int, ion: int, temp: float) -> float:
     return max(1.0, np.exp(ulog))
 
 
+def partnew_vec(iatom: int, ion: int, temps: np.ndarray) -> np.ndarray:
+    """partnew vectorized over an array of temperatures."""
+    temps = np.asarray(temps, dtype=float)
+    row = PARTFLAG[iatom - 1, ion - 1] - 1
+    if row < 0 or row >= len(NEWPARTDATA):
+        return np.ones(len(temps))
+    tlog   = np.log(temps)
+    coeffs = NEWPARTDATA[row]
+    ulog   = np.zeros(len(temps))
+    tpow   = np.ones(len(temps))
+    for c in coeffs:
+        ulog += c * tpow
+        tpow *= tlog
+    return np.maximum(1.0, np.exp(ulog))
+
+
 def partfn(state) -> None:
     """
     Compute partition functions for all 95 elements, 4 ionisation states,
@@ -164,14 +221,12 @@ def partfn(state) -> None:
     state : State
         The moog State dataclass (must have ntau and t populated).
     """
-    ntau = state.ntau
-    for Z in range(1, 96):          # 1-based element number
-        for ion in range(1, 5):     # 1-based ionisation state (1=I, 2=II, …)
-            j = 4 * (Z - 1) + (ion - 1)   # 0-based NUDATA species index
-            use_new = (PARTFLAG[Z - 1, ion - 1] > 0)
-            for k in range(ntau):
-                temp = state.t[k]
-                if use_new:
-                    state.u[Z - 1, ion - 1, k] = partnew(Z, ion, temp)
-                else:
-                    state.u[Z - 1, ion - 1, k] = ucalc(j, temp)
+    ntau  = state.ntau
+    temps = state.t[:ntau]
+    for Z in range(1, 96):
+        for ion in range(1, 5):
+            j = 4 * (Z - 1) + (ion - 1)
+            if PARTFLAG[Z - 1, ion - 1] > 0:
+                state.u[Z - 1, ion - 1, :ntau] = partnew_vec(Z, ion, temps)
+            else:
+                state.u[Z - 1, ion - 1, :ntau] = ucalc_vec(j, temps)

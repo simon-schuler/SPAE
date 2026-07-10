@@ -358,3 +358,7 @@ class State:
     lount: int = 0
     kount: int = 0
     nsyn:  int = 0
+
+    # Per-abfind call cache: lim1 → adapted st1 (avoids re-running the adaptation
+    # loop when lineabund calls oneline multiple times for the same line)
+    _st1_cache: dict = field(default_factory=dict)

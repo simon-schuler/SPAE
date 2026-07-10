@@ -336,6 +336,31 @@ def eqlib(state) -> None:
     state.iorder[:neq] = iorder[:neq]
 
     # ------------------------------------------------------------------ #
+    # Precompute vectorization tables (outside depth/NR loops)            #
+    # ------------------------------------------------------------------ #
+    disc_table = np.array([[_discov(state.amol[jm], int(iorder[k]))
+                             for k in range(neq)] for jm in range(nmol)], dtype=int)
+
+    mol_mask    = np.array([state.amol[jm] >= 100.0 for jm in range(nmol)])
+    mol_indices = np.where(mol_mask)[0]
+    ion_indices = np.where(~mol_mask)[0]
+
+    # True molecules: composition matrix, atom count, ionisation, equilibrium polynomial
+    mol_comp   = disc_table[mol_indices, :]        # (n_mol, neq) atom counts
+    mol_count  = mol_comp.sum(axis=1).astype(float)
+    mol_hion   = np.array([10.0 * (state.amol[jm] - int(state.amol[jm]))
+                            for jm in mol_indices])
+    poly_coeff = const[1:6, mol_indices].T         # (n_mol, 5)
+    d0_mol     = const[0, mol_indices]             # (n_mol,)
+
+    # Ionic species: index into xatom, ionisation potential, PF ratio table
+    ion_k_idx  = np.array([next(k for k in range(neq)
+                                if iorder[k] == int(state.amol[jm]))
+                            for jm in ion_indices], dtype=int)
+    ion_chi    = const[0, ion_indices]             # (n_ion,) chi1 values
+    ion_pf     = const[1:6, ion_indices]           # (5, n_ion) PF ratios at 5 T points
+
+    # ------------------------------------------------------------------ #
     # 3. Main loop: iterate over depth layers from deep to shallow         #
     # ------------------------------------------------------------------ #
     xatom = np.zeros(30)   # neutral number densities of equilibrium atoms
@@ -361,83 +386,37 @@ def eqlib(state) -> None:
 
         # ---- Newton-Raphson iteration ----
         while True:
+            # True molecules (vectorized)
+            if state.t[i] > 12000.0:
+                state.xmol[mol_indices, i] = 1.0e-20
+            else:
+                th       = 5040.0 / state.t[i]
+                lth      = np.log10(th)
+                poly_vec = np.array([1.0, lth, lth**2, lth**3, lth**4])
+                kp_mol   = poly_coeff @ poly_vec - d0_mol * th
+                log_xa   = np.log(np.maximum(xatom[:neq], 1e-300))
+                log_xm   = mol_comp @ log_xa                 # (n_mol,)
+                xmol_mol = (np.exp(log_xm) * tk**(mol_count - 1.0)
+                             / 10.0**kp_mol / state.ne[i]**mol_hion)
+                state.xmol[mol_indices, i] = xmol_mol
 
-            # Compute molecule/ion number densities
-            for jmol in range(nmol):
-                atom = float(state.amol[jmol])
-                if atom >= 100.0:
-                    if state.t[i] > 12000.0:
-                        state.xmol[jmol, i] = 1.0e-20
-                    else:
-                        state.xmol[jmol, i] = 1.0
-                        count = 0
-                        atm = atom
-                        while True:
-                            ia, ib = _sunder(atm)
-                            count += 1
-                            for k in range(neq):
-                                if iorder[k] == ia:
-                                    state.xmol[jmol, i] *= xatom[k]
-                                    break
-                            if ib == 0:
-                                break
-                            atm = float(ib)
+            # Ionic species: Saha equation — must update every NR iteration (vectorized)
+            if len(ion_indices) > 0:
+                delt      = (state.t[i] - state.t[0]) / tdel
+                m         = min(int(delt) + 1, 4)
+                delt_frac = delt - int(delt)
+                u1_ion    = ion_pf[m - 1] + (ion_pf[m] - ion_pf[m - 1]) * delt_frac
+                xmol_ion  = (4.825e15 * u1_ion * state.t[i]**1.5 / state.ne[i]
+                              * np.exp(-1.1605e4 * ion_chi / state.t[i])
+                              * xatom[ion_k_idx])
+                state.xmol[ion_indices, i] = xmol_ion
 
-                        # Equilibrium constant polynomial in log10(theta)
-                        hion = 10.0 * (state.amol[jmol] - int(state.amol[jmol]))
-                        th   = 5040.0 / state.t[i]
-                        lth  = np.log10(th)
-                        kp   = (const[1, jmol]
-                                + const[2, jmol] * lth
-                                + const[3, jmol] * lth ** 2
-                                + const[4, jmol] * lth ** 3
-                                + const[5, jmol] * lth ** 4
-                                - const[0, jmol] * th)
-                        state.xmol[jmol, i] *= (
-                            tk ** (count - 1.0) / 10.0 ** kp
-                        ) / (state.ne[i] ** hion)
-
-                else:
-                    # Ionic species: Saha equation with precomputed PF ratios
-                    delt      = (state.t[i] - state.t[0]) / tdel
-                    m         = min(int(delt) + 1, 4)   # 0-based: Fortran m-1
-                    delt_frac = delt - int(delt)
-                    u1        = (const[m, jmol]
-                                 + (const[m + 1, jmol] - const[m, jmol]) * delt_frac)
-                    iatom1 = int(atom)
-                    for k in range(neq):
-                        if iorder[k] == iatom1:
-                            state.xmol[jmol, i] = (
-                                4.825e15 * u1 * state.t[i] ** 1.5
-                                / state.ne[i]
-                                * np.exp(-1.1605e4 * const[0, jmol] / state.t[i])
-                                * xatom[k]
-                            )
-                            break
-
-            # Build Jacobian matrix c and residual vector deltax
-            c_mat  = np.eye(neq)
-            deltax = np.empty(neq)
-
-            for k in range(neq):
-                korder   = iorder[k]
-                deltax[k] = -xfic[k] + xatom[k]
-
-                for kk in range(neq):
-                    kderiv = iorder[kk]
-                    for jj in range(nmax):
-                        jmol1 = ident[k, jj]
-                        if jmol1 == 0:
-                            break
-                        jmol = jmol1 - 1   # 0-based molecule index
-                        num2 = _discov(state.amol[jmol], kderiv)
-                        if num2 == 0:
-                            continue
-                        num1 = _discov(state.amol[jmol], korder)
-                        c_mat[k, kk] += (state.xmol[jmol, i] * num1 * num2
-                                         / xatom[kk])
-                        if k == kk:
-                            deltax[k] += num1 * state.xmol[jmol, i]
+            # Jacobian and residual (vectorized)
+            xmol_i   = state.xmol[:nmol, i]
+            weighted = disc_table * xmol_i[:, None]          # (nmol, neq)
+            deltax   = -xfic[:neq] + xatom[:neq] + weighted.sum(axis=0)
+            xa_safe  = np.maximum(xatom[:neq], 1e-200)
+            c_mat    = np.eye(neq) + (disc_table.T @ weighted) / xa_safe[None, :]
 
             # Invert and compute corrections
             try:

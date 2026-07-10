@@ -6,15 +6,6 @@ import numpy as np
 from scipy.special import expn as _scipy_expn
 
 
-def expint(x: float, n: int) -> float:
-    """n-th order exponential integral E_n(x) via scipy.special.expn."""
-    if abs(x) >= 100.0:
-        return 0.0
-    if x == 0.0:
-        return 0.0 if n <= 1 else 1.0 / float(n - 1)
-    return float(_scipy_expn(n, float(x)))
-
-
 def cdcalc(state, number: int) -> None:
     """
     Compute contribution functions into state.cd[:ntau].
@@ -28,7 +19,6 @@ def cdcalc(state, number: int) -> None:
     wave = state.wave   # current wavelength [Å]
 
     # Planck function Bλ [erg/cm²/s/Å/sr]
-    # cdcalc.f: (1.19089e25/wave²)*1e10 / (wave³*(exp(1.43879e8/(wave*T))-1))
     scont = ((1.19089e25 / wave**2) * 1.0e10) / (
         wave**3 * (np.exp(1.43879e8 / (wave * state.t[:ntau])) - 1.0))
     state.scont[:ntau] = scont
@@ -42,7 +32,7 @@ def cdcalc(state, number: int) -> None:
         if state.fluxintopt == 1:
             cd = kap * tref * scont * np.exp(-taulam) / (0.4343 * kref)
         else:
-            e2 = np.array([expint(taulam[i], 2) for i in range(ntau)])
+            e2 = _scipy_expn(2, taulam)
             cd = 2.0 * kap * tref * scont * e2 / (0.4343 * kref)
         state.cd[:ntau] = cd
 
@@ -60,9 +50,56 @@ def cdcalc(state, number: int) -> None:
                   (scont * np.exp(-taulam) -
                    (1.0 + kapnu / kap) * sline * exptau))
         else:
-            e2_lam = np.array([expint(taulam[i],          2) for i in range(ntau)])
-            e2_tot = np.array([expint(taulam[i]+taunu[i], 2) for i in range(ntau)])
+            e2_lam = _scipy_expn(2, taulam)
+            e2_tot = _scipy_expn(2, taulam + taunu)
             cd = (2.0 * tref * kap / (0.4343 * flux * kref) *
                   (scont * e2_lam -
                    (1.0 + kapnu / kap) * sline * e2_tot))
         state.cd[:ntau] = cd
+
+
+def cdcalc_batch(state, kapnu_batch, taunu_batch, waves):
+    """
+    Batched cdcalc (line+continuum) for multiple wavelengths.
+
+    taulam and kaplam must already be set in state (from opacit at line centre).
+
+    Parameters
+    ----------
+    state        : State
+    kapnu_batch  : (nwave, ntau)
+    taunu_batch  : (nwave, ntau)
+    waves        : (nwave,) — wavelengths [Å] for Planck function
+
+    Returns
+    -------
+    cd_batch : (nwave, ntau)
+    """
+    ntau   = state.ntau
+    taulam = state.taulam[:ntau]   # (ntau,) — fixed
+    kap    = state.kaplam[:ntau]   # (ntau,)
+    kref   = state.kapref[:ntau]   # (ntau,)
+    tref   = state.tauref[:ntau]   # (ntau,)
+    flux   = state.flux
+
+    # Planck function per wavelength: (nwave, ntau)
+    scont_b = ((1.19089e25 / waves[:, None] ** 2) * 1.0e10) / (
+        waves[:, None] ** 3 * (
+            np.exp(1.43879e8 / (waves[:, None] * state.t[:ntau][None, :])) - 1.0))
+
+    factor = 2.0 * tref[None, :] * kap[None, :] / (0.4343 * flux * kref[None, :])
+
+    if state.fluxintopt == 1:
+        tau_tot  = taulam[None, :] + taunu_batch      # (nwave, ntau)
+        exptau   = np.where(tau_tot <= 50.0, np.exp(-tau_tot), 0.0)
+        cd_batch = (factor
+                    * (scont_b * np.exp(-taulam)[None, :]
+                       - (1.0 + kapnu_batch / kap[None, :]) * scont_b * exptau))
+    else:
+        e2_lam = _scipy_expn(2, taulam)                            # (ntau,)
+        e2_tot = _scipy_expn(2, taulam[None, :] + taunu_batch)    # (nwave, ntau)
+        cd_batch = (factor
+                    * (scont_b * e2_lam[None, :]
+                       - (1.0 + kapnu_batch / kap[None, :]) * scont_b * e2_tot))
+
+    return cd_batch
