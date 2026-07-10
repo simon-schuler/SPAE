@@ -15,8 +15,8 @@ the parameter file, model atmosphere, and line list from disk.
 import numpy as np
 
 from .params    import params
-from .inmodel   import inmodel
-from .inlines   import inlines
+from .inmodel   import inmodel, inmodel_from_array
+from .inlines   import inlines, parse_linelist, apply_parsed_lines
 from .eqlib     import eqlib
 from .nearly    import nearly
 from .fakeline  import fakeline
@@ -125,13 +125,20 @@ def _molquery(state) -> None:
 # Main driver
 # ---------------------------------------------------------------------------
 
-def abfind(state) -> dict:
+def abfind(state, parsed_lines=None) -> dict:
     """
     Derive elemental abundances from equivalent widths.
 
     Assumes state is fully populated (model atmosphere, line list, and
     molecular equilibrium already loaded).  Calls fakeline() → nearly(1) →
     per-species lineabund() → stats().
+
+    Parameters
+    ----------
+    parsed_lines : dict or None
+        Pre-parsed linelist snapshot from parse_linelist().  If provided,
+        line data is restored from the dict instead of re-reading the file
+        after fakeline() — eliminates one file read per call.
 
     Returns
     -------
@@ -144,9 +151,12 @@ def abfind(state) -> dict:
     # Build curve-of-growth lookup table (clobbers nlines=1 and wave1[0])
     fakeline(state)
 
-    # Fortran Abfind.f line 61: re-read linelist after fakeline to restore
-    # nlines and real line parameters (fakeline leaves nlines=1 with fake Fe I)
-    inlines(state, 1)
+    # Restore real line data after fakeline — from memory if pre-parsed,
+    # otherwise re-read from disk (original behaviour)
+    if parsed_lines is not None:
+        apply_parsed_lines(state, parsed_lines)
+    else:
+        inlines(state, 1)
 
     # Doppler widths, damping, line-centre opacities for all lines
     state.waveold = 0.0   # force continuum recompute on first line
@@ -246,3 +256,41 @@ def abfind_from_files(state) -> dict:
     inlines(state, 1)
     eqlib(state)
     return abfind(state)
+
+
+def abfind_direct(state, atmos_array, feh, vt_kms, linelist,
+                  extra_overrides=None) -> dict:
+    """
+    Full abfind pipeline without star.mod or batch.par file I/O.
+
+    Parameters
+    ----------
+    state          : State
+    atmos_array    : ndarray, shape (N, 7) returned by atmos.atmos()
+    feh            : float  — [Fe/H]
+    vt_kms         : float  — microturbulence in km/s
+    linelist       : str or dict
+        Either a path to the MOOG line list file (str), or a pre-parsed
+        snapshot dict from parse_linelist() for zero file I/O per call.
+    extra_overrides : dict {Z: logeps} or None
+        Passed through to inmodel_from_array(); defaults to {3: 3.30} (Li).
+    """
+    # Reset abundance overrides (mirrors params._init_defaults)
+    state.numpecatom     = 0
+    state.numatomsyn     = 0
+    state.ninetynineflag = 0
+    state.pec[:]         = 0
+    state.pecabund[:]    = 0.0
+    state.abfactor[:]    = 0.0
+
+    # Accept either a filename (str) or a pre-parsed dict
+    if isinstance(linelist, dict):
+        parsed = linelist
+    else:
+        state.flines = linelist
+        parsed = parse_linelist(linelist)
+
+    inmodel_from_array(state, atmos_array, feh, vt_kms, extra_overrides)
+    apply_parsed_lines(state, parsed)
+    eqlib(state)
+    return abfind(state, parsed_lines=parsed)

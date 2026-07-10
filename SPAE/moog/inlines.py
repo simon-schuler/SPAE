@@ -83,6 +83,18 @@ def inlines(state, num: int = 1) -> None:
     linfileopt = state.linfileopt
     is_blends  = state.control.strip() == 'blends'
 
+    # Apply peculiar element abundance overrides (Inlines.f lines 27-32).
+    # num==2 and num==6 skip this block in the Fortran (goto 4 / goto 340).
+    # pecabund[z, k] is a log offset from xabu; applied before eqlib/nearly.
+    if state.numpecatom > 0 and num not in (2, 6):
+        k = max(0, state.isynth - 1)   # isynth is 1-indexed
+        for z in range(3, 96):         # elements 3–95 (1-indexed), as in Fortran
+            state.xabund[z - 1] = (
+                10.0 ** state.pecabund[z - 1, k]
+                * 10.0 ** state.abfactor[k]
+                * state.xabu[z - 1]
+            )
+
     # ------------------------------------------------------------------ #
     # 1. Strong lines (max 40)                                             #
     # ------------------------------------------------------------------ #
@@ -178,6 +190,78 @@ def inlines(state, num: int = 1) -> None:
     # 3. Post-processing                                                   #
     # ------------------------------------------------------------------ #
     _postprocess(state, total)
+
+
+def _snapshot_lines(state) -> dict:
+    """Return a copy of all line arrays currently loaded in state."""
+    total = state.nlines + state.nstrong
+    return {
+        'nlines':  state.nlines,
+        'nstrong': state.nstrong,
+        'linitle': state.linitle,
+        'wave1':   state.wave1[:total].copy(),
+        'atom1':   state.atom1[:total].copy(),
+        'e':       state.e[:total, :].copy(),
+        'gf':      state.gf[:total].copy(),
+        'dampnum': state.dampnum[:total].copy(),
+        'd0':      state.d0[:total].copy(),
+        'width':   state.width[:total].copy(),
+        'charge':  state.charge[:total].copy(),
+        'group':   state.group[:total].copy(),
+        'amass':   state.amass[:total].copy(),
+        'rdmass':  state.rdmass[:total].copy(),
+        'chi':     state.chi[:total, :].copy(),
+    }
+
+
+def apply_parsed_lines(state, parsed: dict) -> None:
+    """Copy a pre-parsed line snapshot back into state (no file I/O)."""
+    total = parsed['nlines'] + parsed['nstrong']
+    state.nlines   = parsed['nlines']
+    state.nstrong  = parsed['nstrong']
+    state.linitle  = parsed['linitle']
+    state.wave1[:total]   = parsed['wave1']
+    state.atom1[:total]   = parsed['atom1']
+    state.e[:total, :]    = parsed['e']
+    state.gf[:total]      = parsed['gf']
+    state.dampnum[:total] = parsed['dampnum']
+    state.d0[:total]      = parsed['d0']
+    state.width[:total]   = parsed['width']
+    state.charge[:total]  = parsed['charge']
+    state.group[:total]   = parsed['group']
+    state.amass[:total]   = parsed['amass']
+    state.rdmass[:total]  = parsed['rdmass']
+    state.chi[:total, :]  = parsed['chi']
+
+
+def parse_linelist(filename: str, linfileopt: int = 0, dostrong: int = 0,
+                   iunits: int = 0, gfstyle: int = 0) -> dict:
+    """
+    Parse a MOOG linelist file once and return a snapshot dict.
+
+    The dict can be passed to apply_parsed_lines() to restore line data into
+    any State without reading the file again.  Intended for use in MCMC loops
+    where the linelist is fixed across thousands of likelihood evaluations.
+
+    Parameters
+    ----------
+    filename    : str  — path to the MOOG line list file
+    linfileopt  : int  — 0=fixed format (default), 1=free format
+    dostrong    : int  — 0=no strong lines (default)
+    iunits      : int  — 0=Angstroms (default), 1=microns
+    gfstyle     : int  — 0=log gf in file (default)
+    """
+    from .state import State
+    s = State()
+    s.flines     = filename
+    s.linfileopt = linfileopt
+    s.dostrong   = dostrong
+    s.iunits     = iunits
+    s.gfstyle    = gfstyle
+    s.control    = 'abfind '
+    s.numpecatom = 0
+    inlines(s, 1)
+    return _snapshot_lines(s)
 
 
 def _postprocess(state, total: int) -> None:

@@ -11,9 +11,22 @@ import numpy as np
 from .atomic_data import XSOLAR, XAM
 from .partition import partfn
 from .math_utils import rinteg
+from .eqlib import init_mol_data
 
 _BOLTZMANN = 1.38054e-16   # erg K⁻¹
 _AMU       = 1.6606e-24    # g
+
+# Standard SPAE molecule codes — matches the NMOL block written by atmos.print_output()
+_SPAE_MOL_CODES = [
+    607.0, 108.0, 106.0, 107.0,
+    606.0, 608.0, 112.0, 707.0,
+    708.0, 808.0,  12.1, 60808.0,
+    10108.0, 101.0,   6.1,    7.1,
+    8.1,  822.0,  22.1,
+]
+
+# Default per-element abundance override (Li at solar, matching SPAE's star.mod NATOMS block)
+_SPAE_LI_OVERRIDE = {3: 3.30}
 
 
 def _read_label_then_value(f):
@@ -410,3 +423,114 @@ def inmodel(state, eqlib_func=None) -> None:
     else:
         for i in range(ntau):
             state.xref[i] = np.log10(state.tauref[i])
+
+
+def inmodel_from_array(state, atmos_array, feh, vt_kms,
+                       extra_overrides=None) -> None:
+    """
+    Populate *state* from a (N×7) atmosphere array (atmos.atmos() output).
+
+    Equivalent to writing a KURUCZ star.mod then calling inmodel(state), but
+    with no file I/O.  Handles the KURUCZ model type only.
+
+    Parameters
+    ----------
+    state          : State
+    atmos_array    : ndarray, shape (N, 7) — columns [rhox, T, P, XNE, kappa, ...]
+    feh            : float  — [Fe/H], used as global abundance scale factor
+    vt_kms         : float  — microturbulence in km/s
+    extra_overrides : dict {Z: logeps} or None
+        Per-element log-epsilon overrides applied after the feh scaling.
+        Defaults to {3: 3.30} (Li at solar, matching SPAE's standard star.mod).
+    """
+    if extra_overrides is None:
+        extra_overrides = _SPAE_LI_OVERRIDE
+
+    arr  = np.asarray(atmos_array, dtype=np.float64)
+    ntau = arr.shape[0]
+    if ntau > 100:
+        raise ValueError(f"ntau={ntau} exceeds MOOG limit of 100")
+
+    state.modelnum += 1
+    state.modtype  = 'KURUCZ    '
+    state.moditle  = f'OVER{ntau}: [Fe/H]={feh:.2f} vt={vt_kms:.4f}'
+    state.ntau     = ntau
+    state.wavref   = 5000.0
+
+    # ---- Atmospheric structure (vectorized) --------------------------------
+    state.rhox[:ntau] = arr[:, 0]
+    state.t[:ntau]    = arr[:, 1]
+    state.pgas[:ntau] = arr[:, 2]
+    state.ne[:ntau]   = arr[:, 3]
+    kaprefmass        = arr[:, 4].copy()
+
+    # ---- Derived temperature quantities ------------------------------------
+    state.theta[:ntau] = 5040.0 / state.t[:ntau]
+    state.tkev[:ntau]  = 8.6171e-5 * state.t[:ntau]
+    state.tlog[:ntau]  = np.log(state.t[:ntau])
+
+    # ---- Convert log pressure / electron pressure if needed ----------------
+    if state.pgas[ntau - 1] / state.pgas[0] < 10.0:
+        state.pgas[:ntau] = 10.0 ** state.pgas[:ntau]
+    if state.ne[ntau - 1] / state.ne[0] < 20.0:
+        state.ne[:ntau] = 10.0 ** state.ne[:ntau]
+    if state.ne[ntau - 1] < 1.0e7:
+        state.ne[:ntau] /= _BOLTZMANN * state.t[:ntau]
+
+    # ---- Partition functions -----------------------------------------------
+    partfn(state)
+
+    # ---- Microturbulence (km/s → cm/s) -------------------------------------
+    state.vturb[:ntau] = vt_kms * 1.0e5
+
+    # ---- Abundances --------------------------------------------------------
+    state.abscale   = feh
+    xhyd            = 10.0 ** XSOLAR[0]
+    state.xabund[0] = 1.0
+    state.xabund[1] = 10.0 ** XSOLAR[1] / xhyd
+    for i in range(2, 95):
+        state.xabund[i] = 10.0 ** (XSOLAR[i] + feh) / xhyd
+        state.xabu[i]   = state.xabund[i]
+    for Z, logeps in extra_overrides.items():
+        state.xabund[Z - 1] = 10.0 ** logeps / xhyd
+        state.xabu[Z - 1]   = state.xabund[Z - 1]
+
+    # ---- Mean molecular weight ---------------------------------------------
+    wtnum = sum(state.xabund[i] * XAM[i] for i in range(95))
+    wtden = sum(state.xabund[i]           for i in range(95))
+    state.molweight[:ntau] = wtnum / (XAM[0] * wtden)
+
+    # ---- Mass density (vectorized) -----------------------------------------
+    state.rho[:ntau] = (state.pgas[:ntau] * state.molweight[:ntau]
+                        * _AMU / (_BOLTZMANN * state.t[:ntau]))
+
+    # ---- Fictitious H number density (quadratic formula, vectorized) --------
+    th  = 5040.0 / state.t[:ntau]
+    ah2 = 10.0 ** (-(12.7422 + (-5.1137 + (0.1145 - 0.0091 * th) * th) * th))
+    a1  = (1.0 + 2.0 * state.xabund[1]) * ah2
+    b1  = 1.0 + state.xabund[1]
+    ph  = -b1 / (2.0 * a1) + np.sqrt((b1 / (2.0 * a1)) ** 2
+                                       + state.pgas[:ntau] / a1)
+    state.nhtot[:ntau] = (ph + 2.0 * ph ** 2 * ah2) / (_BOLTZMANN * state.t[:ntau])
+
+    # ---- Molecule list (molset=0 → smallmollist; append SPAE standard codes) -
+    init_mol_data(state)   # ensures smallmollist/largemollist are populated before copy
+    if state.molset == 0:
+        state.amol[:110] = state.smallmollist
+        state.nmol = 30
+    else:
+        state.amol[:110] = state.largemollist
+        state.nmol = 59
+    existing = {round(state.amol[k]) for k in range(state.nmol)}
+    for code in _SPAE_MOL_CODES:
+        if round(code) not in existing:
+            state.amol[state.nmol] = code
+            existing.add(round(code))
+            state.nmol += 1
+
+    # ---- KURUCZ: tauref from rhox×κ integration, kapref, xref (log τ) ------
+    first = state.rhox[0] * kaprefmass[0]
+    _, fint = rinteg(state.rhox, kaprefmass, ntau, first)
+    state.tauref[:ntau] = np.cumsum(fint)
+    state.kapref[:ntau] = kaprefmass * state.rho[:ntau]
+    state.xref[:ntau]   = np.log10(state.tauref[:ntau])

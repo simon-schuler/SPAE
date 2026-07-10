@@ -8,7 +8,7 @@ import numpy as np
 from . import atmos as atmos
 from . import prior
 from .moog.state import State
-from .moog.abfind import abfind_from_files
+from .moog.abfind import abfind_direct
 from .moog.atomic_data import ELEMENT_NAMES
 
 
@@ -50,20 +50,17 @@ def _pymoog_to_spae(result):
 
 
 #Function to derive abundances
-def abunds_func(x, print_atmosphere=True, print_moog=False):
+def abunds_func(x, linelist):
     teff, logg, feh, micro = x
 
     if not in_bounds(x):
         return -np.inf, -np.inf
 
-    #will want to have path to MOOGSILENT to be a user input
-    output = atmos.atmos(teff, logg, feh)
-    if print_atmosphere:
-        atmos.print_output(output, "star.mod", teff, logg, feh, micro)
-
+    atmos_array = atmos.atmos(teff, logg, feh)
     state = State()
-    el_found, abundances = _pymoog_to_spae(abfind_from_files(state))
-
+    el_found, abundances = _pymoog_to_spae(
+        abfind_direct(state, atmos_array, feh, micro, linelist)
+    )
     return el_found, abundances
 
 
@@ -107,6 +104,13 @@ def abs_abunds(el_found,abundances,el):
     return star_abunds
 
 
+# Scale parameters for EP and REW slope penalties added to the log-likelihood.
+# Penalty term: -(slope / scale)^2 / 2  (Gaussian prior centred on zero slope)
+# Larger value = weaker penalty.  Set to np.inf to disable a term entirely.
+_EP_SLOPE_SCALE  = 0.010   # dex / eV
+_REW_SLOPE_SCALE = 0.050   # dex / dex
+
+
 def in_bounds(x):
     teff, logg, feh, micro = x
 
@@ -122,13 +126,13 @@ def in_bounds(x):
     return True
 
 
-def obj_func(x, n_elems, sun_el=None, sun_abs=None, include_prior=False):
+def obj_func(x, n_elems, linelist, sun_el=None, sun_abs=None, include_prior=False):
     """Define the objective function."""
     teff, logg, feh, micro = x
 
     # Check if stellar parameters are within valid ranges
     if not in_bounds(x):
-        return (-np.inf,) + tuple(np.zeros(2*n_elems+2))
+        return (-np.inf,) + tuple(np.zeros(2*n_elems+4))
 
     # Calculate the prior
     if include_prior:
@@ -138,9 +142,9 @@ def obj_func(x, n_elems, sun_el=None, sun_abs=None, include_prior=False):
         ln_prior = 0
 
 
-    el_found, abundances = abunds_func(x)
+    el_found, abundances = abunds_func(x, linelist)
     if len(abundances) < 2:
-        return (-np.inf,) + tuple(np.zeros(2*n_elems+2))
+        return (-np.inf,) + tuple(np.zeros(2*n_elems+4))
 
     if sun_el is None or sun_abs is None:
         abunds_fe1 = abs_abunds(el_found, abundances, 'Fe I ')
@@ -159,12 +163,14 @@ def obj_func(x, n_elems, sun_el=None, sun_abs=None, include_prior=False):
     fe1_likely = np.sum(-(abunds_fe1['abund'] - fe_mean)**2 / (2*fe_std**2)) - np.log(fe_std) * len(abunds_fe1['abund'])
     fe2_likely = np.sum(-(abunds_fe2['abund'] - fe_mean)**2 / (2*fe_std**2)) - np.log(fe_std) * len(abunds_fe2['abund'])
 
-    ln_likelihood = fe1_likely + fe2_likely
+    ln_likelihood = (fe1_likely + fe2_likely
+                     - (ep_slope  / _EP_SLOPE_SCALE )**2 / 2
+                     - (rew_slope / _REW_SLOPE_SCALE)**2 / 2)
 
     ln_posterior = ln_prior + ln_likelihood
 
     # Calculate posterior probability
-    params_obj = tuple((ln_posterior, ep_r, rew_r))
+    params_obj = tuple((ln_posterior, ep_r, rew_r, ep_slope, rew_slope))
 
     # Cycle through other lines to get their mean an std
     for i, el in enumerate(el_found):
@@ -184,8 +190,6 @@ def obj_func(x, n_elems, sun_el=None, sun_abs=None, include_prior=False):
 
 #Function to derive line-by-line abundances for Sun; sun_linelist is path to Sun linelist
 def sun_abs(sun_linelist, teff_sun=5777, logg_sun=4.44, feh_sun=0.00, micro_sun=1.38):
-    param_file(sun_linelist)
     x_sun = teff_sun, logg_sun, feh_sun, micro_sun
-    sun_el, sun_abs = abunds_func(x_sun)
-
-    return sun_el, sun_abs
+    sun_el, sun_abunds = abunds_func(x_sun, sun_linelist)
+    return sun_el, sun_abunds
