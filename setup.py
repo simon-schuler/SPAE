@@ -29,7 +29,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name="spae",
-    version="0.0.1",
+    version="0.3.1",
     author="Simon Schuler",
     author_email="sschuler@ut.edu",
     description="SPAE: Stellar Parameters, Abundances, and Errors",
