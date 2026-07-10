@@ -397,7 +397,7 @@ def nearly(state, numpass: int) -> None:
         if abs(state.atom1[j] - float(iatom)) >= 0.0:
             for n in range(state.numiso):
                 if abs(state.atom1[j] - state.isotope[n]) < 1.0e-9:
-                    factoriso = state.isoabund[n, state.isorun]
+                    factoriso = state.isoabund[n, state.isorun - 1]
                     break
 
         # Line opacity at line center

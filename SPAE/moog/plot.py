@@ -4,23 +4,134 @@ Matplotlib-based spectral plotting — replaces PGPLOT/X11 output from MOOG.
 Functions
 ---------
 plot_spectrum   — plot synthetic spectrum; optionally overlay observed
-read_obs        — read a two-column (wavelength, flux) observed spectrum
+read_obs        — read observed spectrum (text or FITS)
 """
 import numpy as np
+
+# Column name candidates, checked in order (first match wins)
+_WAVE_COLS = ['WAVELENGTH', 'WAVE', 'LAMBDA', 'LOGLAM', 'WAVE_VAC', 'WAVE_AIR',
+              'WAV', 'WAVEL']
+_FLUX_COLS = ['FLUX', 'NORMALIZED_FLUX', 'NORM_FLUX', 'FLUX_NORM', 'NFLUX',
+              'SPEC', 'SPECTRUM', 'DATA']
+
+
+def _to_angstrom(wave: np.ndarray, unit: str) -> np.ndarray:
+    """Convert wavelength array to Å based on unit string."""
+    u = unit.strip().lower()
+    if u in ('nm', 'nanometer', 'nanometers'):
+        return wave * 10.0
+    if u in ('um', 'micron', 'microns', 'micrometer', 'micrometers'):
+        return wave * 1e4
+    return wave   # already Å (or unknown — leave as-is)
+
+
+def _read_obs_fits(filename: str) -> tuple:
+    """
+    Read a 1-D spectrum from a FITS file.
+
+    Tries, in order:
+      1. Binary or ASCII table extension — looks for wavelength and flux
+         columns by name (case-insensitive).  LOGLAM columns are treated as
+         log10(Å).  Column units (nm, µm) are converted to Å.
+      2. Image extension (primary or first IMAGE) — reconstructs the
+         wavelength grid from the WCS keywords CRVAL1, CDELT1/CD1_1, CRPIX1.
+         CTYPE1 containing 'LOG' triggers 10^wave conversion.
+         CUNIT1 'nm' or 'µm' triggers unit conversion to Å.
+
+    Returns
+    -------
+    wave : np.ndarray [Å]
+    flux : np.ndarray
+    """
+    try:
+        from astropy.io import fits
+    except ImportError:
+        raise ImportError(
+            "astropy is required to read FITS spectra.  "
+            "Install it with:  pip install astropy"
+        )
+
+    with fits.open(filename) as hdul:
+        # ---- 1. Table extensions ----------------------------------------
+        for hdu in hdul:
+            if not hasattr(hdu, 'columns') or hdu.data is None:
+                continue
+            col_names = [c.name.upper() for c in hdu.columns]
+            wave_name = next((c for c in _WAVE_COLS if c in col_names), None)
+            flux_name = next((c for c in _FLUX_COLS if c in col_names), None)
+            if wave_name is None or flux_name is None:
+                continue
+
+            wave = np.asarray(hdu.data[wave_name], dtype=np.float64).ravel()
+            flux = np.asarray(hdu.data[flux_name], dtype=np.float64).ravel()
+
+            # log10-wavelength (e.g. SDSS LOGLAM)
+            if wave_name == 'LOGLAM':
+                wave = 10.0 ** wave
+            else:
+                col_unit = hdu.columns[wave_name].unit or ''
+                wave = _to_angstrom(wave, col_unit)
+            return wave, flux
+
+        # ---- 2. Image HDU with WCS --------------------------------------
+        for hdu in hdul:
+            if hdu.data is None:
+                continue
+            data = np.asarray(hdu.data, dtype=np.float64).ravel()
+            if len(data) < 2:
+                continue
+            hdr = hdu.header
+            if 'CRVAL1' not in hdr:
+                continue
+            crval1 = float(hdr['CRVAL1'])
+            crpix1 = float(hdr.get('CRPIX1', 1))
+            cdelt1 = float(hdr.get('CDELT1', hdr.get('CD1_1', 1.0)))
+            pixels = np.arange(1, len(data) + 1, dtype=np.float64)
+            wave   = crval1 + (pixels - crpix1) * cdelt1
+            ctype1 = hdr.get('CTYPE1', '')
+            if 'LOG' in ctype1.upper():
+                wave = 10.0 ** wave
+            cunit1 = hdr.get('CUNIT1', 'Angstrom')
+            wave = _to_angstrom(wave, cunit1)
+            return wave, data
+
+    raise ValueError(
+        f"Cannot read FITS spectrum from '{filename}': no recognised table "
+        "columns (WAVELENGTH/FLUX variants) or image WCS (CRVAL1) found."
+    )
 
 
 def read_obs(filename: str) -> tuple:
     """
-    Read a MONGO-style two-column observed spectrum (whitespace-separated).
+    Read an observed spectrum from a text or FITS file.
 
-    First line is treated as a comment/title and skipped if it cannot be
-    parsed as two floats.  Wavelengths are sorted ascending.
+    Text format (default)
+    ---------------------
+    Whitespace-separated wavelength and flux columns (MONGO/MOOG style).
+    Comment lines starting with '#' and a single non-numeric header line
+    are skipped.  Wavelengths are sorted ascending on return.
+
+    FITS format
+    -----------
+    Triggered automatically for files ending in .fits, .fit, .fits.gz, or
+    .fit.gz.  Supports:
+      - Binary/ASCII table with WAVELENGTH (or WAVE/LAMBDA/LOGLAM/…) and
+        FLUX (or NORMALIZED_FLUX/NORM_FLUX/…) columns.
+      - 1-D image extension with WCS keywords (CRVAL1, CDELT1, CRPIX1).
+    Wavelengths in nm or µm are converted to Å automatically.
 
     Returns
     -------
     wave : np.ndarray [Å]
     flux : np.ndarray (normalised to continuum)
     """
+    _FITS_EXTS = ('.fits', '.fit', '.fits.gz', '.fit.gz')
+    if any(filename.lower().endswith(ext) for ext in _FITS_EXTS):
+        wave, flux = _read_obs_fits(filename)
+        order = np.argsort(wave)
+        return wave[order], flux[order]
+
+    # ---- plain text -------------------------------------------------------
     wave, flux = [], []
     with open(filename) as fh:
         for i, line in enumerate(fh):

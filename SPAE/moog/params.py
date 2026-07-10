@@ -291,6 +291,8 @@ def params(state, param_file: str = 'batch.par') -> None:
                 sp = raw_lines[i].split()
                 i += 1
                 # smtype fwhmgauss vsini limbdark vmac fwhmloren
+                if len(sp) > 0:
+                    state.smtype    = sp[0]
                 if len(sp) > 1:
                     state.fwhmgauss = float(sp[1])
                 if len(sp) > 2:
