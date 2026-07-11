@@ -26,9 +26,10 @@ pip install ./
 | `numpy` | Array math throughout | `pip install numpy` |
 | `matplotlib` | Plotting and interactive widget | `pip install matplotlib` |
 | `emcee` | Bayesian MCMC parameter estimation | `pip install emcee` |
+| `tqdm` | Per-step progress bar during `run_spae()` MCMC runs | `pip install tqdm` |
 | `ipympl` | Interactive `%matplotlib widget` support in Jupyter | `pip install ipympl` |
 
-All dependencies except `ipympl` are required for core SPAE functionality. `ipympl` is only needed when using the interactive synthesis widget inside a Jupyter notebook.
+All dependencies except `ipympl` and `tqdm` are required for core SPAE functionality. `ipympl` is only needed when using the interactive synthesis widget inside a Jupyter notebook; `tqdm` is optional but strongly recommended — without it, `run_spae()` runs silently with no progress feedback until completion.
 
 Minimum Python version: **3.6**
 
