@@ -19,6 +19,7 @@ analyze_run                — one-call convenience chaining all of the above
 I/O
 ---
 summarize            — human-readable text summary of an AnalysisResult
+write_mrt             — export one star/run's result as a CDS/MRT-format file
 
 Plotting (all return (fig, ax); matplotlib imported lazily; no rcParams set)
 --------
@@ -330,7 +331,7 @@ def analyze_run(sampler, linelist, sun_el=None, sun_abs=None,
                            traditional=traditional, refined=refined)
 
 
-def summarize(result: AnalysisResult) -> str:
+def summarize(result: AnalysisResult, provisional: bool = False) -> str:
     """
     Human-readable text summary of an AnalysisResult: clipping info, MCMC
     median solution, EP/REW slopes at the median, per-species [X/H] table,
@@ -343,9 +344,26 @@ def summarize(result: AnalysisResult) -> str:
     only the p-qualifying samples, plus the single best sample among them
     (the one maximizing ep_p**2 + rew_p**2) — clearly labeled as distinct
     from the plain traditional-solution mean above it.
+
+    `provisional=True` prepends a banner flagging that `burn_in` was NOT
+    chosen by inspecting a trace plot (e.g. a driver script's automatic
+    post-run call using a hardcoded default) and spelling out the 3-step
+    re-run recipe to get a final result: plot_trace() on the full unclipped
+    chain -> visually pick burn_in -> re-run analyze_run(burn_in=...).
     """
     c, m, b, t = result.clipped, result.median, result.median_balance, result.traditional
     lines = []
+
+    if provisional:
+        lines.append("*** PROVISIONAL RESULT ***")
+        lines.append(f"burn_in={c.burn_in} is a hardcoded default, NOT chosen by inspecting "
+                     f"a trace plot. Treat this result as a quick sanity check only.")
+        lines.append("To get a final result:")
+        lines.append("  1. az.plot_trace(sampler.get_chain()) and visually inspect for convergence")
+        lines.append("  2. Pick burn_in from where the chains settle down")
+        lines.append("  3. result = az.analyze_run(sampler, linelist, ..., burn_in=<your value>)")
+        lines.append("     az.summarize(result)")
+        lines.append("")
 
     lines.append(f"Clipping: burn_in={c.burn_in}, acceptance_fraction > {c.a_frac} "
                  f"-> {c.n_walkers_kept}/{c.n_walkers_total} walkers kept "
@@ -397,6 +415,119 @@ def summarize(result: AnalysisResult) -> str:
         )
 
     return "\n".join(lines)
+
+
+def write_mrt(result: AnalysisResult, name: str, path: str) -> None:
+    """
+    Write one star/run's AnalysisResult as a single-row CDS/MRT-format file
+    via astropy's `ascii.mrt` writer (byte-aligned header, units, per-column
+    descriptions built from the dataclass fields).
+
+    Reports the MCMC-median AND traditional (excitation/ionization-balance)
+    solutions side by side for the four stellar parameters (Teff/logg/[Fe/H]/
+    micro; traditional columns suffixed 'T'), plus a per-species [X/H] table
+    at the MCMC median only -- traditional-solution abundances are not
+    recomputed here (would cost one extra MOOG call per star).
+
+    This is a PER-STAR export. Combining multiple stars' files into one
+    paper table (e.g. via `astropy.table.vstack` + `format='ascii.cds'` read
+    back in) is left to the caller -- out of scope for this function.
+
+    astropy's Mrt writer leaves Title/Authors/Notes blank (not supported by
+    the writer itself); Title/Authors must be filled in by hand later, but
+    the Notes: block is auto-populated here with clipping/traditional-
+    solution provenance (burn-in, walkers kept, sample counts).
+    """
+    from astropy.table import Table
+    import astropy.units as u
+
+    m, t, c = result.median, result.traditional, result.clipped
+    tbl = Table()
+    tbl['Name'] = [name]
+    tbl['Name'].description = 'Star identifier'
+
+    def _add(col, val, err_lo, err_hi, unit, desc, ndigits):
+        tbl[col] = [round(val, ndigits)]
+        tbl[col].unit = unit
+        tbl[col].description = desc
+        tbl['e_' + col] = [round(err_lo, ndigits)]
+        tbl['e_' + col].unit = unit
+        tbl['e_' + col].description = (
+            f'Lower uncertainty in {col}' if err_hi is not None else f'Uncertainty in {col}')
+        if err_hi is not None:
+            tbl['E_' + col] = [round(err_hi, ndigits)]
+            tbl['E_' + col].unit = unit
+            tbl['E_' + col].description = f'Upper uncertainty in {col}'
+
+    # Precision matches summarize()'s existing conventions: Teff to 0.1 K,
+    # logg/[Fe/H]/micro/abundances to 0.001.
+    _add('Teff', m.teff.median, abs(m.teff.lower), m.teff.upper, u.K,
+         'MCMC median effective temperature', 1)
+    _add('logg', m.logg.median, abs(m.logg.lower), m.logg.upper, '[cm/s2]',
+         'MCMC median surface gravity', 3)
+    _add('FeH', m.feh.median, abs(m.feh.lower), m.feh.upper, '[Sun]',
+         'MCMC median metallicity [Fe/H]', 3)
+    _add('vt', m.micro.median, abs(m.micro.lower), m.micro.upper, u.km / u.s,
+         'MCMC median microturbulent velocity', 3)
+
+    _add('TeffT', t.mean[0], t.std[0], None, u.K,
+         'Traditional (excitation/ionization balance) effective temperature', 1)
+    _add('loggT', t.mean[1], t.std[1], None, '[cm/s2]',
+         'Traditional surface gravity', 3)
+    _add('FeHT', t.mean[2], t.std[2], None, '[Sun]',
+         'Traditional metallicity [Fe/H]', 3)
+    _add('vtT', t.mean[3], t.std[3], None, u.km / u.s,
+         'Traditional microturbulent velocity', 3)
+
+    for row in m.species_table:
+        species = str(row['species']).strip()
+        label = species.replace(' ', '')
+        tbl[label] = [round(float(row['mean']), 3)]
+        tbl[label].unit = '[Sun]'
+        tbl[label].description = f'[{species}/H] abundance ratio (MCMC median)'
+        tbl['e_' + label] = [round(float(row['tot_uncert']), 3)]
+        tbl['e_' + label].unit = '[Sun]'
+        tbl['e_' + label].description = f'Total uncertainty in {label}'
+        tbl['N_' + label] = [int(row['n_lines'])]
+        tbl['N_' + label].description = f'Number of {species} lines used'
+
+    tbl.write(path, format='ascii.mrt', overwrite=True)
+
+    notes = [
+        f"(1) MCMC: burn_in={c.burn_in}, acceptance_fraction>{c.a_frac}, "
+        f"{c.n_walkers_kept}/{c.n_walkers_total} walkers kept, "
+        f"{len(c.flat_chain)} posterior samples.",
+        f"(2) Traditional solution ('T' columns): mean of {t.n_unique} unique "
+        f"posterior samples with |EP_r|,|REW_r|<{t.max_cor} and Fe I = Fe II "
+        f"(out of {t.n_checked} samples checked).",
+    ]
+    _insert_mrt_notes(path, notes)
+
+
+def _insert_mrt_notes(path: str, notes: List[str]) -> None:
+    """
+    Fill in the blank 'Notes:' block astropy's ascii.mrt writer leaves in
+    place. astropy's CDS/MRT reader has no special handling for Notes text
+    -- it treats every line after the LAST dash-separator in the file as a
+    fixed-width data row -- so the note lines must be followed by their own
+    closing separator (matching the standard CDS convention: Notes: header,
+    dash line, numbered note lines, dash line, THEN data) or round-tripping
+    via `Table.read(..., format='ascii.cds')` silently misparses them as
+    data.
+    """
+    with open(path) as f:
+        text = f.read()
+    marker = ("Notes:\n"
+              "--------------------------------------------------------------------------------\n")
+    idx = text.find(marker)
+    if idx == -1:
+        return
+    insert_at = idx + len(marker)
+    separator = "-" * 80 + "\n"
+    block = "\n".join(notes) + "\n" + separator
+    text = text[:insert_at] + block + text[insert_at:]
+    with open(path, 'w') as f:
+        f.write(text)
 
 
 # --------------------------------------------------------------------------- #
