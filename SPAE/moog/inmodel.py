@@ -342,6 +342,8 @@ def inmodel(state, eqlib_func=None) -> None:
         moremol_line = _read_label_then_value(f)
         moremol = int(moremol_line.split()[0]) if moremol_line else 0
 
+        init_mol_data(state)   # ensures smallmollist/largemollist are populated before copy
+
         if moremol > 0:
             extra_codes = []
             while len(extra_codes) < moremol:
