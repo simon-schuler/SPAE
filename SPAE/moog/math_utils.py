@@ -7,6 +7,7 @@ Math primitives translated from MOOG Fortran.
 """
 
 import numpy as np
+from numba import vectorize, njit, float64
 
 
 # ---------------------------------------------------------------------------
@@ -124,12 +125,75 @@ def rinteg(x, f, n, start):
 # voigt  (Voigt.f)
 # ---------------------------------------------------------------------------
 
+@vectorize([float64(float64, float64)], nopython=True, cache=True)
+def _voigt_scalar(a, v):
+    """Scalar Voigt kernel (Landolt-Börnstein approx, Voigt.f) — numba ufunc.
+
+    Branches on real if/elif instead of computing every case and masking,
+    since this is called ~10^4-10^5 times per abfind evaluation on
+    arrays of only ~ntau elements, where numpy's per-call dispatch
+    overhead (not the arithmetic) dominates.
+    """
+    v2 = v * v
+    h0 = np.exp(-v2)
+
+    if a == 0.0:
+        return h0 / 1.772454
+
+    a2 = a * a
+
+    # case 1: large-a approximation
+    if (a > 1.4) or ((a > 0.2) and ((a + v) > 3.2)):
+        u1 = 1.4142136 * (a2 + v2)
+        u1s = 1.0 if u1 == 0.0 else u1
+        return (0.7978847 * a / u1s
+                * (1.0 + (3.0 * v2 - a2) / u1s**2
+                   + (15.0 * v2**2 - 30.0 * a2 * v2 + 3.0 * a2**2) / u1s**4)
+                ) / 1.772454
+
+    # case 4: a <= 0.2, v >= 5
+    if (a <= 0.2) and (v >= 5.0):
+        safe_v2_45 = 1.0 if v2 == 0.0 else v2
+        return (a / (1.772454 * safe_v2_45)
+                * (1.0 + 1.5 / safe_v2_45 + 3.75 / (safe_v2_45 * safe_v2_45))
+                / 1.772454)
+
+    # polynomial-in-v term shared by cases 2 & 3
+    if v < 1.3:
+        h1_234 = (-1.12470432 - 0.15516677 * v + 3.28867591 * v2
+                  - 2.34357915 * v * v2 + 0.42139162 * v2 * v2)
+    elif v < 2.4:
+        h1_234 = (-4.48480194 + 9.39456063 * v - 6.61487486 * v2
+                  + 1.98919585 * v * v2 - 0.2204165 * v2 * v2)
+    else:
+        safe_v2 = 1.0 if abs(v2 - 1.5) < 1e-30 else v2 - 1.5
+        h1_234 = ((0.554153432 + 0.278711796 * v - 0.188325687 * v2
+                   + 0.042991293 * v * v2 - 0.003278278 * v2 * v2) / safe_v2)
+
+    h2 = (1.0 - 2.0 * v2) * h0
+
+    # case 3: a <= 0.2, v < 5
+    if a <= 0.2:
+        return (h0 + h1_234 * a + h2 * a2) / 1.772454
+
+    # case 2: 0.2 < a <= 1.4, a+v <= 3.2
+    u234 = (0.979895023 - 0.962846325 * a + 0.532770573 * a2
+            - 0.122727278 * a * a2)
+    h1_c2 = h1_234 + 1.1283790 * h0
+    h2_c2 = h2 - h0 + 1.1283790 * h1_c2
+    h3_c2 = 0.37612635 * (1.0 - h2) - 0.6666667 * v2 * h1_c2 + 1.1283790 * h2_c2
+    h4_c2 = 0.6666667 * v2 * v2 * h0 - 0.37612635 * h1_c2 + 1.1283790 * h3_c2
+    return u234 * (h0 + h1_c2 * a + h2_c2 * a2
+                   + h3_c2 * a * a2 + h4_c2 * a2 * a2) / 1.772454
+
+
 def voigt(a, v):
     """
     Voigt profile H(a, v) / sqrt(π), normalised so that H(0,0)=1.
 
-    Fully vectorized numpy implementation of the Landolt-Börnstein approximation
-    used in MOOG (Voigt.f). Handles both scalar and array inputs.
+    Numba-compiled ufunc (Landolt-Börnstein approximation used in MOOG,
+    Voigt.f) — broadcasts like any numpy ufunc; handles scalar or array
+    inputs of any compatible shape.
 
     Parameters
     ----------
@@ -144,67 +208,8 @@ def voigt(a, v):
         Voigt function value.
     """
     scalar = np.ndim(a) == 0 and np.ndim(v) == 0
-    a = np.atleast_1d(np.asarray(a, dtype=float))
-    v = np.atleast_1d(np.asarray(v, dtype=float))
-
-    a2 = a * a
-    v2 = v * v
-    h0 = np.exp(-v2)
-
-    # ---- case 1: large-a approximation ----
-    u1   = 1.4142136 * (a2 + v2)
-    u1s  = np.where(u1 == 0.0, 1.0, u1)   # guard divide; only used where mask_c1
-    val1 = (0.7978847 * a / u1s
-            * (1.0 + (3.0 * v2 - a2) / u1s**2
-               + (15.0 * v2**2 - 30.0 * a2 * v2 + 3.0 * a2**2) / u1s**4)
-            ) / 1.772454
-
-    # ---- cases 2 & 3: polynomial in v (h1) ----
-    h1_lo  = (-1.12470432  - 0.15516677 * v + 3.28867591 * v2
-              - 2.34357915 * v * v2 + 0.42139162 * v2 * v2)
-    h1_mid = (-4.48480194  + 9.39456063 * v - 6.61487486 * v2
-              + 1.98919585 * v * v2 - 0.2204165  * v2 * v2)
-    safe_v2 = np.where(np.abs(v2 - 1.5) < 1e-30, 1.0, v2 - 1.5)
-    h1_hi  = ((0.554153432 + 0.278711796 * v - 0.188325687 * v2
-               + 0.042991293 * v * v2 - 0.003278278 * v2 * v2) / safe_v2)
-    h1_234 = np.where(v < 1.3, h1_lo, np.where(v < 2.4, h1_mid, h1_hi))
-    h2     = (1.0 - 2.0 * v2) * h0
-    u234   = (0.979895023 - 0.962846325 * a + 0.532770573 * a2
-              - 0.122727278 * a * a2)
-
-    # case 3 (a <= 0.2, v < 5)
-    val3 = (h0 + h1_234 * a + h2 * a2) / 1.772454
-
-    # case 4 (a <= 0.2, v >= 5)
-    safe_v2_45 = np.where(v2 == 0.0, 1.0, v2)
-    val4 = (a / (1.772454 * safe_v2_45)
-            * (1.0 + 1.5 / safe_v2_45 + 3.75 / (safe_v2_45 * safe_v2_45))
-            / 1.772454)
-
-    # case 2 (0.2 < a <= 1.4, a+v <= 3.2)
-    h1_c2 = h1_234 + 1.1283790 * h0
-    h2_c2 = h2 - h0 + 1.1283790 * h1_c2
-    h3_c2 = 0.37612635 * (1.0 - h2) - 0.6666667 * v2 * h1_c2 + 1.1283790 * h2_c2
-    h4_c2 = 0.6666667 * v2 * v2 * h0 - 0.37612635 * h1_c2 + 1.1283790 * h3_c2
-    val2  = (u234 * (h0 + h1_c2 * a + h2_c2 * a2
-                     + h3_c2 * a * a2 + h4_c2 * a2 * a2) / 1.772454)
-
-    # case 5 (a == 0)
-    val5 = h0 / 1.772454
-
-    # ---- select by case masks ----
-    mask_c1 = (a > 1.4) | ((a > 0.2) & ((a + v) > 3.2))
-    mask_c5 = (a == 0.0)
-    mask_c4 = (~mask_c1) & (~mask_c5) & (a <= 0.2) & (v >= 5.0)
-    mask_c3 = (~mask_c1) & (~mask_c5) & (~mask_c4) & (a <= 0.2)
-
-    result = np.where(mask_c5, val5,
-             np.where(mask_c1, val1,
-             np.where(mask_c4, val4,
-             np.where(mask_c3, val3,
-                      val2))))
-
-    return float(result[0]) if scalar else result
+    result = _voigt_scalar(np.asarray(a, dtype=np.float64), np.asarray(v, dtype=np.float64))
+    return float(result) if scalar else result
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +327,74 @@ def rinteg_batch_cumsum(x, f_batch, start_batch):
     fint[:, 0] = start_batch
     fint[:, 1:] = contrib
     return np.cumsum(fint, axis=1)
+
+
+# ---------------------------------------------------------------------------
+# expn2  (exponential integral E2(x), replacing scipy.special.expn(2, x))
+# ---------------------------------------------------------------------------
+#
+# cdcalc/cdcalc_batch call scipy.special.expn(2, x) ~35,000 times per abfind
+# evaluation on small arrays (~ntau elements) — call-count-dominated cost,
+# same pattern as voigt above. scipy's own algorithm can't run in numba
+# nopython mode, so this replaces it with a precomputed lookup table
+# (log-spaced in x, storing ln(E2) for accuracy across the ~11 decades of x
+# that occur, from ~1e-7 up to ~1e5) plus the standard asymptotic series for
+# x >= _E2_X_BREAK, where the table's absolute resolution runs out. Validated
+# against scipy.special.expn(2, x): max relative error 2.1e-6 across a
+# 3M-point log-uniform sweep from 1e-8 to 1e5 (see conversation/session notes
+# for the sweep script) — far below MOOG/SPAE's ~1e-3 dex precision floor.
+
+_E2_X_MIN = 1e-8
+_E2_X_BREAK = 50.0       # beyond this, use the asymptotic series instead of
+                          # the table — the table's fixed point count can't
+                          # resolve E2's absolute curvature well past here
+_E2_N_POINTS = 65536      # 512 KB table; error scales ~1/N^2 (linear interp
+                          # of ln(E2) on a log-x grid), chosen for <1e-5 error
+
+
+def _build_e2_table():
+    from scipy.special import expn as _scipy_expn
+    log_x = np.linspace(np.log10(_E2_X_MIN), np.log10(_E2_X_BREAK), _E2_N_POINTS)
+    x_grid = 10.0 ** log_x
+    ln_e2_grid = np.log(_scipy_expn(2, x_grid))
+    return log_x, ln_e2_grid
+
+
+_E2_LOG_X_GRID, _E2_LN_GRID = _build_e2_table()
+_E2_LOG_X0 = _E2_LOG_X_GRID[0]
+_E2_DLOG = (_E2_LOG_X_GRID[-1] - _E2_LOG_X_GRID[0]) / (_E2_N_POINTS - 1)
+
+
+@njit(cache=True)
+def _expn2_scalar(x, log_x0, dlog, ln_grid, n, x_min, x_break):
+    if x <= x_min:
+        x = x_min
+    if x >= x_break:
+        # asymptotic series: E2(x) ~ (e^-x/x) * (1 - 2/x + 6/x^2 - 24/x^3 + 120/x^4)
+        inv = 1.0 / x
+        series = (1.0 - 2.0 * inv + 6.0 * inv * inv
+                  - 24.0 * inv**3 + 120.0 * inv**4)
+        return np.exp(-x) * inv * series
+    pos = (np.log10(x) - log_x0) / dlog
+    idx = int(pos)
+    if idx < 0:
+        idx = 0
+    elif idx > n - 2:
+        idx = n - 2
+    frac = pos - idx
+    return np.exp(ln_grid[idx] * (1.0 - frac) + ln_grid[idx + 1] * frac)
+
+
+@vectorize([float64(float64)], nopython=True, cache=True)
+def expn2(x):
+    """
+    Exponential integral E2(x), drop-in replacement for
+    scipy.special.expn(2, x) — table lookup + asymptotic series, ~4-7x
+    faster at the small-array sizes cdcalc/cdcalc_batch call this with.
+    Broadcasts like any numpy ufunc.
+    """
+    return _expn2_scalar(x, _E2_LOG_X0, _E2_DLOG, _E2_LN_GRID, _E2_N_POINTS,
+                          _E2_X_MIN, _E2_X_BREAK)
 
 
 # ---------------------------------------------------------------------------

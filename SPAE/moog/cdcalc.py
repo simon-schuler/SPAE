@@ -3,7 +3,7 @@ Continuum and line+continuum contribution functions.
 Translated from Cdcalc.f and Jexpint.f.
 """
 import numpy as np
-from scipy.special import expn as _scipy_expn
+from .math_utils import expn2
 
 
 def cdcalc(state, number: int) -> None:
@@ -32,7 +32,7 @@ def cdcalc(state, number: int) -> None:
         if state.fluxintopt == 1:
             cd = kap * tref * scont * np.exp(-taulam) / (0.4343 * kref)
         else:
-            e2 = _scipy_expn(2, taulam)
+            e2 = expn2(taulam)
             cd = 2.0 * kap * tref * scont * e2 / (0.4343 * kref)
         state.cd[:ntau] = cd
 
@@ -50,8 +50,8 @@ def cdcalc(state, number: int) -> None:
                   (scont * np.exp(-taulam) -
                    (1.0 + kapnu / kap) * sline * exptau))
         else:
-            e2_lam = _scipy_expn(2, taulam)
-            e2_tot = _scipy_expn(2, taulam + taunu)
+            e2_lam = expn2(taulam)
+            e2_tot = expn2(taulam + taunu)
             cd = (2.0 * tref * kap / (0.4343 * flux * kref) *
                   (scont * e2_lam -
                    (1.0 + kapnu / kap) * sline * e2_tot))
@@ -96,8 +96,8 @@ def cdcalc_batch(state, kapnu_batch, taunu_batch, waves):
                     * (scont_b * np.exp(-taulam)[None, :]
                        - (1.0 + kapnu_batch / kap[None, :]) * scont_b * exptau))
     else:
-        e2_lam = _scipy_expn(2, taulam)                            # (ntau,)
-        e2_tot = _scipy_expn(2, taulam[None, :] + taunu_batch)    # (nwave, ntau)
+        e2_lam = expn2(taulam)                            # (ntau,)
+        e2_tot = expn2(taulam[None, :] + taunu_batch)    # (nwave, ntau)
         cd_batch = (factor
                     * (scont_b * e2_lam[None, :]
                        - (1.0 + kapnu_batch / kap[None, :]) * scont_b * e2_tot))
