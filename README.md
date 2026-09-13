@@ -24,6 +24,7 @@ pip install ./
 | Package | Purpose | Install |
 |---------|---------|---------|
 | `numpy` | Array math throughout | `pip install numpy` |
+| `numba` | JIT-compiled physics kernels (`voigt`, `expn2`) in `SPAE/moog` | `pip install numba` |
 | `matplotlib` | Plotting and interactive widget | `pip install matplotlib` |
 | `emcee` | Bayesian MCMC parameter estimation | `pip install emcee` |
 | `tqdm` | Per-step progress bar during `run_spae()` MCMC runs | `pip install tqdm` |
