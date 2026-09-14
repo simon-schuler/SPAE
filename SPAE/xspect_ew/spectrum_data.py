@@ -21,6 +21,7 @@ from .gp_utils import SEKernel, Pred_GP
 from .combine import make_line, parabolic_refine
 from .plotting import make_plots_folder
 from .readers import read_spectrum
+from .radial_velocity import measure_effective_rv, C_KMS
 
 
 class Spectrum_Data():
@@ -307,6 +308,20 @@ class Spectrum_Data():
         self.flux = self.combined_flux
 
     def estimate_shift(self, sun_spectra, shift_max = 5, shift_min = -5, shift_spacing = 100, verbose = False):
+        """
+        Per-order wavelength shift via grid-search cross-correlation against
+        a reference spectrum (e.g. a solar atlas). Only reliable for orders
+        that actually overlap the reference spectrum's own coverage -- see
+        clean_shift()'s docstring for what happens otherwise.
+
+        For preparing a spectrum for EW measurement specifically, prefer
+        apply_rv_shift() instead: it needs no reference spectrum at all (so
+        it has no coverage-gap failure mode), and was measured to track the
+        true line position noticeably more precisely (RMS ~37 mA vs ~67 mA
+        on a real test) where the two methods could be directly compared.
+        estimate_shift() remains the right tool for reference-spectrum
+        cross-correlation itself, e.g. combine_spectra()'s internal use.
+        """
         #setup num orders, place holder for chi min, shifts array
         orders = len(self.wavelength)
         chi = np.zeros(shift_spacing)
@@ -391,6 +406,18 @@ class Spectrum_Data():
                     print('missing values can be interpolated/extrapolated using clean_shift() method')
 
     def clean_shift(self):
+        """
+        NOTE (found by testing, see conversation/session notes): the
+        interpolation/extrapolation this does for orders with no reference-
+        spectrum match is only reliable *within* the wavelength range where
+        real matches were actually found -- extrapolating beyond that range
+        was measured to be substantially wrong (RMS ~67 mA, worst case
+        ~119 mA off the true line position on a real cross-instrument test),
+        enough to risk misidentifying a line during EW measurement. This
+        method now warns when that happens. For EW-measurement prep, prefer
+        apply_rv_shift() instead -- it doesn't depend on reference-spectrum
+        coverage at all, so it doesn't have this failure mode.
+        """
         #remove orders not found
         gd = np.where(self.estimated_shift != -999)
         bad_points = np.where(self.estimated_shift == -999)[0]
@@ -399,6 +426,12 @@ class Spectrum_Data():
         means = np.zeros(len(self.shifted_wavelength))
         for i in range(len(self.estimated_shift)):
             means[i] = self.shifted_wavelength[i].mean()
+
+        #wavelength range actually covered by real reference-spectrum matches --
+        #used below to tell interpolation (safer) apart from extrapolation
+        #(risky, see docstring)
+        gd_wave_min = means[gd].min()
+        gd_wave_max = means[gd].max()
 
         #get standard deviation of good points
         stds = self.estimated_shift[gd].std()
@@ -426,12 +459,79 @@ class Spectrum_Data():
         for i in range(len(self.estimated_shift[bad_points])):
             current_index = bad_points[0][i]
             wave = means[current_index]
+            if wave < gd_wave_min or wave > gd_wave_max:
+                print(f"WARNING: order {current_index} (mean wavelength {wave:.1f} A) has "
+                      f"no reference-spectrum match and falls OUTSIDE the "
+                      f"{gd_wave_min:.1f}-{gd_wave_max:.1f} A range where real matches were "
+                      f"found -- its shift is an EXTRAPOLATION, which was measured to be "
+                      f"unreliable (see clean_shift()'s docstring) and risks misidentifying "
+                      f"lines in this order during EW measurement. Prefer apply_rv_shift() "
+                      f"for this wavelength range instead.")
             self.estimated_shift[current_index] = make_line(wave, best_fit[0], best_fit[1]) + line[current_index]
             self.wave_shift(current_index, self.estimated_shift[current_index])
 
         #get radial velocity from slope of shifts
         best_fit, C = np.polyfit(means, self.estimated_shift*(-1), 1, cov=True)
         self.rv = (np.round(best_fit[0]*3e5,3), np.round(np.sqrt(np.diag(C))[1], 3))
+
+    def apply_rv_shift(self, rv=None, lines=None, min_depth=0.02, verbose=False):
+        """
+        RECOMMENDED default for preparing a spectrum for EW measurement.
+        Shift every order by a single effective radial velocity, applied
+        correctly as a multiplicative (1 + rv/c) wavelength scaling rather
+        than a per-order independent Angstrom offset (see estimate_shift()).
+
+        Unlike estimate_shift(), this needs no reference spectrum and no
+        per-order overlap matching -- only a handful of radial_velocity.
+        RV_REFERENCE_LINES need to fall somewhere in this spectrum's
+        coverage -- so it has none of estimate_shift()/clean_shift()'s
+        reference-coverage-gap failure mode (measured on a real test: RMS
+        ~37 mA vs ~67 mA position error where the two methods could be
+        directly compared, with clean_shift()'s extrapolated orders off by
+        up to 119 mA -- enough to risk misidentifying a line). normalize()/
+        normalize_all() must be run first (uses normalized_flux to locate
+        line centers).
+
+        Parameters
+        ----------
+        rv : float, km/s, optional -- apply this RV directly and skip line
+            measurement (e.g. if the RV is already known from elsewhere).
+        lines : {name: (rest_wavelength, window)}, optional -- defaults to
+            radial_velocity.RV_REFERENCE_LINES.
+        min_depth : float -- minimum line depth (in normalized flux) to
+            trust a line's fitted center.
+        verbose : bool -- print the measured RV and which lines were used.
+
+        Returns
+        -------
+        rv : float, km/s -- the RV actually applied.
+        """
+        if rv is None:
+            measured_rv, rv_err, used = measure_effective_rv(self, lines=lines, min_depth=min_depth)
+            if measured_rv is None:
+                raise ValueError(
+                    "Could not measure an effective RV -- none of the reference "
+                    "lines were found/usable in this spectrum's wavelength "
+                    "coverage. Pass rv= directly, or lines= with a custom set.")
+            if verbose:
+                print(f"Effective RV = {measured_rv:.3f} +/- {rv_err:.3f} km/s, "
+                      f"from {len(used)} line(s):")
+                for name, restw, order, v in used:
+                    print(f"  {name} ({restw} A, order {order}): v={v:.3f} km/s")
+            self.rv = (round(measured_rv, 3), round(rv_err, 3))
+            rv = measured_rv
+        else:
+            self.rv = (rv, 0.0)
+
+        for order in range(len(self.wavelength)):
+            self.shifted_wavelength[order] = self.wavelength[order] * (1.0 + rv / C_KMS)
+            # Angstrom-equivalent at the order's mean wavelength, kept for
+            # reporting/consistency with estimate_shift()'s convention --
+            # the actually-applied shift above is the correct multiplicative
+            # one, not this per-order scalar approximation of it.
+            self.estimated_shift[order] = self.wavelength[order].mean() * (rv / C_KMS)
+
+        return rv
 
     def load_lines(self, filename):
         self.lines = np.genfromtxt(filename, skip_header = 1, usecols = 0)

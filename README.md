@@ -45,11 +45,14 @@ All dependencies except `ipympl` and `tqdm` are required for core SPAE functiona
 from SPAE.xspect_ew import Spectrum_Data
 
 spec = Spectrum_Data('star_blue.fits')                    # format auto-detected
+spec.normalize_all()                                       # per-order GP continuum fit (needed before shifting)
+spec.apply_rv_shift(verbose=True)                          # recommended: single RV from strong lines, no reference spectrum needed
 spec.load_lines('linelist.txt')                           # MOOG-format: wave, species, EP, loggf, damping
-spec.normalize(order)                                      # per-order GP continuum fit
 spec.measure_line_ew(4779.439)                              # or measure_all_ew() / measure_ew()
 spec.make_ew_doc('linelist_with_ew.txt')                   # MOOG-format output
 ```
+
+`apply_rv_shift()` is the recommended way to align a spectrum before EW measurement — it measures one effective RV from a handful of strong, well-identified lines (`SPAE.xspect_ew.radial_velocity.RV_REFERENCE_LINES`) and applies it as a proper multiplicative (1+v/c) shift to every order. The older `estimate_shift()`/`clean_shift()` (per-order cross-correlation against a reference spectrum, e.g. a solar atlas) remains available and is still the right tool when you specifically need reference-spectrum registration (e.g. `combine_spectra()`), but its extrapolation for orders with no reference-spectrum overlap was measured to be substantially less reliable (RMS ~67 mA vs ~37 mA position error on a real test, worst case 119 mA) — unreliable enough to risk misidentifying a line during EW measurement. `clean_shift()` now warns when it's extrapolating outside its actual reference coverage.
 
 Sample data (`SPAE/xspect_ew/data/`) — a solar HIRES spectrum and Fe linelist — is included for testing.
 

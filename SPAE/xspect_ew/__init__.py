@@ -19,3 +19,4 @@ from .plotting import plot_line_info, plot_comparison_res
 from .combine import combine_files
 from .io_utils import load_object
 from .readers import read_spectrum, SpectrumFormatError
+from .radial_velocity import measure_effective_rv, RV_REFERENCE_LINES
