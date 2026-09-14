@@ -7,7 +7,6 @@ import pickle
 
 import numpy as np
 import matplotlib.pyplot as plt
-from astropy.io import fits
 from scipy.interpolate import interp1d
 from scipy.integrate import simpson
 from scipy.optimize import minimize
@@ -21,23 +20,37 @@ from .line_profile import get_line_window, gauss_model, gfit_simple, gauss_ew
 from .gp_utils import SEKernel, Pred_GP
 from .combine import make_line
 from .plotting import make_plots_folder
+from .readers import read_spectrum
 
 
 class Spectrum_Data():
-    def __init__(self, filename, KECK_file = True, spectx=False, specty=False, order_split = (False,3500)):
+    def __init__(self, filename, KECK_file = True, spectx=False, specty=False, order_split = (False,3500),
+                 instrument = 'auto', custom_reader = None, **reader_kwargs):
         """
             filenmae - used to name plots and files
-            KECK_file - True if loading KECK fits file
-            spectx, specty - input spectrum if loading from arrays
+            KECK_file - True (default) to read `filename` from disk, auto-detecting
+                its format (Keck/MAKEE, GRACES/OPERA, MAROON-X, or a FITS binary
+                table with named wave/flux columns -- see readers.py). False to
+                supply already-extracted arrays directly via spectx/specty instead.
+            spectx, specty - input spectrum if loading from arrays (KECK_file=False)
                 if not using order_split:
                     input format: [[order1],[order2],...] orderN = [x1,x2,x3,...]
                 if using order_split:
                     input format: [x1,x2,x3,...]
+            instrument - 'auto' (default), or force a specific reader by name
+                ('graces', 'keck_hires', 'fits_table', 'maroonx') -- see
+                readers.read_spectrum(). Only used when KECK_file=True.
+            custom_reader - callable(filename, **kwargs) -> (wavelength, flux)
+                or (wavelength, flux, gain), for a one-off format not yet
+                recognized by readers.py. Only used when KECK_file=True.
+            reader_kwargs - passed through to the reader (e.g. fiber=... for
+                MAROON-X to override the assumed science fiber).
         """
         self.filename = filename
         self.gain = None
         if KECK_file:
-            self.wavelength, self.flux = self.read_spec()
+            self.wavelength, self.flux, self.gain = read_spectrum(
+                filename, instrument=instrument, custom_reader=custom_reader, **reader_kwargs)
         else:
             #split input array into orders
             if order_split[0]:
@@ -721,122 +734,6 @@ class Spectrum_Data():
                 self.lines_check_flag[i] = True
                 print(self.lines[i], 'might have a bad fit', self.lines_gauss_Xsquare[i])
 
-    def wat_info(self, hdul):
-        '''Gather starting wavelengths and spacing for each order
-
-        Parameters
-        ----------
-        hdul : fits file as hdul object
-        open with astropy.io, fits.open()
-
-        Returns
-        -------
-        starting_wavs : numpy array of starting wavelengths for each order
-        wavelength (in Ang)
-        wave_spacing : numpy array of wavelength spacing for each order
-        '''
-        spectrum_information = ''
-        #loop through header keys
-        for key in hdul[0].header.keys():
-            #find 'WAT' key which holds wavelength and order information
-            if 'WAT' in key:
-                #collect spectrum information
-                spectrum_information = spectrum_information + hdul[0].header[key]
-
-        #split up spectrum information to grab starting wavelength and spacing for each order
-        min_wave = 3000
-        starting_wavs = np.zeros(hdul[0].header['NAXIS2'])
-        wave_spacing = np.zeros(hdul[0].header['NAXIS2'])
-        count = 0
-        for stuff in spectrum_information.split('spec'):
-            #print(stuff)
-            if ' = ' in stuff:
-                for i,item in enumerate(stuff.split(' ')):
-                    #print(i,len(item))
-                    try:
-                        floats = float(item)
-                        spacing = 0.0
-                        starting_wave = 0.0
-                        if floats > min_wave:
-                            starting_wave = floats
-                            spacing = float(stuff.split(' ')[i+1])
-                            break
-
-                    except:
-                        if len(item) >= 30:
-                            print()
-                        non_floats = item
-                        pass
-                starting_wavs[count] = starting_wave
-                #print(count, starting_wave)
-                wave_spacing[count] = spacing
-                #print(spacing)
-                count += 1
-        return starting_wavs, wave_spacing
-
-    def read_spec(self):
-        '''Read a KECK HIRES spectrum
-
-        Parameters
-        ----------
-        filename : string
-        name of the fits file with the data
-
-        Returns
-        -------
-        wavelength : np.ndarray (orders,points)
-        wavelength (in Ang)
-        flux : np.ndarray (orders,points)
-        flux (in erg/s/cm**2)
-        '''
-        with fits.open(self.filename) as hdul:
-            header = hdul[0].header
-            num_orders = header['NAXIS2']
-            num_points = header['NAXIS1']
-
-            #make index array
-            wavelength = np.zeros((num_orders, num_points))
-
-            try:#get ccd info and gain
-                self.gain = np.ones(len(wavelength))*header['CCDGN01']
-            except:
-                self.keck_chip_gains(header, len(wavelength))
-
-            try:
-                #get wavelength information for each order
-                for i in range(num_orders):
-                    #get key for starting wavelength and spacing for each order
-                    if i+1 < 10:
-                        start_wave_key = 'CRVL1_'+'0'+str(i+1)
-                        spacing_wave_key = 'CDLT1_'+'0'+str(i+1)
-                    else:
-                        start_wave_key = 'CRVL1_'+str(i+1)
-                        spacing_wave_key = 'CDLT1_'+str(i+1)
-
-                    #fill wavelength array
-                    wavelength[i][0] = header[start_wave_key]
-                    for j in range(num_points-1):
-                        j += 1
-                        wavelength[i][j] = wavelength[i][j-1] + header[spacing_wave_key]
-                print('CRVL stuff found')
-
-            except: #faster and possibly more common
-                ##get wavelength information for each order
-                starting_waves, wave_spacing = self.wat_info(hdul)
-
-                #fill wavelength array
-                for i in range(num_orders):
-                    wavelength[i][0] = starting_waves[i]
-                    for j in range(num_points-1):
-                        j += 1
-                        wavelength[i][j] = wavelength[i][j-1] + wave_spacing[i]
-                print('CRVL stuff not found')
-
-            #get flux
-            flux = hdul[0].data
-
-        return wavelength, flux
-
     def check_spectra(self, norm=True, lines=False):
         orders = len(self.wavelength)
 
@@ -864,35 +761,3 @@ class Spectrum_Data():
     def save_object(self, filename):
         with open(filename, 'wb') as f:
             pickle.dump(self, f)
-
-    def keck_chip_gains(self, header, num_orders):
-        #Determine chip color based on starting wavelength of chip
-        #Determine gain based on chip color info from https://www2.keck.hawaii.edu/inst/hires/ccdgain.html
-        spec_info = header['WAT2_001'].split()
-        for i in range(len(spec_info)):
-            try:
-                num = float(spec_info[i])
-                if num/100 > 1.0:
-                    break
-            except ValueError:
-                pass
-
-        starting_wavelength = num
-        print("starting wavelength:", starting_wavelength)
-        low_high = header['CCDGAIN']
-        print("Chip Gain:", low_high)
-        if starting_wavelength < 5000.0:
-            if low_high == 'low':
-                self.gain = np.ones(num_orders)*1.95
-            if low_high == 'high':
-                self.gain = np.ones(num_orders)*0.78
-        elif starting_wavelength < 6500.0:
-            if low_high == 'low':
-                self.gain = np.ones(num_orders)*2.09
-            if low_high == 'high':
-                self.gain = np.ones(num_orders)*0.84
-        else:
-            if low_high == 'low':
-                self.gain = np.ones(num_orders)*2.09
-            if low_high == 'high':
-                self.gain = np.ones(num_orders)*0.89
