@@ -37,12 +37,14 @@ All dependencies except `ipympl` and `tqdm` are required for core SPAE functiona
 
 ## XSpect-EW (equivalent-width measurement)
 
-`SPAE.xspect_ew` measures equivalent widths from Keck/HIRES spectra and writes a MOOG-format linelist-with-EW file directly usable by `SPAE.moog.abfind`. Originally developed by George Vejar ([github.com/forgeousgeorge/XSpect](https://github.com/forgeousgeorge/XSpect)), incorporated into SPAE 2026-09-14.
+`SPAE.xspect_ew` measures equivalent widths from a stellar spectrum and writes a MOOG-format linelist-with-EW file directly usable by `SPAE.moog.abfind`. Originally developed by George Vejar ([github.com/forgeousgeorge/XSpect](https://github.com/forgeousgeorge/XSpect)), incorporated into SPAE 2026-09-14.
+
+`Spectrum_Data(filename)` auto-detects the spectrum's format — Keck/MAKEE, GRACES/OPERA, MAROON-X, or a FITS binary table with named wave/flux columns (including this project's own KOA HIRES output, see `Verification/Brewer2016_HIRES`) — no need to say which instrument it came from. For anything not yet recognized, pass already-extracted arrays directly (`KECK_file=False, spectx=..., specty=...`) or a `custom_reader=` callable; see `SPAE/xspect_ew/readers.py` for the detection logic and how to add a new format.
 
 ```python
 from SPAE.xspect_ew import Spectrum_Data
 
-spec = Spectrum_Data('star_blue.fits', KECK_file=True)   # or KECK_file=False with spectx/specty arrays
+spec = Spectrum_Data('star_blue.fits')                    # format auto-detected
 spec.load_lines('linelist.txt')                           # MOOG-format: wave, species, EP, loggf, damping
 spec.normalize(order)                                      # per-order GP continuum fit
 spec.measure_line_ew(4779.439)                              # or measure_all_ew() / measure_ew()
