@@ -18,7 +18,7 @@ from .constants import ELEMENTS
 from .continuum import Continuum_scan
 from .line_profile import get_line_window, gauss_model, gfit_simple, gauss_ew
 from .gp_utils import SEKernel, Pred_GP
-from .combine import make_line
+from .combine import make_line, parabolic_refine
 from .plotting import make_plots_folder
 from .readers import read_spectrum
 
@@ -356,13 +356,19 @@ class Spectrum_Data():
                             result_y = spect_interp(sun.wavelength[i][compare_window_sun])
 
                             diff = (result_y - sun.normalized_flux[i][compare_window_sun])**2
-                            chi[k] = np.sum(diff)
+                            # mean, not sum: the overlap window (and hence the
+                            # number of compared points) shrinks near the edges
+                            # of the shift search range, which would otherwise
+                            # bias the minimum toward whichever trial shift
+                            # happens to produce the smallest overlap
+                            chi[k] = np.mean(diff)
 
                             #chi[k] = chisquare(result_y, constraint_value)[0]
                             #chi[k] = chisquare(result_y, sun.normalized_flux[i][compare_window_sun])[0]
 
                         if verbose:
-                            min_shift = shifts[np.where(chi == chi.min())][0]
+                            k_min = np.argmin(chi)
+                            min_shift = parabolic_refine(shifts, chi, k_min)
                             print('The best shift is', min_shift)
 
                         break
@@ -376,7 +382,8 @@ class Spectrum_Data():
                 self.estimated_shift[order] = -999.0
             else:
                 try:
-                    min_shift = shifts[np.where(chi == chi.min())][0]
+                    k_min = np.argmin(chi)
+                    min_shift = parabolic_refine(shifts, chi, k_min)
                     self.estimated_shift[order] = min_shift
                     self.wave_shift(order,min_shift)
                 except:

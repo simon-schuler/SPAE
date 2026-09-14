@@ -1,11 +1,37 @@
 """Combining multiple Spectrum_Data objects, and helpers used by wavelength-
-shift cleaning (Spectrum_Data.clean_shift())."""
+shift estimation/cleaning (Spectrum_Data.estimate_shift()/clean_shift())."""
 
 import numpy as np
 
 
 def make_line(x,m,b):
     return m*x+b
+
+
+def parabolic_refine(shifts, chi, k_min):
+    """
+    Sub-grid-resolution refinement of a coarse grid-search minimum via a
+    3-point parabolic fit around shifts[k_min]/chi[k_min].
+
+    Assumes a uniform grid (as produced by np.linspace, which is what
+    estimate_shift() uses). Falls back to the unrefined grid value at the
+    edges of the search range, where a symmetric 3-point fit isn't possible.
+
+    Returns
+    -------
+    refined_shift : float
+    """
+    if k_min == 0 or k_min == len(shifts) - 1:
+        return shifts[k_min]
+
+    y_lo, y_mid, y_hi = chi[k_min - 1], chi[k_min], chi[k_min + 1]
+    denom = (y_lo - 2.0 * y_mid + y_hi)
+    if denom == 0.0:
+        return shifts[k_min]
+
+    d = shifts[k_min] - shifts[k_min - 1]  # grid spacing
+    delta = 0.5 * (y_lo - y_hi) / denom
+    return shifts[k_min] + delta * d
 
 
 def combine_files(empty_obj,objects = []):
