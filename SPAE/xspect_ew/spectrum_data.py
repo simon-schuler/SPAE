@@ -9,19 +9,17 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.interpolate import interp1d
 from scipy.integrate import simpson
-from scipy.optimize import minimize
 from numpy.random import multivariate_normal
-import george
-from george import kernels
 
 from .constants import ELEMENTS
-from .continuum import Continuum_scan
+from .continuum import Continuum_scan, iterative_continuum_select
 from .line_profile import get_line_window, gauss_model, gfit_simple, gauss_ew
 from .gp_utils import SEKernel, Pred_GP
 from .combine import make_line, parabolic_refine
 from .plotting import make_plots_folder
 from .readers import read_spectrum
 from .radial_velocity import measure_effective_rv, C_KMS
+from .response_correction import apply_response_correction as _apply_response_correction
 
 
 class Spectrum_Data():
@@ -145,12 +143,42 @@ class Spectrum_Data():
         self.temp_line_ew = None
         self.temp_line_ew_err = None
 
-    def normalize_all(self, window_width = 1.5, continuum_depth = 90):
+    def apply_response_correction(self, response_wave, response, min_overlap_fraction=0.5,
+                                   min_response_fraction=0.1):
+        """
+        Divide out an instrument response/blaze correction curve. General:
+        works with a response curve from any source, matched to this
+        spectrum's own orders by wavelength overlap -- see
+        response_correction.py's module docstring for why. Run this
+        BEFORE normalize()/normalize_all(); it corrects the raw counts
+        (self.flux), and normalize()'s continuum fit will be far more
+        robust on an already-flattened spectrum.
+
+        For MAROON-X specifically: response_wave/response can come from
+        readers.load_maroonx_response('MAROON-X_PHOENIX_RESPONSE_...hd5')
+        -- a separate calibration file, not embedded in individual science
+        exposures (confirmed empty there).
+
+        Returns
+        -------
+        corrected_orders : list of order indices that were actually
+            corrected (others may have been skipped -- see
+            response_correction.apply_response_correction()'s docstring,
+            including its min_response_fraction edge-pixel guard).
+        """
+        return _apply_response_correction(self, response_wave, response,
+                                           min_overlap_fraction=min_overlap_fraction,
+                                           min_response_fraction=min_response_fraction)
+
+    def normalize_all(self, window_width = 1.5, continuum_depth = 90, degree = 3,
+                       n_iterations = 5, low_reject_sigma = 2.5, high_reject_sigma = 5.0):
         #loop through orders
         for i in range(len(self.flux)):
 
-            #use Gaussian Process to fit continuum
-            self.normalize(i, window_width, continuum_depth)
+            #fit continuum with an iteratively sigma-clipped low-order polynomial
+            self.normalize(i, window_width, continuum_depth, degree=degree,
+                            n_iterations=n_iterations, low_reject_sigma=low_reject_sigma,
+                            high_reject_sigma=high_reject_sigma)
 
             #Replace un-normalized points with value before it
             #This should only be replacing the last point in the
@@ -162,7 +190,30 @@ class Spectrum_Data():
 
         return None
 
-    def normalize(self, order, window_width = 1.5, continuum_depth = 90, clip = [-999,-999]):
+    def normalize(self, order, window_width = 1.5, continuum_depth = 90, clip = [-999,-999],
+                  degree = 3, n_iterations = 5, low_reject_sigma = 2.5, high_reject_sigma = 5.0):
+        """
+        Fit and divide out the continuum for one order.
+
+        Continuum_scan's local-window percentile selection (window_width,
+        continuum_depth) is used only as an INITIAL guess; the final
+        continuum-point selection and fit come from
+        iterative_continuum_select() (continuum.py), which refines that
+        guess via GLOBAL (order-wide), iteratively sigma-clipped low-order
+        polynomial fit. This fixes a real failure mode of trusting the
+        local-window selection as final: a window sitting entirely inside
+        a moderately broad/strong line has no true-continuum points to
+        select at all, and was measured (see conversation/session notes)
+        to bias the fitted continuum low there by 20-70% -- silently
+        making any such line (and anything sharing its local fit) look
+        shallower than it really is, i.e. underestimating its EW. A
+        first attempt at fixing this with a globally-refit Gaussian
+        Process did NOT work (same bug, same magnitude) -- see
+        continuum.py's module docstring for why a rigid low-order
+        polynomial fit is structurally the right tool here instead.
+        degree/n_iterations/low_reject_sigma/high_reject_sigma control
+        the refinement; see iterative_continuum_select()'s docstring.
+        """
         if clip[0] != -999 and clip[1] != -999:
             #clipped = True
             clipl = np.where(self.wavelength[order] <= clip[0])[0][-1]
@@ -172,45 +223,27 @@ class Spectrum_Data():
             clipl = 0
             clipr = len(self.flux[order])
 
-        err = np.sqrt(self.flux[order][clipl:clipr])
+        wave = self.wavelength[order][clipl:clipr]
+        flux = self.flux[order][clipl:clipr]
+        err = np.sqrt(flux)
+
         continuum_scan_obj = Continuum_scan(window_width, continuum_depth)
-        continuum_scan_obj.load_data(self.wavelength[order][clipl:clipr],self.flux[order][clipl:clipr])
+        continuum_scan_obj.load_data(wave, flux)
         continuum_scan_obj.scan()
-        cont = continuum_scan_obj.get_selected()
+        initial_select = continuum_scan_obj.get_selected()
         del continuum_scan_obj
 
-        #Gaussian Process to fit continuum
-        kernel = np.var(self.flux[order][clipl:clipr][cont]) * kernels.Matern32Kernel(10)
-        #print("cont", len(self.flux[order][cont]))
-        #kernel = np.var(self.flux[order][cont]) * kernels.ExpSquaredKernel(10)
-        gp = george.GP(kernel,mean=self.flux[order][clipl:clipr][cont].mean())
-        gp.compute(self.wavelength[order][clipl:clipr][cont], err[cont])
-        x_pred = self.wavelength[order][clipl:clipr].copy()
-        pred, pred_var = gp.predict(self.flux[order][clipl:clipr][cont], x_pred, return_var=True)
-        #print("ln-likelihood: {0:.2f}".format(gp1.log_likelihood(self.flux[order][cont])))
-        params = [gp,self.flux[order][clipl:clipr][cont]]
-        result = minimize(self.neg_ln_like, gp.get_parameter_vector(), args = params, jac=self.grad_neg_ln_like)
-        #print(result)
-        gp.set_parameter_vector(result.x)
-        pred, pred_var = gp.predict(self.flux[order][clipl:clipr][cont], x_pred, return_var=True)
-        #print("\nFinal ln-likelihood: {0:.2f}".format(gp.log_likelihood(self.flux[order][cont])))
+        cont, pred, pred_var = iterative_continuum_select(
+            wave, flux, err, initial_select, degree=degree,
+            n_iterations=n_iterations, low_reject_sigma=low_reject_sigma,
+            high_reject_sigma=high_reject_sigma)
 
         self.continuum[order][clipl:clipr] = cont
         self.pred_all[order][clipl:clipr] = pred
         self.pred_var_all[order][clipl:clipr] = pred_var
         self.obs_err[order][clipl:clipr] = err
-        self.normalized_flux[order][clipl:clipr] = self.flux[order][clipl:clipr]/pred
+        self.normalized_flux[order][clipl:clipr] = flux/pred
         return None
-
-    def grad_neg_ln_like(self,p, params):
-        params[0].set_parameter_vector(p)
-        neg_ln = (-1)*params[0].grad_log_likelihood(params[1])
-        return neg_ln
-
-    def neg_ln_like(self,p, params):
-        params[0].set_parameter_vector(p)
-        neg_ln = (-1)*params[0].log_likelihood(params[1])
-        return neg_ln
 
     def S_N(self, rows = 5, cols = 4, save_plot = False):
         #Siganl to noise is overestimated compared to MAKEE output

@@ -286,6 +286,38 @@ def _read_maroonx(store, fiber=_MAROONX_DEFAULT_FIBER,
     return wavelength, flux, None
 
 
+def load_maroonx_response(filename):
+    """
+    Load a MAROON-X PHOENIX-based instrument response/blaze correction
+    file (e.g. MAROON-X_PHOENIX_RESPONSE_CORRECTORDERS.hd5) -- a SEPARATE
+    calibration file, not embedded in individual science exposures
+    (confirmed: the per-exposure 'blaze_blue'/'blaze_red' keys exist but
+    are empty in real science files). Returns per-order (wave, response)
+    arrays in the same list-of-arrays convention Spectrum_Data itself
+    uses, ready to pass to Spectrum_Data.apply_response_correction().
+
+    File structure (confirmed against a real file, not assumed): keys
+    'wavelength_blue'/'wavelength_red' and 'response_blue'/'response_red',
+    each a DataFrame with one column per echelle order. The two DataFrames'
+    columns do NOT share label values -- wavelength_* uses plain positional
+    labels (0, 1, 2, ...) while response_* uses the real echelle order
+    numbers (e.g. 92, 93, ...) -- but they correspond POSITIONALLY
+    (wavelength column 0 <-> response column 92, etc.), confirmed by
+    checking that the wavelength ranges line up when paired that way.
+    """
+    import pandas as pd
+    wave_list = []
+    resp_list = []
+    with pd.HDFStore(filename, 'r') as store:
+        for band in ('blue', 'red'):
+            wave_df = store[f'wavelength_{band}']
+            resp_df = store[f'response_{band}']
+            for wave_col, resp_col in zip(wave_df.columns, resp_df.columns):
+                wave_list.append(np.asarray(wave_df[wave_col], dtype=float) * 10.0)  # nm -> Angstrom
+                resp_list.append(np.asarray(resp_df[resp_col], dtype=float))
+    return wave_list, resp_list
+
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
