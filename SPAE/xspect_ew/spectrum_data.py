@@ -115,8 +115,32 @@ class Spectrum_Data():
         self.lines_gauss_Xsquare = None
         #line - X squared threshold value
         self.X_thresh = 0.003
+        #line - the actually-identified line center (Angstrom, in
+        #shifted_wavelength), set by measure_ew(). Comparing this against
+        #the rest wavelength (self.lines) is how check_for_flags() catches
+        #likely misidentification -- see its docstring.
+        self.lines_found_position = None
+        #line - max allowed |lines_found_position - lines| (Angstrom) before
+        #check_for_flags() flags a line as a possible misidentification.
+        #Note get_line_window()'s own search is bounded to +/-0.1 A around
+        #the expected position by default, so this threshold only has teeth
+        #below that. Calibrated empirically (see conversation/session notes,
+        #the 78-line real-star test): apply_rv_shift()-corrected positions
+        #had RMS ~37 mA and MAX ~63 mA offset from the physically-expected
+        #position even when correctly identified (real per-line
+        #astrophysical scatter, e.g. convective blueshift differences --
+        #not error). A first attempt at 0.05 (50 mA) sat below that
+        #legitimate max and produced false positives; 0.07 leaves margin
+        #above the good method's observed worst case while remaining well
+        #below where the unreliable clean_shift()-extrapolated positions
+        #commonly landed (many 90-160 mA off in the same test).
+        self.position_thresh = 0.07
         #line - X squared value above threshold or EW = 0
         self.lines_check_flag = None
+        #line - human-readable reason(s) lines_check_flag was set, '' if not
+        #flagged. Set by check_for_flags(); make_ew_doc() uses this to
+        #explain why a line was routed to the flagged-lines file.
+        self.lines_flag_reasons = None
         #used to switch between Adamow ew calculation and simpson's rule integration
         self.temp_line_ew = None
         self.temp_line_ew_err = None
@@ -547,7 +571,9 @@ class Spectrum_Data():
         self.lines_ew_simp_err = np.zeros(len(self.lines))
         self.lines_bf_params = np.array([None]*len(self.lines))
         self.lines_gauss_Xsquare = np.array([np.nan]*len(self.lines))
+        self.lines_found_position = np.array([np.nan]*len(self.lines))
         self.lines_check_flag = np.array([False]*len(self.lines))
+        self.lines_flag_reasons = np.array(['']*len(self.lines), dtype=object)
         for i in range(len(self.lines)):
             self.lines_exd[i] = np.array([elmnt[i],ep[i],gf[i],rad[i]])
 
@@ -567,9 +593,43 @@ class Spectrum_Data():
     #         self.temp_line_ew = self.lines_ew_simp
     #         self.temp_line_ew_err = self.lines_ew_simp_err
 
-    def make_ew_doc(self, name,doc_title='STARNAME, PROJECT, YEAR; '):
+    def make_ew_doc(self, name, doc_title='STARNAME, PROJECT, YEAR; ', flagged_name=None):
+        """
+        Write the measured EWs as a MOOG-format linelist.
+
+        For running unattended (little to no user interaction): lines that
+        check_for_flags() marks as untrustworthy are NOT written to `name`
+        -- a suspicious measurement should never silently end up in the
+        science linelist. They're written instead to a separate file
+        (flagged_name, default: `name` with "_flagged" inserted before the
+        extension), each annotated with its flag reason(s), for later
+        interactive/visual review -- not for automatic consumption.
+
+        Calls check_for_flags() itself, so it reflects the current
+        measurements even if you haven't called it explicitly.
+
+        Returns
+        -------
+        removed_lines : ndarray -- rest wavelengths of lines never measured
+            at all (EW == 0, e.g. excluded via measure_all_ew()'s
+            exclude_lines). Distinct from flagged lines, which WERE
+            measured but look untrustworthy.
+        """
+        if flagged_name is None:
+            if '.' in name:
+                base, ext = name.rsplit('.', 1)
+                flagged_name = f'{base}_flagged.{ext}'
+            else:
+                flagged_name = f'{name}_flagged'
+
+        self.check_for_flags()
+
         doc = open(name, 'w')
         doc.write(doc_title+'Extended Fe Linelist based on the SWP (2010) paper plus additions from Ivan\n')
+        flagged_doc = open(flagged_name, 'w')
+        flagged_doc.write(doc_title + 'FLAGGED lines -- excluded from the main linelist above; for '
+                           'interactive/visual review, not automatic use. Trailing comment is the '
+                           'flag reason(s) from check_for_flags().\n')
         removed_lines = []
         for i in range(len(self.lines)):
             if self.lines_ew[i] != 0.0:
@@ -585,10 +645,14 @@ class Spectrum_Data():
                 ew = str(np.round(self.lines_ew[i],3))
                 err = str(np.round(self.lines_ew_err[i],3))
                 current_line = "{0:14s}{1:11s}{2:8s}{3:15s}{4:17s}{5:10s}{6:5s}\n".format(wave,elmnt,ep,gf,rad,ew,err)
-                doc.write(current_line)
+                if self.lines_check_flag[i]:
+                    flagged_doc.write(current_line.rstrip('\n') + '   # ' + self.lines_flag_reasons[i] + '\n')
+                else:
+                    doc.write(current_line)
             else:
                 removed_lines.append(self.lines[i])
         doc.close()
+        flagged_doc.close()
         return np.array(removed_lines)
 
     def measure_ew(self, i, order, plot = False, ex_params = [0,0,0,0], save_plot = False, window_size = 1.5):
@@ -628,6 +692,11 @@ class Spectrum_Data():
             measure_y_array = self.normalized_flux[order][wind]
             temp_err_array = self.obs_err[order][wind]
             temp_pred_array = self.pred_all[order][wind]
+
+        # record the actually-identified line center -- check_for_flags()
+        # compares this against the rest wavelength to catch likely
+        # misidentification (see its docstring)
+        self.lines_found_position[i] = found_line
 
         other_than_line = np.where((measure_x_array <= line_bound[0])|(measure_x_array >= line_bound[1]))
         only_line = np.where((measure_x_array >= line_bound[0])|(measure_x_array <= line_bound[1]))
@@ -823,23 +892,52 @@ class Spectrum_Data():
                             print('order', order, 'saved!')
 
     def check_for_flags(self):
+        """
+        Flag lines whose measurement looks untrustworthy: high EW error
+        fraction, too shallow to trust, a poor Gaussian fit, or -- the
+        check that matters most for avoiding a silently WRONG EW rather
+        than just an imprecise one -- a found line center
+        (lines_found_position, set by measure_ew()) that lands more than
+        position_thresh away from the line's rest wavelength. Since
+        get_line_window()'s search is itself bounded to +/-0.1 A by
+        default, a found position near that boundary is a strong sign the
+        code locked onto a neighboring feature/blend/noise dip rather than
+        the intended line -- see the wavelength-shift robustness testing in
+        conversation/session notes for how large this risk can be when a
+        spectrum's wavelength correction is not well constrained.
+        """
         for i in range(len(self.lines)):
             self.lines_check_flag[i] = False
+            reasons = []
             #error measure check - above 10% is a problem
             if self.lines_ew_err[i]/self.lines_ew[i] >= .1:
                 self.lines_check_flag[i] = True
+                reasons.append(f'error>10% ({np.round(self.lines_ew_err[i],2)} mA)')
                 print(self.lines[i], 'has more than a 10% error', np.round(self.lines_ew_err[i],2))
             #shallow line check - below 2 mA is a problem
             if self.lines_ew[i] < 2.0:
                 self.lines_check_flag[i] = True
+                reasons.append(f'too shallow ({np.round(self.lines_ew[i],2)} mA)')
                 print(self.lines[i], 'might be too shallow', np.round(self.lines_ew[i],2))
-            if self.lines_gauss_Xsquare[i] == np.nan:
+            if np.isnan(self.lines_gauss_Xsquare[i]):
                 self.lines_check_flag[i] = True
+                reasons.append('no fit / line not found')
                 print(self.lines[i], 'no fit, line may not be found in spectrum')
             #X square check - if fit above threshold (problem)
             elif self.lines_gauss_Xsquare[i] > self.X_thresh:
                 self.lines_check_flag[i] = True
+                reasons.append(f'bad fit (X^2={np.round(self.lines_gauss_Xsquare[i],4)})')
                 print(self.lines[i], 'might have a bad fit', self.lines_gauss_Xsquare[i])
+            #position check - found line far from its rest wavelength is a
+            #likely misidentification, not just an imprecise measurement
+            if not np.isnan(self.lines_found_position[i]):
+                position_offset = abs(self.lines_found_position[i] - self.lines[i])
+                if position_offset > self.position_thresh:
+                    self.lines_check_flag[i] = True
+                    reasons.append(f'position off by {np.round(position_offset*1000,1)} mA (possible misidentification)')
+                    print(self.lines[i], 'found position is', np.round(position_offset*1000,1),
+                          'mA from rest wavelength -- possible misidentification, inspect before trusting this EW')
+            self.lines_flag_reasons[i] = '; '.join(reasons)
 
     def check_spectra(self, norm=True, lines=False):
         orders = len(self.wavelength)
