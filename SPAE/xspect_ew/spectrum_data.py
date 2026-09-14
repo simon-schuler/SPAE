@@ -1,368 +1,34 @@
-"""Python3 - User guided equivalent wideth measurement and analysis tool for stellar absorption spectra """
+"""Spectrum_Data: the core driver class for loading a spectrum, fitting its
+continuum, wave-shifting against a reference, and measuring line EWs."""
 
-__version__ = "dev"
+import copy
+import glob
+import pickle
 
 import numpy as np
 import matplotlib.pyplot as plt
-#from scipy.optimize import fmin
-from scipy.stats import chisquare
+from astropy.io import fits
 from scipy.interpolate import interp1d
 from scipy.integrate import simpson
+from scipy.optimize import minimize
 from numpy.random import multivariate_normal
-from astropy.io import fits
-from scipy.optimize import curve_fit
-import glob
 import george
 from george import kernels
-from scipy.optimize import minimize
-import pickle
-import copy
-from scipy.spatial.distance import cdist
-from numpy.linalg import inv
-from numpy.linalg import slogdet
-import subprocess
 
-#----------------------------------------------------------Functions-------------------------------------------------------#
-def plot_line_info(star, name, filt = None):
-    fig = plt.figure(figsize = (10,5))
-    info_plot = fig.add_subplot(111)
-    if filt == None:
-        info_plot.errorbar(star.lines, star.lines_ew, yerr = star.lines_ew_err, fmt='.', zorder = 2, ecolor='k', c = 'k')
-        info_plot.scatter(star.lines, star.lines_ew, c= star.lines_gauss_Xsquare, cmap = plt.cm.Reds, edgecolors='k', zorder = 3, s = 30)
-        info_plot.scatter(star.lines[star.lines_check_flag], star.lines_ew[star.lines_check_flag], c = 'w', edgecolors= 'r',  zorder = 0, s = 100)
-    else:
-        info_plot.errorbar(star.lines[filt], star.lines_ew[filt], yerr = star.lines_ew_err[filt], fmt='.', zorder = 2, ecolor='k', c = 'k')
-        info_plot.scatter(star.lines[filt], star.lines_ew[filt], c= star.lines_gauss_Xsquare[filt], cmap = plt.cm.Reds, edgecolors='k', zorder = 3, s = 30)
-        info_plot.scatter(star.lines[filt][star.lines_check_flag[filt]], star.lines_ew[filt][star.lines_check_flag[filt]], c = 'w', edgecolors= 'r',  zorder = 0, s = 100)
-        
-    info_plot.grid()
-    info_plot.set_title(name, size = 20)
-    info_plot.set_xlabel(r'$\rm Wavelength\ (nm)$', size = 15)
-    info_plot.set_ylabel(r'$\rm Equivalent\ Width\ (mA)$', size = 15)
-    #plt.savefig(name+'_line_ew_info.pdf')
-    plt.show()
-    
-def plot_comparison_res(star,hand_measured, name,xy = [0,100], filt = None):
-    fig = plt.figure(figsize = (10,5))
-    #top plot
-    info_plot = fig.add_subplot(211)
-    if filt == None:
-        info_plot.errorbar(hand_measured, star.lines_ew, yerr = star.lines_ew_err, fmt='.', zorder = 2,ecolor='k', c = 'k')
-        info_plot.scatter(hand_measured, star.lines_ew, c= star.lines_gauss_Xsquare, cmap = plt.cm.Reds, edgecolors='k', zorder = 3, s = 30)
-        info_plot.scatter(hand_measured[star.lines_check_flag], star.lines_ew[star.lines_check_flag], c = 'w', edgecolors= 'r',  zorder = 0, s = 100)
-    else:
-        info_plot.errorbar(hand_measured[filt], star.lines_ew[filt], yerr = star.lines_ew_err[filt], fmt='.', zorder = 2,ecolor='k', c = 'k')
-        info_plot.scatter(hand_measured[filt], star.lines_ew[filt], c= star.lines_gauss_Xsquare[filt], cmap = plt.cm.Reds, edgecolors='k', zorder = 3, s = 30)
-        info_plot.scatter(hand_measured[filt][star.lines_check_flag[filt]], star.lines_ew[filt][star.lines_check_flag[filt]], c = 'w', edgecolors= 'r',  zorder = 0, s = 100)
-        
-    info_plot.plot([xy[0],xy[1]],[xy[0],xy[1]], 'k--')
-    info_plot.set_title(name, size = 20)
-    info_plot.grid()
-    info_plot.set_ylabel(r'$\rm Auto\ Measured\ (mA)$', size = 15)
-    
-    #residuals plot
-    res_plot = fig.add_subplot(212, sharex=info_plot)
-    if filt == None:
-        star_res_values = star.lines_ew - hand_measured
-        res_plot.errorbar(hand_measured, star_res_values, yerr = star.lines_ew_err, fmt='.', zorder = 2,ecolor='k', c = 'k')
-        res_plot.scatter(hand_measured, star_res_values, c= star.lines_gauss_Xsquare, cmap = plt.cm.Reds, edgecolors='k', zorder = 3, s = 30)
-        res_plot.scatter(hand_measured[star.lines_check_flag], star_res_values[star.lines_check_flag], c = 'w', edgecolors= 'r',  zorder = 0, s = 100)
-    else:
-        star_res_values = star.lines_ew - hand_measured
-        res_plot.errorbar(hand_measured[filt], star_res_values[filt], yerr = star.lines_ew_err[filt], fmt='.', zorder = 2,ecolor='k', c = 'k')
-        res_plot.scatter(hand_measured[filt], star_res_values[filt], c= star.lines_gauss_Xsquare[filt], cmap = plt.cm.Reds, edgecolors='k', zorder = 3, s = 30)
-        res_plot.scatter(hand_measured[filt][star.lines_check_flag[filt]], star_res_values[star.lines_check_flag], c = 'w', edgecolors= 'r',  zorder = 0, s = 100)
-    #plt.savefig(name+'_ew_comparison.pdf')
-    res_plot.plot([xy[0],xy[1]],[0,0],'k--')
-    res_plot.set_xlabel(r'$\rm Hand\ Measured\ (mA)$', size = 15)
-    res_plot.grid()
-    plt.tight_layout()
-    plt.show()
-
-def get_line_window(line, wave, flux, left_bound, right_bound, 
-                    line_input, window_size = 1.5):
-    boundaries = [0,0]
-    #if no line is specified, auto fine best line guess
-    if line_input == 0.0:
-        #find line tip
-        left_look = np.where((wave <= line)&(wave >= line - 0.1))
-        right_look = np.where((wave >= line)&(wave <= line + 0.1))
-        #find min
-        mins = [flux[left_look].min(),flux[right_look].min()]
-        best_line_guess = wave[np.where(flux == np.min(mins))][0]
-    else:
-        best_line_guess = line_input
-        
-    #get_window around line
-    window = np.where((wave >= best_line_guess-window_size/2.0)&(wave <= best_line_guess+window_size/2.0))
-
-    #calc derivative
-    dy = np.gradient(flux[window])
-    dy_std = dy.std()
-
-    #if no left or right bound given set using std
-    auto_bound_l = False
-    auto_bound_r = False
-    if left_bound == 0:
-        dy_l = dy_std/2.0
-        auto_bound_l = True
-    if right_bound == 0:
-        dy_r = dy_std/2.0
-        auto_bound_r = True
-    
-    #if no line boundaries specified auto find boundaries
-    if auto_bound_l:
-        left_look = np.where(wave[window] <= best_line_guess - 0.05)
-        dy1_left = np.where((dy[left_look] < dy_l)&(dy[left_look] > (-1)*dy_l))
-        if len(wave[window][left_look][dy1_left]) ==0:
-            print('line ',line,' very close to edge or dy selection value too small')
-            print('will attempt to remeasure, if not possible, add line to exclude lines list in .measure_all_ew() function')
-            plt.clf()
-            plt.plot(wave[window],flux[window])
-            plt.plot([line,line],[0.95,1.0], 'k')
-            plt.annotate(str(line), xy=[line,1.01])
-            plt.plot([best_line_guess,best_line_guess],[0.95,1.0], 'k--')
-            plt.annotate(str(best_line_guess), xy=[best_line_guess,1.01])
-            plt.show()
-            return 1,1,0,0
-
-        else:
-            boundaries[0] = wave[window][left_look][dy1_left][-1]
-    else:
-        boundaries[0] = left_bound
-    if auto_bound_r:
-        right_look = np.where(wave[window] >= best_line_guess + 0.05)
-        dy1_right = np.where((dy[right_look] < dy_r)&(dy[right_look] > (-1)*dy_r))
-        if len(wave[window][right_look][dy1_right]) ==0:
-            print('line ',line,' very close to edge or dy selection value too small')
-            print('will attempt to remeasure, if not possible, add line to exclude lines list in .measure_all_ew() function')
-            plt.clf()
-            plt.plot(wave[window],flux[window])
-            plt.plot([line,line],[0.95,1.0], 'k')
-            plt.annotate(str(line), xy=[line,1.01])
-            plt.plot([best_line_guess,best_line_guess],[0.95,1.0], 'k--')
-            plt.annotate(str(best_line_guess), xy=[best_line_guess,1.01])
-            plt.show()
-            return 0,0,1,1
-
-        else:
-            boundaries[1] = wave[window][right_look][dy1_right][0]
-    else:
-        boundaries[1] = right_bound
-
-    return window,best_line_guess, boundaries,dy
-
-def gauss_model(x,A,mu,sigma, baseline): 
-    return A*np.exp(-(x-mu)**2/2/sigma**2) + baseline
-
-def gfit(wav,flux,wav_cen, fwhm):
-        sigma = fwhm/2.355
-        #limit window of search center +- 2*fwhm to exclude other emission lines
-        gwave = np.where((wav >= wav_cen-30)&(wav <= wav_cen+30))
-
-        #find better center to account for small doppler shift within same window of search
-        bet_cen = wav[np.where(flux == flux[gwave].max())[0][0]]
-
-        #Initial value for guass max value guess from max of curve
-        guess = flux[np.where(flux == flux[gwave].max())[0][0]]
-
-        #Set parameters for gauss curve fit
-        p0 = [guess,bet_cen,sigma, 0.]
-        bf,cov = curve_fit(gauss_model,wav[gwave],flux[gwave],p0)
-
-        #plt.plot(wav[gwave], flux[gwave], 'r')
-        return bf, np.sqrt(np.diag(cov)), p0
-    
-def gfit_simple(x_array, y_array, mu, sigma, baseline):
-    A = y_array.max()
-    p0 = [A, mu, sigma, baseline]
-    try:
-        bf, cov = curve_fit(gauss_model, x_array, y_array, p0)
-        return bf, np.sqrt(np.diag(cov)), p0
-    except:
-        bf, cov = [0,0,0,0],None
-        return bf, cov, p0
-
-def gauss_ew(a, fwhm):
-    if a == 0 or fwhm == 0:
-        return 0
-    else:
-        return 500.*a*np.sqrt(np.pi/np.log(2))*fwhm #From Adamow pyMOOG ew measure
-
-#Gaussian Process code and kernals taken from LSSTC DSFP notebook
-def SEKernel(par, x1, x2):
-    A, Gamma = par
-    D2 = cdist(x1.reshape(len(x1),1), x2.reshape(len(x2),1), metric = 'sqeuclidean')
-    return A*np.exp(-Gamma*D2)
-
-def Pred_GP(CovFunc, CovPar, xobs, yobs, eobs, xtest):
-    # evaluate the covariance matrix for pairs of observed inputs
-    K = CovFunc(CovPar, xobs, xobs) 
-    # add white noise
-    K += np.identity(xobs.shape[0]) * eobs**2
-    # evaluate the covariance matrix for pairs of test inputs
-    Kss = CovFunc(CovPar, xtest, xtest)
-    # evaluate the cross-term
-    Ks = CovFunc(CovPar, xtest, xobs)
-    # invert K
-    Ki = inv(K)
-    # evaluate the predictive mean
-    m = np.dot(Ks, np.dot(Ki, yobs))
-    # evaluate the covariance
-    cov = Kss - np.dot(Ks, np.dot(Ki, Ks.T))
-    return m, cov
-
-def NLL_GP(p,CovFunc,x,y,e):
-    # Evaluate the covariance matrix
-    K = CovFunc(p,x,x)
-    # Add the white noise term
-    K += np.identity(x.shape[0]) * e**2
-    # invert it
-    Ki = inv(K)
-    # evaluate each of the three terms in the NLL
-    term1 = 0.5 * np.dot(y,np.dot(Ki,y))
-    term2 = 0.5 * slogdet(K)[1]
-    term3 = 0.5 * len(y) * np.log(2*np.pi)
-    # return the total
-    return term1 + term2 + term3
-
-def make_line(x,m,b):
-    return m*x+b
-
-def combine_files(empty_obj,objects = []):
-    final_wavelength = []
-    final_flux = []
-    final_norm_flux = []
-    final_shifted_wavelength = []
-    final_estimated_shift = []
-    final_continuum = []
-    final_obs_err = []
-    final_pred_all = []
-    final_pred_var_all = []
-    final_gain = []
-    
-    for j in objects:
-
-        for i in range(len(j.flux)):
-            final_norm_flux.append(j.normalized_flux[i])
-            final_shifted_wavelength.append(j.shifted_wavelength[i])
-            final_wavelength.append(j.wavelength[i])
-            final_flux.append(j.flux[i])
-            final_estimated_shift.append(j.estimated_shift[i])
-            final_continuum.append(j.continuum[i])
-            final_obs_err.append(j.obs_err[i])
-            final_pred_all.append(j.pred_all[i])
-            final_pred_var_all.append(j.pred_var_all[i])
-            final_gain.append(j.gain[i])
-               
-    empty_obj.wavelength = np.array(final_wavelength)
-    empty_obj.flux = np.array(final_flux)
-    empty_obj.shifted_wavelength = np.array(final_shifted_wavelength)
-    empty_obj.normalized_flux = np.array(final_norm_flux)
-    empty_obj.estimated_shift = np.array(final_estimated_shift)
-    empty_obj.continuum = np.array(final_continuum)
-    empty_obj.obs_err = np.array(final_obs_err)
-    empty_obj.pred_all = np.array(final_pred_all)
-    empty_obj.pred_var_all = np.array(final_pred_var_all)
-    empty_obj.gain = np.array(final_gain)
-    del final_wavelength
-    del final_flux
-    del final_norm_flux
-    del final_shifted_wavelength
-    del final_estimated_shift
-    del final_continuum
-    del final_obs_err
-    del final_pred_all
-    del final_pred_var_all
-    del final_gain
-    
-    return empty_obj
-
-def reduce_cc(x,y,lines,lines_removed,limit=0.12):
-    #check correlation before going further
-    cc = np.corrcoef(x,y)
-    print('starting cc', cc[0,1])
-    
-    if abs(cc[0,1]) < limit:
-        print('cc good enough')
-        return lines,x,y,lines_removed
-    
-    check_ccs = np.zeros(len(x))
-    
-    #remove largest cc difference
-    for i in range(len(x)):
-        new_x = np.delete(x,i)
-        new_y = np.delete(y,i)
-        new_cc = np.corrcoef(new_x,new_y)
-        check_ccs[i] = new_cc[0,1]
-    
-    #Calculate differences
-    diffs = [abs(cc[0,1])- abs(j) for j in check_ccs]
-    #which gives largest difference?
-    biggest_diff = np.where(diffs == max(diffs))[0][0]
-    #remove that one line
-    lines_removed.append([lines[biggest_diff],x[biggest_diff],y[biggest_diff]])
-    x = np.delete(x,biggest_diff)
-    y = np.delete(y,biggest_diff)
-    lines = np.delete(lines,biggest_diff)
-    print('line removed: ', lines_removed)
-    
-    #recalculate cc
-    cc = np.corrcoef(x,y)
-    print('ending cc', cc[0,1])
-    
-    #Call function again to remove lines until 0.12 is passed
-    lines,x,y,lines_removed = reduce_cc(x,y,lines,lines_removed)
-    
-    return lines,x,y,lines_removed
-
-def load_object(filename):
-    with open(filename, 'rb') as f:
-        return pickle.load(f)
-
-def make_plots_folder():
-    folder_name = 'line_plots'
-    #check if folder exists
-    filenames = glob.glob('*')
-    if folder_name in filenames:
-        pass
-    else:
-        #make folder if not
-        cmd = 'mkdir '+folder_name
-        subprocess.call(cmd, shell=True)
-    
-
-def replace_w(array, replace_value, replace_with = 'med' ):
-    """
-        Use to replace individual values with either median or average of the order
-        or with a specific value
-        array format: [[order1],[order2],...] orderN = [x1,x2,x3,...]
-        replace_value - value to be replaced
-        repace_with - 'med', 'avg', or value to replace with
-    """
-
-    for i in range(len(array)):
-        gd_0 = np.where(array[i] == replace_value)
-        gd = np.where(array[i] != replace_value)
-
-        for j in gd_0:
-            if replace_with == 'med':
-                array[i][j] = np.median(array[i][gd])
-            elif replace_with == 'avg':
-                array[i][j] = np.average(array[i][gd])
-            else:
-                array[i][j] = replace_with
-            
-    return None
+from .constants import ELEMENTS
+from .continuum import Continuum_scan
+from .line_profile import get_line_window, gauss_model, gfit_simple, gauss_ew
+from .gp_utils import SEKernel, Pred_GP
+from .combine import make_line
+from .plotting import make_plots_folder
 
 
-#--------------------------------------------------Classes--------------------------------------------------#
 class Spectrum_Data():
     def __init__(self, filename, KECK_file = True, spectx=False, specty=False, order_split = (False,3500)):
         """
             filenmae - used to name plots and files
             KECK_file - True if loading KECK fits file
-            spectx, specty - input spectrum if loading from arrays 
+            spectx, specty - input spectrum if loading from arrays
                 if not using order_split:
                     input format: [[order1],[order2],...] orderN = [x1,x2,x3,...]
                 if using order_split:
@@ -373,7 +39,7 @@ class Spectrum_Data():
         if KECK_file:
             self.wavelength, self.flux = self.read_spec()
         else:
-            #split input array into orders 
+            #split input array into orders
             if order_split[0]:
                 #Try targetting about 3500 points per order, too many points per order will slow code down
                 order_count = int(len(spectx)/order_split[1])
@@ -392,7 +58,7 @@ class Spectrum_Data():
         self.shifted_wavelength = copy.deepcopy(self.wavelength)
         self.estimated_shift = np.zeros(len(self.wavelength))
         self.rv = None #km/s
-        
+
         #continuum information
         self.continuum = np.full(len(self.wavelength), None)
         #print('cont array empty', self.continuum)
@@ -412,7 +78,7 @@ class Spectrum_Data():
         # self.pred_all = np.zeros((len(self.wavelength),len(self.wavelength[0])))
         # self.pred_var_all = np.zeros((len(self.wavelength),len(self.wavelength[0])))
         # self.obs_err = np.zeros((len(self.wavelength),len(self.wavelength[0])))
-        
+
         #line information
         self.lines = None
         #line - extra parameters [0] - shift continuum, [1] - left boundary in Angstroms
@@ -440,16 +106,16 @@ class Spectrum_Data():
         #used to switch between Adamow ew calculation and simpson's rule integration
         self.temp_line_ew = None
         self.temp_line_ew_err = None
-        
+
     def normalize_all(self, window_width = 1.5, continuum_depth = 90):
-        #loop through orders        
+        #loop through orders
         for i in range(len(self.flux)):
 
             #use Gaussian Process to fit continuum
             self.normalize(i, window_width, continuum_depth)
 
             #Replace un-normalized points with value before it
-            #This should only be replacing the last point in the 
+            #This should only be replacing the last point in the
             #spectrum that is always missed by normalize
             # err_est = self.obs_err[i]/self.pred_all[i]
             # non_norm_points = np.where(self.normalized_flux[i] > np.average(self.normalized_flux[i][self.continuum[i]]+err_est[self.continuum[i]]*100))
@@ -467,14 +133,14 @@ class Spectrum_Data():
             #clipped = False
             clipl = 0
             clipr = len(self.flux[order])
- 
+
         err = np.sqrt(self.flux[order][clipl:clipr])
         continuum_scan_obj = Continuum_scan(window_width, continuum_depth)
         continuum_scan_obj.load_data(self.wavelength[order][clipl:clipr],self.flux[order][clipl:clipr])
         continuum_scan_obj.scan()
         cont = continuum_scan_obj.get_selected()
         del continuum_scan_obj
-        
+
         #Gaussian Process to fit continuum
         kernel = np.var(self.flux[order][clipl:clipr][cont]) * kernels.Matern32Kernel(10)
         #print("cont", len(self.flux[order][cont]))
@@ -556,7 +222,7 @@ class Spectrum_Data():
         np.save(name+'_pred',self.pred_all)
         np.save(name+'_pred_var',self.pred_var_all)
         return None
-            
+
     def wave_shift(self, order, shift):
         self.shifted_wavelength[order] = self.wavelength[order] + shift
         self.estimated_shift[order] = shift
@@ -572,22 +238,22 @@ class Spectrum_Data():
             diff = abs(med_A[k] - med_B)
             loc = np.where(diff == diff.min())
             b_order.append(loc)
-            
+
         combined_flux_orders = np.zeros_like(self.flux)
         if shift:
             #first shift A to match B with higher accuracy (higher resolution)
             #may have to include a try statement for errors
             self.estimate_shift([spectB], shift_spacing=resolution)
             self.clean_shift()
-        
+
         #loop through orders
         for i in range(len(self.shifted_wavelength)):
-            
+
             #combining flux values for each wavelength value
             combined_flux = np.zeros(len(self.shifted_wavelength[i]))
-            
+
             print('A order', i, 'B order', b_order[i][0][0])
-            
+
             #loop through each shifted wavelength value
             for j in range(len(self.shifted_wavelength[i])):
                 #difference between one shifted wavelength value and all B wavelength values
@@ -611,7 +277,7 @@ class Spectrum_Data():
             #collect flux values for each order
             combined_flux_orders[i] = combined_flux
             self.obs_err[i] = np.sqrt(combined_flux)
-            
+
             plt.plot(self.shifted_wavelength[i], self.flux[i], label = 'A')
             plt.plot(spectB.wavelength[b_order[i][0][0]], spectB.flux[b_order[i][0][0]], label = 'B')
             plt.plot(self.shifted_wavelength[i], combined_flux, label = 'A+B')
@@ -626,7 +292,7 @@ class Spectrum_Data():
 
     def update_combined(self):
         self.flux = self.combined_flux
-        
+
     def estimate_shift(self, sun_spectra, shift_max = 5, shift_min = -5, shift_spacing = 100, verbose = False):
         #setup num orders, place holder for chi min, shifts array
         orders = len(self.wavelength)
@@ -638,14 +304,14 @@ class Spectrum_Data():
             order = q
             order_found = False
             order_mean = self.shifted_wavelength[order].mean()
-                
+
             #loop through each included solar spectrum to find a matching order
             for j in range(len(sun_spectra)):
                 sun = sun_spectra[j]
 
                 #Loop through sun orders to find similar order
                 for i in range(len(sun.wavelength)):
-                    #use average wavelength value in an order to look for 
+                    #use average wavelength value in an order to look for
                     #matching solar order
                     if order_mean < sun.wavelength[i].max() and order_mean > sun.wavelength[i].min():
                         if verbose:
@@ -653,7 +319,7 @@ class Spectrum_Data():
                         order_found = True
                         sun_range = sun.wavelength[i].max() - sun.wavelength[i].min()
                         sun_window = [sun.wavelength[i][0], sun.wavelength[i][-1]]
-                        
+
                         #loop through specified shift values to find best match
                         for k in range(len(shifts)):
                             shift = shifts[k]
@@ -667,7 +333,7 @@ class Spectrum_Data():
                                 sun_window[0] = sun.wavelength[i][np.where(sun.wavelength[i] > order_window[0])][0]
 
                             #|------------|         --> |------------|
-                            #    |------------|     -->     |-------|xxxxx| 
+                            #    |------------|     -->     |-------|xxxxx|
                             if order_window[1] < sun_window[1]:
                                 sun_window[1] = sun.wavelength[i][np.where(sun.wavelength[i] < order_window[1])][-1]
 
@@ -680,7 +346,7 @@ class Spectrum_Data():
                             chi[k] = np.sum(diff)
 
                             #chi[k] = chisquare(result_y, constraint_value)[0]
-                            #chi[k] = chisquare(result_y, sun.normalized_flux[i][compare_window_sun])[0] 
+                            #chi[k] = chisquare(result_y, sun.normalized_flux[i][compare_window_sun])[0]
 
                         if verbose:
                             min_shift = shifts[np.where(chi == chi.min())][0]
@@ -703,7 +369,7 @@ class Spectrum_Data():
                 except:
                     print('order ' + str(order) + ' experienced a problem')
                     print('missing values can be interpolated/extrapolated using clean_shift() method')
-                
+
     def clean_shift(self):
         #remove orders not found
         gd = np.where(self.estimated_shift != -999)
@@ -742,11 +408,11 @@ class Spectrum_Data():
             wave = means[current_index]
             self.estimated_shift[current_index] = make_line(wave, best_fit[0], best_fit[1]) + line[current_index]
             self.wave_shift(current_index, self.estimated_shift[current_index])
-        
+
         #get radial velocity from slope of shifts
         best_fit, C = np.polyfit(means, self.estimated_shift*(-1), 1, cov=True)
         self.rv = (np.round(best_fit[0]*3e5,3), np.round(np.sqrt(np.diag(C))[1], 3))
-        
+
     def load_lines(self, filename):
         self.lines = np.genfromtxt(filename, skip_header = 1, usecols = 0)
         elmnt = np.genfromtxt(filename, skip_header = 1, usecols = 1)
@@ -780,13 +446,13 @@ class Spectrum_Data():
 
     #         self.temp_line_ew = self.lines_ew_simp
     #         self.temp_line_ew_err = self.lines_ew_simp_err
-        
+
     def make_ew_doc(self, name,doc_title='STARNAME, PROJECT, YEAR; '):
         doc = open(name, 'w')
         doc.write(doc_title+'Extended Fe Linelist based on the SWP (2010) paper plus additions from Ivan\n')
         removed_lines = []
         for i in range(len(self.lines)):
-            if self.lines_ew[i] != 0.0: 
+            if self.lines_ew[i] != 0.0:
                 wave = "  "+str(self.lines[i])
                 elmnt = str(self.lines_exd[i][0])
                 if self.lines_exd[i][0] < 10:
@@ -804,7 +470,7 @@ class Spectrum_Data():
                 removed_lines.append(self.lines[i])
         doc.close()
         return np.array(removed_lines)
-        
+
     def measure_ew(self, i, order, plot = False, ex_params = [0,0,0,0], save_plot = False, window_size = 1.5):
         #extra parameters [0] - shift continuum
         #                 [1] - left boundary in Angstroms
@@ -846,7 +512,7 @@ class Spectrum_Data():
         other_than_line = np.where((measure_x_array <= line_bound[0])|(measure_x_array >= line_bound[1]))
         only_line = np.where((measure_x_array >= line_bound[0])|(measure_x_array <= line_bound[1]))
         flat_wing = measure_y_array.copy() + ex_params[0]
-        flat_wing[other_than_line] = norm 
+        flat_wing[other_than_line] = norm
         #highlight points within errors of continuum (or 1.0)
         upper_cont_bounds = measure_y_array+ ex_params[0] + 2*temp_err_array/temp_pred_array
         lower_cont_bounds = measure_y_array+ ex_params[0] - 2*temp_err_array/temp_pred_array
@@ -884,9 +550,9 @@ class Spectrum_Data():
 
                 #simpson's rule integration
                 # line_inpterp = interp1d(measure_x_array, flat_wing, kind='linear', bounds_error = False)
-                # x = np.linspace(flat_wing[0], flat_wing[-1],100) 
+                # x = np.linspace(flat_wing[0], flat_wing[-1],100)
                 # result_y = line_inpterp(x)
-                
+
                 #y =  gauss_model(x,bf[0],bf[1],bf[2],abs(bf[3]))-abs(bf[3])
                 simp_values[j] = simpson((-1)*(samples[j]-1), xtest)*1000 #integrates each sample data
             else:
@@ -909,7 +575,7 @@ class Spectrum_Data():
         self.lines_bf_params[i] = best_bf
         if len(samp_ew[np.where(samp_ew==0)]) == len(samples):
             self.lines_ew[i] = 0
-            self.lines_ew_err[i] = 0 
+            self.lines_ew_err[i] = 0
             self.lines_ew_simp[i] = 0
             self.lines_ew_simp_err[i] = 0
         else:
@@ -918,7 +584,7 @@ class Spectrum_Data():
             self.lines_ew_simp[i] = simp_values[np.where(simp_values!=0)].mean()
             self.lines_ew_simp_err[i] = simp_values[np.where(simp_values!=0)].std()
         print('line to measure:', ELEMENTS[self.lines_exd[i][0]],self.lines[i], '- Line found:', found_line)
-        print('EW:',np.round(self.lines_ew[i],2),u"\u00B1",np.round(self.lines_ew_err[i],2), 'simps-int:', np.round(self.lines_ew_simp[i],2),u"\u00B1", np.round(self.lines_ew_simp_err[i],2))
+        print('EW:',np.round(self.lines_ew[i],2),u"±",np.round(self.lines_ew_err[i],2), 'simps-int:', np.round(self.lines_ew_simp[i],2),u"±", np.round(self.lines_ew_simp_err[i],2))
 
         #Plotting stuff
         if plot:
@@ -940,7 +606,7 @@ class Spectrum_Data():
             fit_view.annotate(str(self.lines[i]), xy = [self.lines[i], norm*1.025])
             fit_view.plot(xtest, fit_gauss, '--', color = '#377eb8', lw= 2)
             fit_view.plot([xtest[0],xtest[-1]],[norm,norm], '--', color = '#4daf4a')
-            
+
             data_view = fig.add_subplot(122)
             data_view.grid()
             data_view.set_xlabel(r'$\rm Wavelength~(\AA)$', size = 14)
@@ -977,7 +643,7 @@ class Spectrum_Data():
             plt.show()
 
             print('#-----------------------#')
-        
+
         #print extra parameter stuff
         if ex_params == [0,0,0,0]:
             pass
@@ -985,7 +651,6 @@ class Spectrum_Data():
             self.lines_exp[i] = np.array(ex_params)
             print('extra params:',ex_params)
 
-#------------------------------------------------------------------------------------#        
     def measure_all_ew(self, exclude_lines= [], plot_lines=[], ex_params = {}, window_size = 1.5, save_all = False):
         if save_all:
             make_plots_folder()
@@ -1007,13 +672,13 @@ class Spectrum_Data():
                     if self.lines[i] in plot_lines:
                         plot = True
                         if self.lines[i] in ex_params.keys():
-                            exp = ex_params[self.lines[i]]   
+                            exp = ex_params[self.lines[i]]
                     if save_all:
                         self.measure_ew(i,order, plot, exp, True, window_size)
                     else:
                         self.measure_ew(i,order, plot, exp, False, window_size)
         #self.lines_bf_params = np.array(self.lines_bf_params)
-        
+
     def measure_line_ew(self,line,ex_params=[0,0,0,0], save_line = False, save_plot = False, window_size = 1.5):
         if save_plot:
             make_plots_folder()
@@ -1037,7 +702,6 @@ class Spectrum_Data():
                                 f.write("{0:10f}\t{1:10f}\n".format(self.shifted_wavelength[order][k],self.normalized_flux[order][k]))
                             print('order', order, 'saved!')
 
-                    
     def check_for_flags(self):
         for i in range(len(self.lines)):
             self.lines_check_flag[i] = False
@@ -1056,12 +720,7 @@ class Spectrum_Data():
             elif self.lines_gauss_Xsquare[i] > self.X_thresh:
                 self.lines_check_flag[i] = True
                 print(self.lines[i], 'might have a bad fit', self.lines_gauss_Xsquare[i])
-                
-                
-    
-#------------------------------------------------------------------------------------#    
-    
-    
+
     def wat_info(self, hdul):
         '''Gather starting wavelengths and spacing for each order
 
@@ -1154,8 +813,8 @@ class Spectrum_Data():
                         start_wave_key = 'CRVL1_'+str(i+1)
                         spacing_wave_key = 'CDLT1_'+str(i+1)
 
-                    #fill wavelength array            
-                    wavelength[i][0] = header[start_wave_key] 
+                    #fill wavelength array
+                    wavelength[i][0] = header[start_wave_key]
                     for j in range(num_points-1):
                         j += 1
                         wavelength[i][j] = wavelength[i][j-1] + header[spacing_wave_key]
@@ -1177,10 +836,10 @@ class Spectrum_Data():
             flux = hdul[0].data
 
         return wavelength, flux
-    
+
     def check_spectra(self, norm=True, lines=False):
         orders = len(self.wavelength)
-        
+
         if norm:
             for i in range(orders):
                 plt.plot(self.shifted_wavelength[i],self.normalized_flux[i], linewidth = 0.5)
@@ -1237,88 +896,3 @@ class Spectrum_Data():
                 self.gain = np.ones(num_orders)*2.09
             if low_high == 'high':
                 self.gain = np.ones(num_orders)*0.89
-                
-class Continuum_scan():
-    '''Selects points at the continuum
-    '''
-    def __init__(self, distx, depth):
-        #values currently viewed for selection
-        self.select_window = None
-        #standard deviation of selected window
-        #self.current_sig = None
-        #Size of selection box in x axis
-        self.distx = distx
-        self.points_in_window = None
-        #Input spectra
-        self.data = None
-        #Points selected as part of the continuum
-        self.select_points = None
-        #Relates to how deeply to move selection box into data
-        self.depth = depth
-        return None
-        
-    def load_data(self,x,y):
-        self.data = np.array([x,y])
-        self.select_points = np.zeros(len(x))
-        self.points_in_window = len(self.data[0][np.where(self.data[0] <= self.data[0][0]+self.distx)])
-        return None
-    
-    def scan(self):
-        split_order_into = int(np.ceil(len(self.data[0])/self.points_in_window))
-        split_order_x = np.array_split(self.data[0], split_order_into)
-        split_order_y = np.array_split(self.data[1], split_order_into)
-        for i in range(len(split_order_y)):
-            dex = np.where((self.data[0] >= split_order_x[i][0])&(self.data[0] <= split_order_x[i][-1]))
-            percent = np.percentile(split_order_y[i], self.depth)
-            self.select_points[dex] = (split_order_y[i] >= percent)
-        return None
-
-
-
-        # left_lim = self.data[0][0]
-        # while left_lim < self.data[0][-1]:
-        #     right_lim = left_lim + self.distx
-        #     self.select_window = np.where((self.data[0]>=left_lim)&(self.data[0]<=right_lim))
-        #     #self.current_sig = np.sqrt(self.data[1][self.select_window]).mean()
-        #     #self.current_sig = self.data[1][self.select_window].std()
-        #     self.above_sigma()
-        #     left_lim = right_lim
-        #     #self.view_window()
-        # return None
-            
-#     def view_window(self):
-#         percent = np.percentile(self.data[1][self.select_window], self.depth)
-#         fig = plt.figure()
-#         ax = fig.add_subplot(121)
-#         ax.scatter(self.data[0][self.select_window], self.data[1][self.select_window], c = '#cccccc', alpha = 0.75)
-#         bool_points = (self.select_points == 1)
-#         ax.scatter(self.data[0][bool_points],self.data[1][bool_points], c = 'g')
-#         ax.plot([self.data[0][self.select_window][0], self.data[0][self.select_window][-1]],
-#                 [self.data[1][self.select_window].max(),self.data[1][self.select_window].max()], 'k--')
-# #         ax.plot([self.data[0][self.select_window][0], self.data[0][self.select_window][-1]],
-# #                 [self.data[1][self.select_window].max() - self.depth*self.current_sig,
-# #                  self.data[1][self.select_window].max() - self.depth*self.current_sig],'g--')
-#         ax.set_xlim([self.data[0][self.select_window][0], self.data[0][self.select_window][-1]])
-#         plt.axhline(percent, color='k', linestyle='dashed', linewidth=1)
-#         hist = fig.add_subplot(122)
-#         hist.hist(self.data[1][self.select_window])
-#         plt.axvline(percent, color='k', linestyle='dashed', linewidth=1)
-#         plt.show()
-#         return None
-        
-    def view_selected(self):
-        fig = plt.figure(figsize=(15,5))
-        ax = fig.add_subplot(111)
-        ax.scatter(self.data[0], self.data[1], c = '#cccccc', alpha = 0.75, s = 5)
-        bool_points = (self.select_points == 1)
-        ax.scatter(self.data[0][bool_points],self.data[1][bool_points], c = 'g', s = 5)
-        plt.show()
-        return None
-        
-    def get_selected(self):
-        bool_points = (self.select_points == 1)
-        return bool_points
-#-------------------------------------------------------------DICTIONARY--------------------------------------------------------------#
-ELEMENTS = {1:'H I',2:'He I',3:'Li I',4:'Be I',5:'B I',6:'C I',7:'N I',8:'O I',9:'F I',10:'Ne I',11:'Na I',12:'Mg I',13:'Al I',
-14:'Si I',15:'P I',16:'S I',17:'Cl I',18:'Ar I',19:'K I',20:'Ca I',21:'Sc I',21.1:'Sc II',22:'Ti I',22.1:'Ti II',23:'V I',24:'Cr I',
-25:'Mn I',26:'Fe I',26.1:'Fe II',27:'Co I',28:'Ni I',29:'Cu I',30:'Zn I', 56.1:'Ba II', 39.1:'Y II'}
