@@ -1,0 +1,21 @@
+"""
+XSpect-EW: user-guided equivalent-width measurement for stellar absorption
+spectra. Originally developed by George Vejar (github.com/forgeousgeorge/XSpect),
+incorporated into SPAE 2026-09-14.
+
+Loads a spectrum (KECK/MAKEE-format FITS, or raw wavelength/flux arrays),
+fits the continuum per echelle order via Gaussian Process regression,
+optionally cross-correlates against a reference spectrum to solve for
+wavelength shift/RV, measures each line's equivalent width, and writes a
+MOOG-format linelist-with-EW file directly usable by SPAE.moog.abfind.
+"""
+
+from .xspect_ew import (
+    Spectrum_Data,
+    Continuum_scan,
+    ELEMENTS,
+    plot_line_info,
+    plot_comparison_res,
+    combine_files,
+    load_object,
+)

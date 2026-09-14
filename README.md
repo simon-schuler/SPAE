@@ -25,12 +25,31 @@ pip install ./
 |---------|---------|---------|
 | `numpy` | Array math throughout | `pip install numpy` |
 | `numba` | JIT-compiled physics kernels (`voigt`, `expn2`) in `SPAE/moog` | `pip install numba` |
+| `scipy` | Interpolation, optimization, integration (`SPAE/atmos.py`, `SPAE/xspect_ew`) | `pip install scipy` |
+| `astropy` | FITS I/O (`SPAE/xspect_ew`, model/linelist parsing) | `pip install astropy` |
+| `george` | Gaussian Process continuum fitting in `SPAE/xspect_ew` | `pip install george` |
 | `matplotlib` | Plotting and interactive widget | `pip install matplotlib` |
 | `emcee` | Bayesian MCMC parameter estimation | `pip install emcee` |
 | `tqdm` | Per-step progress bar during `run_spae()` MCMC runs | `pip install tqdm` |
 | `ipympl` | Interactive `%matplotlib widget` support in Jupyter | `pip install ipympl` |
 
 All dependencies except `ipympl` and `tqdm` are required for core SPAE functionality. `ipympl` is only needed when using the interactive synthesis widget inside a Jupyter notebook; `tqdm` is optional but strongly recommended — without it, `run_spae()` runs silently with no progress feedback until completion.
+
+## XSpect-EW (equivalent-width measurement)
+
+`SPAE.xspect_ew` measures equivalent widths from Keck/HIRES spectra and writes a MOOG-format linelist-with-EW file directly usable by `SPAE.moog.abfind`. Originally developed by George Vejar ([github.com/forgeousgeorge/XSpect](https://github.com/forgeousgeorge/XSpect)), incorporated into SPAE 2026-09-14.
+
+```python
+from SPAE.xspect_ew import Spectrum_Data
+
+spec = Spectrum_Data('star_blue.fits', KECK_file=True)   # or KECK_file=False with spectx/specty arrays
+spec.load_lines('linelist.txt')                           # MOOG-format: wave, species, EP, loggf, damping
+spec.normalize(order)                                      # per-order GP continuum fit
+spec.measure_line_ew(4779.439)                              # or measure_all_ew() / measure_ew()
+spec.make_ew_doc('linelist_with_ew.txt')                   # MOOG-format output
+```
+
+Sample data (`SPAE/xspect_ew/data/`) — a solar HIRES spectrum and Fe linelist — is included for testing.
 
 Minimum Python version: **3.6**
 
