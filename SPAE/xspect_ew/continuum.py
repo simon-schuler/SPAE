@@ -64,21 +64,47 @@ GRACES's real edges. No single global value serves both well.
 
 fit_als_continuum() therefore stiffens the penalty ADAPTIVELY, per
 point, based on a measurement that's independent of the fit itself (so
-it can't inherit a bias from a fit that's already wrong): compare each
-point's local peak (max flux in a narrow window, `local_window`
-Angstroms) against a wider window's peak (`wide_window` Angstroms). In
-a normal region, isolated lines still leave points nearby where the
-local peak nearly reaches the wider peak. In a densely blended stretch
-(or, just as well, inside one broad/strong line -- the same criterion
-naturally covers the original broad-line stress case too), the local
-peak stays well below the wider peak over an EXTENDED stretch, and that
-shortfall is what triggers extra stiffness there. A real large-scale
-slope (GRACES) doesn't trigger this: `wide_window` is much narrower
-than the slope's own scale, so the local and wide peaks stay close
-together even while both decline together across the order. This is
-computed ONCE up front from the raw data (two cheap 1-D filter passes),
-not re-derived every reweighting iteration, so it adds negligible
-runtime.
+it can't inherit a bias from a fit that's already wrong). Two DIFFERENT
+things can make a stretch untrustworthy for the base (lam, p) to handle
+well, and one metric can't catch both without breaking on a real slope
+-- so there are two signals, combined via max():
+
+1. A genuinely BROAD/deep trough (one strong or wide line, a saturated
+telluric band): compare each point's local peak (max flux in
+`local_window` Angstroms) against a wider window's peak (`wide_window`
+Angstroms). In a normal region, isolated lines still leave points
+nearby where the local peak nearly reaches the wider peak; across a
+broad trough, the local peak stays well below the wider peak over an
+EXTENDED stretch. A real large-scale slope (GRACES) doesn't trigger
+this: `wide_window` is much narrower than the slope's own scale, so
+local and wide PEAKS stay close together even while both decline
+together across the order (both are governed by the same nearby-noise
+maximum, largely independent of the slope's own rate).
+
+2. WIDESPREAD but individually modest weak/blended lines -- confirmed a
+real, common case this session, and invisible to signal 1: a single
+bright pixel anywhere in `local_window` satisfies "local peak reaches
+wide peak" even when 95-99% of the surrounding points sit measurably
+below it. Detected instead by comparing the local MEDIAN to the local
+MAX (same narrow window, not local-vs-wide) of flux first divided by a
+wide-window MEDIAN trend -- the division removes a real large-scale
+slope's own contribution (which would otherwise make local median vs.
+local max differ across just `local_window` purely from the slope's own
+rate, a second, smaller version of the same false-positive signal 1
+was designed to avoid), while a genuine weak-line forest's dips survive
+the division untouched, since they're far narrower than `wide_window`.
+Confirmed on real MAROON-X data: two different orders' "clean" regions
+(one flagged by the user, one this module's own earlier verification
+had called fine) both showed the ORIGINAL (signal-1-only) severity
+staying at exactly 0 throughout that stretch, silently leaving it
+uncorrected.
+
+Both shortfalls are computed ONCE up front from the raw data (a few
+cheap 1-D filter passes), not re-derived every reweighting iteration,
+so this adds negligible runtime. Signal 2 uses its own, much smaller
+threshold/scale (`severity_threshold`/`severity_scale`) than signal 1's
+fixed 0.08/0.92 -- a widespread-but-moderate forest saturates nowhere
+near the 0.3-1.0 shortfall a genuinely broad trough does.
 
 A second, more subtle bias remained even with adaptive stiffening: the
 weight update used a HARD step at the current fit -- any point below it
@@ -170,14 +196,14 @@ level does."""
 import numpy as np
 from scipy import sparse
 from scipy.sparse.linalg import spsolve
-from scipy.ndimage import maximum_filter1d, uniform_filter1d
+from scipy.ndimage import maximum_filter1d, median_filter, uniform_filter1d
 from scipy.stats import norm
 
 
-def fit_als_continuum(wave, flux, err, lam=2e4, p=0.01, n_iter=15, adaptive=True,
+def fit_als_continuum(wave, flux, err, lam=2e3, p=0.01, n_iter=15, adaptive=True,
                        stiffen_factor=15.0, local_window=3.0, wide_window=25.0,
-                       severity_threshold=0.08, low_reject_sigma=2.5, p_reduction_factor=30.0,
-                       target_percentile=80.0):
+                       severity_threshold=0.02, severity_scale=0.06, low_reject_sigma=2.5,
+                       p_reduction_factor=30.0, target_percentile=80.0):
     """
     Fit the continuum as the (noise-aware) upper envelope of flux via
     Asymmetric Least Squares (AsLS) smoothing: iteratively solve the
@@ -211,7 +237,27 @@ def fit_als_continuum(wave, flux, err, lam=2e4, p=0.01, n_iter=15, adaptive=True
         throughout this module's history, now WITH adaptive stiffening
         doing the work of resisting broad/blended regions -- lam itself
         can be smaller than it needed to be without adaptive stiffening,
-        since it's no longer solely responsible for that.
+        since it's no longer solely responsible for that. Recalibrated
+        this session (2e4 -> 2e3): the OLD value was left over from
+        before adaptive stiffening existed and was never revisited once
+        the adaptive mechanism took over that job, leaving the base
+        penalty needlessly rigid everywhere else. Confirmed on a real
+        Keck order (5760-5800 A, a red-order-edge transition with no
+        genuinely broad/deep feature, so adaptive stiffening correctly
+        never engages there): even the ACHIEVABLE local envelope
+        (between real lines) undershot true continuum by 3-4%, because
+        `lam=2e4` was too rigid to bend down fast enough as line
+        crowding gradually thickened -- confirmed NOT fixable by adding
+        more adaptive stiffening (forcing severity=1 there made it
+        dramatically WORSE, down to 50-65%, since over-rigidifying an
+        already-too-stiff base penalty just resists tracking real local
+        structure even harder). Scanning lam over the same synthetic
+        ground-truth test used throughout this module's history found
+        2e3 recovers that envelope (~1.00) while still improving (not
+        regressing) both the flat and sloped synthetic tests' own error
+        metrics -- the old value wasn't apparently just cautious, it
+        was too rigid full stop, verified independent of the Keck case
+        that motivated re-examining it.
     p : BASE weight floor for points far below the current fit (as a
         fraction of full trust), 0 < p < 0.5, used everywhere adaptive
         stiffening isn't triggered -- see module docstring for why this
@@ -222,14 +268,21 @@ def fit_als_continuum(wave, flux, err, lam=2e4, p=0.01, n_iter=15, adaptive=True
         docstring) and use `lam * multiplier` instead of a flat `lam`
         (and shrink `p` by up to `p_reduction_factor` in the same
         regions -- see module docstring for why both are needed).
-    stiffen_factor : maximum multiple of `lam` applied where local peaks
-        fall furthest short of the wider window's peak.
-    local_window, wide_window : Angstrom widths of the two peak-finding
-        windows (see module docstring for what each is for).
-    severity_threshold : fractional local-vs-wide peak shortfall below
-        which a point is treated as normal (no stiffening) -- guards
-        against stiffening every ordinary line-to-line gap, not just
-        genuinely extended blended/broad stretches.
+    stiffen_factor : maximum multiple of `lam` applied where either
+        severity signal (see module docstring) reaches 1.
+    local_window, wide_window : Angstrom widths of the two windows used
+        by BOTH severity signals (see module docstring for what each is
+        for).
+    severity_threshold, severity_scale : threshold and (linear) span,
+        in units of the SIGNAL-2 (widespread weak-line forest) shortfall
+        (see module docstring), below/over which severity ramps from 0
+        to 1. Signal 1 (broad troughs) uses its own fixed 0.08/0.92,
+        unchanged from this module's original calibration -- it doesn't
+        need retuning since a genuinely broad/deep trough's shortfall
+        saturates close to 1 regardless. Signal 2's shortfall saturates
+        far short of 1 for even an obviously-real widespread forest
+        (0.03-0.08 is typical, not 0.3-1.0), so it needs its own, much
+        smaller default scale to respond to it at all.
     low_reject_sigma : noise-width (in units of `err`) over which trust
         decays for points below the current fit -- points within
         roughly this many sigma of the fit are trusted close to fully
@@ -250,7 +303,12 @@ def fit_als_continuum(wave, flux, err, lam=2e4, p=0.01, n_iter=15, adaptive=True
         artificially small inside an absorption line where flux itself
         is depressed) -- see module docstring for why the base iteration
         settles near the noise MEAN and needs this correction on top.
-        50 reproduces the old (uncorrected) mean-tracking behavior.
+        50 reproduces the old (uncorrected) mean-tracking behavior. The
+        noise scale itself is further calibrated against the fit's own
+        above-fit residuals before use (see the code just before the
+        `return`) -- real extracted spectra don't always match `err`'s
+        theoretical Poisson scaling (confirmed on MAROON-X), and this
+        keeps the offset's actual SIZE correct even when they don't.
 
     Returns
     -------
@@ -260,6 +318,14 @@ def fit_als_continuum(wave, flux, err, lam=2e4, p=0.01, n_iter=15, adaptive=True
         per-point predictive variance; nothing downstream currently
         consumes more than that)
     """
+    # median_filter (unlike maximum_filter1d/uniform_filter1d) rejects
+    # non-native-byte-order input, which raw Keck/MAKEE FITS data is
+    # (big-endian float32) -- normalize dtype once up front rather than
+    # requiring every caller to know that.
+    wave = np.asarray(wave, dtype=np.float64)
+    flux = np.asarray(flux, dtype=np.float64)
+    err = np.asarray(err, dtype=np.float64)
+
     L = len(flux)
     d2 = sparse.diags([1.0, -2.0, 1.0], [0, 1, 2], shape=(L - 2, L))
     base_weight = 1.0 / err**2
@@ -298,10 +364,34 @@ def fit_als_continuum(wave, flux, err, lam=2e4, p=0.01, n_iter=15, adaptive=True
         dx = (wave[-1] - wave[0]) / (L - 1)
         local_pts = max(int(round(local_window / dx)), 1)
         wide_pts = max(int(round(wide_window / dx)), local_pts + 1)
+
+        # Signal 1: a genuinely BROAD/deep trough (one strong/wide line,
+        # a saturated telluric band) -- local peak vs a WIDER window's
+        # peak. Unchanged from the original design; deliberately still
+        # max-vs-max (see module docstring for why median-vs-max here
+        # would falsely fire on an ordinary large-scale slope).
         local_max = maximum_filter1d(flux, size=local_pts, mode='nearest')
         wide_max = maximum_filter1d(flux, size=wide_pts, mode='nearest')
-        shortfall = uniform_filter1d(1.0 - local_max / wide_max, size=local_pts, mode='nearest')
-        severity = np.clip((shortfall - severity_threshold) / (1.0 - severity_threshold), 0.0, 1.0)
+        shortfall_broad = uniform_filter1d(1.0 - local_max / wide_max, size=local_pts, mode='nearest')
+        severity_broad = np.clip((shortfall_broad - 0.08) / 0.92, 0.0, 1.0)
+
+        # Signal 2: WIDESPREAD but individually modest weak/blended lines
+        # -- real, common, and invisible to signal 1 (see module
+        # docstring). Detrend by a wide-window median first (tracks a
+        # real large-scale slope without a real line's much narrower
+        # dip), then compare the local median to the local max of that
+        # detrended ratio -- both computed over the SAME narrow window,
+        # so a genuine slope's own variation across just that window
+        # can't masquerade as blending the way a raw local-vs-wide
+        # comparison would.
+        wide_trend = median_filter(flux, size=wide_pts, mode='nearest')
+        detrended = flux / wide_trend
+        local_max_dt = maximum_filter1d(detrended, size=local_pts, mode='nearest')
+        local_med_dt = median_filter(detrended, size=local_pts, mode='nearest')
+        shortfall_density = uniform_filter1d(1.0 - local_med_dt / local_max_dt, size=local_pts, mode='nearest')
+        severity_density = np.clip((shortfall_density - severity_threshold) / severity_scale, 0.0, 1.0)
+
+        severity = np.maximum(severity_broad, severity_density)
         mult = 1.0 + (stiffen_factor - 1.0) * severity
         lam_vec = lam * mult[1:-1]  # align to d2's L-2 interior rows
         p_vec = p / (1.0 + (p_reduction_factor - 1.0) * severity)
@@ -317,13 +407,45 @@ def fit_als_continuum(wave, flux, err, lam=2e4, p=0.01, n_iter=15, adaptive=True
         w = np.where(z >= 0, base_weight * (1.0 - p_vec),
                      base_weight * (p_vec + (1.0 - 2.0 * p_vec) * below_decay))
 
+    resid = flux - pred
+
     if target_percentile != 50.0:
         sigma_offset = norm.ppf(target_percentile / 100.0)
         flux_floor = np.maximum(flux, 1e-3 * np.median(flux[flux > 0]) if np.any(flux > 0) else 1.0)
         continuum_scale = np.clip(pred / flux_floor, 0.0, 100.0)
         err_at_continuum = err * np.sqrt(continuum_scale)
-        pred = pred + sigma_offset * err_at_continuum
 
-    resid = flux - pred
+        # `err` is a THEORETICAL noise scale (Poisson-style sqrt
+        # scaling); real extracted spectra don't always match it. An
+        # "optimal extraction" algorithm (MAROON-X) combines several raw
+        # CCD pixels per output point via inverse-variance-weighted PSF
+        # fitting, correlating adjacent output points and leaving LESS
+        # actual point-to-point scatter than sqrt(counts) alone would
+        # predict -- confirmed directly: real MAROON-X data's observed
+        # scatter in genuinely flat stretches was only 30-40% of what
+        # err implied, while Keck's matched almost exactly. Trusting
+        # err's absolute scale blindly overshot MAROON-X's continuum by
+        # several percent (a real, user-caught, spectrum-wide bug), even
+        # though the SAME formula was correct for Keck. Rather than a
+        # per-instrument fudge factor, calibrate against the fit's OWN
+        # above-fit residuals (least likely to be real absorption, by
+        # construction, so their spread is a genuine empirical noise
+        # estimate) each time: compare the median of positive residuals
+        # to what a Gaussian with err's sigma would predict for that same
+        # statistic (median of a positive half-normal = 0.6745*sigma),
+        # and rescale err_at_continuum by that ratio before applying the
+        # offset. A no-op when err already matches reality (Keck/GRACES);
+        # self-corrects when it doesn't, without needing to know why.
+        above = resid > 0
+        calib = 1.0
+        if above.sum() > 10:
+            empirical = np.median(resid[above])
+            theoretical = np.median(err_at_continuum[above]) * 0.6744897501960817
+            if theoretical > 0:
+                calib = np.clip(empirical / theoretical, 0.05, 3.0)
+
+        pred = pred + sigma_offset * calib * err_at_continuum
+        resid = flux - pred
+
     pred_var = np.full_like(wave, np.var(resid))
     return pred, pred_var

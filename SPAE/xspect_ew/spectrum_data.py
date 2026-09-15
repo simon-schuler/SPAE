@@ -178,7 +178,7 @@ class Spectrum_Data():
                                            min_response_fraction=min_response_fraction,
                                            response_bands=response_bands, science_bands=science_bands)
 
-    def normalize_all(self, lam = 2e4, p = 0.01, n_iter = 15, adaptive = True, **als_kwargs):
+    def normalize_all(self, lam = 2e3, p = 0.01, n_iter = 15, adaptive = True, **als_kwargs):
         #loop through orders
         for i in range(len(self.flux)):
 
@@ -195,7 +195,7 @@ class Spectrum_Data():
 
         return None
 
-    def normalize(self, order, clip = [-999,-999], lam = 2e4, p = 0.01, n_iter = 15,
+    def normalize(self, order, clip = [-999,-999], lam = 2e3, p = 0.01, n_iter = 15,
                   adaptive = True, **als_kwargs):
         """
         Fit and divide out the continuum for one order via Asymmetric
