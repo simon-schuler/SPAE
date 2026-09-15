@@ -919,10 +919,19 @@ class Spectrum_Data():
             fit_view.plot([line_bound[0],line_bound[0]],[norm*1.025,norm*0.95], '--', color = '#e41a1c', alpha = 0.5)
             fit_view.plot([line_bound[1],line_bound[1]],[norm*1.025,norm*0.95], '--', color = '#e41a1c', alpha = 0.5)
             fit_view.annotate(str(self.lines[i]), xy = [self.lines[i], norm*1.025])
-            fit_view.plot(xtest, fit_gauss, '--', color = '#377eb8', lw= 2, label = 'Gaussian fit')
+            #plot the fit/band/local-continuum curves on a 5x denser
+            #wavelength grid than the actual data -- xtest only has one
+            #point per real pixel, which makes a narrow line's Gaussian
+            #fit curve look faceted/low-resolution; this is purely
+            #cosmetic (fitting, chi-square and the Simpson cross-check
+            #above all still use the real data grid, unchanged)
+            xplot = np.linspace(xtest[0], xtest[-1], len(xtest)*5)
+            cont_offset_plot = norm - (c0 + c1*(xplot-found_line))
+            fit_gauss_plot = norm - (gauss_model(xplot, *best_bf) + cont_offset_plot)
+            fit_view.plot(xplot, fit_gauss_plot, '--', color = '#377eb8', lw= 2, label = 'Gaussian fit')
             if pcov is not None:
-                model_err = gauss_model_err(xtest, best_bf, pcov)
-                fit_view.fill_between(xtest, fit_gauss-model_err, fit_gauss+model_err,
+                model_err_plot = gauss_model_err(xplot, best_bf, pcov)
+                fit_view.fill_between(xplot, fit_gauss_plot-model_err_plot, fit_gauss_plot+model_err_plot,
                          color = '#377eb8', alpha = 0.25, zorder = 1, label = r'fit $\pm1\sigma$')
             fit_view.plot([xtest[0],xtest[-1]],[norm,norm], '--', color = '#4daf4a', label = 'assumed continuum (norm)')
             if fit_continuum:
@@ -930,8 +939,8 @@ class Spectrum_Data():
                 #see directly how far the global normalization was off
                 #here -- this is what fixes a fit biased by imperfect
                 #normalization
-                local_cont = norm - cont_offset
-                fit_view.plot(xtest, local_cont, ':', color = '#ff7f00', lw = 2, label = 'estimated local continuum')
+                local_cont_plot = norm - cont_offset_plot
+                fit_view.plot(xplot, local_cont_plot, ':', color = '#ff7f00', lw = 2, label = 'estimated local continuum')
             fit_view.legend(loc='best', fontsize=8)
 
             data_view = fig.add_subplot(122)
