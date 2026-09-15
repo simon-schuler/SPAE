@@ -82,7 +82,18 @@ class Spectrum_Data():
             self.continuum[i] = false_array
             self.pred_all[i] = np.full(len(self.wavelength[i]), 0)
             self.pred_var_all[i] = np.full(len(self.wavelength[i]), 0)
-            self.obs_err[i] = np.sqrt(self.flux[i])
+            #abs() guards against the occasional slightly-negative pixel
+            #from background/bias subtraction (confirmed on the bundled
+            #suni.fits sample: 4/4021 pixels in one order, ~-20 counts
+            #against a ~150000 count median -- ordinary noise, not a real
+            #data problem) -- sqrt() of a small negative value is NaN,
+            #which silently breaks the downstream weighted continuum fit
+            #(a singular-matrix crash, not a graceful failure). The
+            #np.maximum(..., 1.0) floor guards the same fit against an
+            #exact-zero-count (dead/masked) pixel instead making its
+            #weight (1/err) infinite -- also confirmed on suni.fits: 146
+            #pixels, non-contiguous, near one order's far edge.
+            self.obs_err[i] = np.maximum(np.sqrt(np.abs(self.flux[i])), 1.0)
         #print('empty continuum arrays created', self.continuum)
         #Old way of setting these variables (change back if above code causes problems)
         # self.continuum = np.full((len(self.wavelength),len(self.wavelength[0])), False)
