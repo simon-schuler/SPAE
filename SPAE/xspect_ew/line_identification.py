@@ -59,7 +59,7 @@ from scipy.signal import find_peaks
 
 
 def identify_line(rest_wave, wave, flux, err, pred, search_radius=0.15,
-                   min_significance=3.0, position_tolerance=0.07,
+                   min_significance=3.0, min_prominence=None, position_tolerance=0.07,
                    smooth_points=3, blend_significance_fraction=0.5):
     """
     Locate one line's real center in one order, or report it as not
@@ -88,6 +88,24 @@ def identify_line(rest_wave, wave, flux, err, pred, search_radius=0.15,
         decent-S/N spectrum clear this by a wide margin (see
         DEVELOPMENT_LOG.md for real-data significance values found
         during validation).
+    min_prominence : minimum topographic prominence (scipy.signal
+        convention: height above the higher of the two valleys
+        flanking a peak) the winning candidate must have, in the same
+        sigma units as min_significance. Defaults to min_significance
+        itself if not given -- a real, isolated detection should stand
+        out from ITS OWN local surroundings by roughly as much as its
+        absolute height, not just clear a fixed floor. Without this,
+        a point sitting on the monotonic wing of a much deeper,
+        DIFFERENT nearby line -- especially right at the search
+        window's own edge, where the true, much taller feature is cut
+        off and never seen -- can register as a "peak" purely because
+        it is (very marginally) higher than its immediate neighbor,
+        with near-zero real prominence. Confirmed on real MAROON-X
+        data (user-caught): a candidate at 3.03 sigma, 0.023 A from the
+        window edge, had prominence 0.02 -- essentially the second-to-
+        last point of a smoothly rising slope into a real, much
+        stronger line just outside the window, not a genuine local
+        feature at all.
     position_tolerance : Angstrom scale over which a candidate's score
         is discounted with distance from rest_wave (see module
         docstring -- NOT a hard cutoff, a soft preference).
@@ -107,9 +125,13 @@ def identify_line(rest_wave, wave, flux, err, pred, search_radius=0.15,
         significance : float, the winning candidate's sigma-below-
             continuum (0 if not detected)
         blended : bool -- a competitive second candidate exists nearby
-        n_candidates : int -- number of candidates clearing
-            min_significance in the search window (0 if none)
+        n_candidates : int -- number of candidates clearing both
+            min_significance and min_prominence in the search window
+            (0 if none)
     """
+    if min_prominence is None:
+        min_prominence = min_significance
+
     mask = (wave >= rest_wave - search_radius) & (wave <= rest_wave + search_radius)
     if mask.sum() < max(smooth_points, 3):
         return {'detected': False, 'center': np.nan, 'significance': 0.0,
@@ -121,7 +143,7 @@ def identify_line(rest_wave, wave, flux, err, pred, search_radius=0.15,
     local_err = np.where(local_err > 0, local_err, np.inf)
     significance = uniform_filter1d(depth / local_err, size=smooth_points, mode='nearest')
 
-    peak_idx, _ = find_peaks(significance, height=min_significance)
+    peak_idx, _ = find_peaks(significance, height=min_significance, prominence=min_prominence)
     if len(peak_idx) == 0:
         return {'detected': False, 'center': np.nan, 'significance': 0.0,
                 'blended': False, 'n_candidates': 0}
@@ -141,7 +163,47 @@ def identify_line(rest_wave, wave, flux, err, pred, search_radius=0.15,
             'blended': blended, 'n_candidates': int(len(peak_idx))}
 
 
-def identify_lines_in_spectrum(lines, wavelength, flux, err, pred, **kwargs):
+def _empirical_noise_calibration(flux, pred, err):
+    """
+    Rescale one order's err to match its ACTUAL above-fit residual
+    spread, rather than trusting err's theoretical (Poisson-style)
+    scale blindly -- the same fix as continuum.py's fit_als_continuum()
+    (target_percentile's noise calibration), independently re-derived
+    here because it matters for line DETECTION too, not just continuum
+    placement. Confirmed on real MAROON-X data: without this, real
+    lines' computed significance is deflated by the same ~0.25-0.4
+    factor found there ("optimal extraction" pipelines that combine
+    multiple raw CCD pixels per output point correlate adjacent points,
+    giving less real point-to-point scatter than err's Poisson-style
+    scaling predicts), pushing many real lines below the detection
+    threshold that would otherwise clear it easily -- confirmed
+    directly: this alone took one real MAROON-X order set's detection
+    count from 13/78 to 27/78 lines, with the calibration factor
+    (median ~0.34) matching the continuum-fitting context's
+    independently-derived value almost exactly. A no-op on Keck/GRACES
+    (confirmed: full detection preserved, calibration factor near 1).
+
+    `flux` here is NORMALIZED flux (~1.0 baseline), this module's
+    convention throughout -- NOT raw flux the way continuum.py's
+    fit_als_continuum() uses it (resid = flux - pred there). The
+    equivalent raw-scale residual from normalized flux is
+    pred*(flux-1.0), since normalized_flux = raw_flux/pred by
+    definition; `err` is still expected in raw/absolute units
+    (Spectrum_Data.obs_err), matching `pred`'s scale, since that's what
+    identify_line() itself expects (it divides by pred internally).
+    """
+    resid = pred * (flux - 1.0)
+    above = resid > 0
+    if above.sum() < 10:
+        return 1.0
+    empirical = np.median(resid[above])
+    theoretical = np.median(err[above]) * 0.6744897501960817  # median of a positive half-normal
+    if theoretical <= 0:
+        return 1.0
+    return float(np.clip(empirical / theoretical, 0.05, 3.0))
+
+
+def identify_lines_in_spectrum(lines, wavelength, flux, err, pred, calibrate_noise=True, **kwargs):
     """
     Run identify_line() for every rest wavelength in `lines`, against
     every order whose wavelength range could contain it -- i.e. every
@@ -160,6 +222,9 @@ def identify_lines_in_spectrum(lines, wavelength, flux, err, pred, **kwargs):
     wavelength, flux, err, pred : lists of per-order arrays (e.g.
         Spectrum_Data's shifted_wavelength, normalized_flux, obs_err,
         pred_all).
+    calibrate_noise : if True (default), rescale each order's err by
+        _empirical_noise_calibration() before computing significance --
+        see there for why. Set False to use err exactly as given.
     **kwargs : passed through to identify_line() (search_radius,
         min_significance, etc.)
 
@@ -171,6 +236,9 @@ def identify_lines_in_spectrum(lines, wavelength, flux, err, pred, **kwargs):
     order).
     """
     search_radius = kwargs.get('search_radius', 0.15)
+    if calibrate_noise:
+        err = [err[o] * _empirical_noise_calibration(flux[o], pred[o], err[o])
+               for o in range(len(wavelength))]
     results = []
     for rest_wave in lines:
         best_result = {'detected': False, 'center': np.nan, 'significance': 0.0,

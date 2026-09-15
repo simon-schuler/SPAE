@@ -167,8 +167,22 @@ def measure_effective_rv(spectrum, lines=None, min_depth=0.02, sigma_clip=3.0, m
     return _measure_rv_over_lines(spectrum, RV_REFERENCE_LINES, min_depth, sigma_clip)
 
 
+def _rv_from_detections(lines, wavelength, flux, err, pred, radius, min_significance):
+    """One identify-and-convert-to-velocity pass -- shared by both
+    stages of measure_rv_from_linelist() below."""
+    results = identify_lines_in_spectrum(lines, wavelength, flux, err, pred,
+                                          search_radius=radius,
+                                          min_significance=min_significance)
+    velocities = []
+    for rest_wavelength, r in zip(lines, results):
+        if r['detected']:
+            velocities.append(C_KMS * (r['center'] - rest_wavelength) / rest_wavelength)
+    return np.array(velocities)
+
+
 def measure_rv_from_linelist(lines, wavelength, flux, err, pred, search_radius=1.0,
-                              min_significance=3.0, sigma_clip=3.0, min_lines=3):
+                              refine_radius=0.15, min_significance=3.0, sigma_clip=3.0,
+                              min_lines=3):
     """
     Measure one effective RV (km/s) from a full science linelist, as a
     generalization of measure_effective_rv() that isn't tied to a small
@@ -183,11 +197,33 @@ def measure_rv_from_linelist(lines, wavelength, flux, err, pred, search_radius=1
     Reuses line_identification.identify_lines_in_spectrum() -- the same
     detection-based centering used for EW-measurement line identification
     itself, rather than introducing a third line-centering method into
-    the package. `search_radius` is deliberately much wider than
-    identify_lines()'s own EW-identification default (0.15 A): this runs
-    BEFORE any wavelength correction, so the true center can be offset by
-    however large the spectrum's real, uncorrected RV is, not just by
-    residual noise around an already-good solution.
+    the package.
+
+    Runs in TWO passes, the way a standard coarse-then-fine cross-
+    correlation RV search does, rather than one single wide search:
+    1. COARSE: `search_radius` (default 1.0 A, deliberately much wider
+       than identify_lines()'s own 0.15 A EW-identification default),
+       since this runs before any wavelength correction and the true
+       center can be offset by however large the spectrum's real,
+       uncorrected RV is.
+    2. FINE: the coarse pass's own median velocity is applied as a
+       trial correction, then the search is repeated with a much
+       narrower `refine_radius` (default 0.15 A, matching
+       identify_lines()'s own default).
+
+    The second pass is not just extra precision -- confirmed on real,
+    densely-lined MAROON-X data that it's necessary for correctness: a
+    wide search radius in a densely-lined spectrum can lock onto an
+    unrelated NEARBY real line instead of the intended one often enough
+    to measurably BIAS the coarse pass's own median velocity, not just
+    add scatter around the right answer (confirmed directly: individual
+    per-line velocities from the coarse pass showed no smooth trend with
+    wavelength or order, including wide swings WITHIN a single order --
+    inconsistent with a real RV or calibration drift, consistent with
+    scattered misidentification in a dense line forest). Once a first-
+    pass correction removes most of the true offset, a narrow window is
+    both sufficient and far less likely to contain more than one real
+    candidate.
 
     Parameters
     ----------
@@ -195,48 +231,59 @@ def measure_rv_from_linelist(lines, wavelength, flux, err, pred, search_radius=1
     wavelength, flux, err, pred : lists of per-order arrays, UNSHIFTED
         (e.g. Spectrum_Data.wavelength, not shifted_wavelength -- this
         measures the shift that hasn't been applied yet).
-    search_radius : Angstrom half-width searched around each rest
-        wavelength. 1.0 A comfortably covers a several-tens-of-km/s
-        uncorrected offset across this package's typical (optical,
-        FGK-star) wavelength range without needing a per-line-tuned
-        window the way the small named-line set has.
+    search_radius, refine_radius : Angstrom half-widths for the coarse
+        and fine passes respectively -- see above.
     min_significance : passed through to identify_line() -- how many
         local-noise-sigma below continuum a candidate must clear to
-        count, same meaning as there.
+        count, same meaning as there (identify_lines_in_spectrum()'s own
+        empirical noise calibration applies here too, so this threshold
+        means the same thing regardless of an instrument's own error
+        propagation quirks -- see its docstring).
     sigma_clip : reject individual lines' implied velocity more than
         this many standard deviations from the median, same convention
         as measure_effective_rv() -- much more effective here than on a
         small reference set, since a real linelist has dozens of lines
         to average over instead of 3-4.
     min_lines : refuse to report an RV from fewer than this many
-        detected lines (a handful of detections isn't enough to trust
-        over a single bad blend/misidentification).
+        detected lines at EACH pass (a handful of detections isn't
+        enough to trust over a single bad blend/misidentification); if
+        the fine pass comes up short, falls back to the coarse-only
+        estimate rather than failing outright.
 
     Returns
     -------
-    rv : float or None (km/s) -- None if fewer than min_lines usable.
-    rv_err : float (km/s) -- standard error on the mean of the lines used.
+    rv : float or None (km/s) -- None if the coarse pass found fewer
+        than min_lines usable lines.
+    rv_err : float (km/s) -- standard error on the mean of the lines the
+        FINAL estimate is based on (fine pass if it had enough lines,
+        else the coarse pass).
     n_used : int -- number of lines the reported RV is averaged over.
     """
-    results = identify_lines_in_spectrum(lines, wavelength, flux, err, pred,
-                                          search_radius=search_radius,
-                                          min_significance=min_significance)
-    velocities = []
-    for rest_wavelength, r in zip(lines, results):
-        if r['detected']:
-            velocities.append(C_KMS * (r['center'] - rest_wavelength) / rest_wavelength)
+    def _clip(v):
+        if len(v) == 0:
+            return v
+        med, std = np.median(v), v.std()
+        if std > 0:
+            good = np.abs(v - med) < sigma_clip * std
+            if good.sum() > 0:
+                return v[good]
+        return v
 
-    if len(velocities) < min_lines:
-        return None, None, len(velocities)
+    coarse_v = _clip(_rv_from_detections(lines, wavelength, flux, err, pred,
+                                          search_radius, min_significance))
+    if len(coarse_v) < min_lines:
+        return None, None, len(coarse_v)
+    rv0 = float(np.median(coarse_v))  # median, not mean: robust to a coarse
+                                       # pass skewed by misidentification, not
+                                       # just noisy around the right answer
 
-    velocities = np.array(velocities)
-    med = np.median(velocities)
-    std = velocities.std()
-    if std > 0:
-        good = np.abs(velocities - med) < sigma_clip * std
-        if good.sum() > 0:
-            velocities = velocities[good]
+    shifted = [w * (1.0 - rv0 / C_KMS) for w in wavelength]
+    fine_v = _clip(_rv_from_detections(lines, shifted, flux, err, pred,
+                                        refine_radius, min_significance))
+    if len(fine_v) < min_lines:
+        rv_err = float(coarse_v.std() / np.sqrt(len(coarse_v))) if len(coarse_v) > 1 else 0.0
+        return rv0, rv_err, len(coarse_v)
 
-    rv = float(np.mean(velocities))
-    rv_err = float(velocities.std() / np.sqrt(len(velocities))) if len(velocities) > 1 else 0.0
-    return rv, rv_err, len(velocities)
+    rv = rv0 + float(np.mean(fine_v))
+    rv_err = float(fine_v.std() / np.sqrt(len(fine_v))) if len(fine_v) > 1 else 0.0
+    return rv, rv_err, len(fine_v)

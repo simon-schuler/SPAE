@@ -592,10 +592,19 @@ absolute-wavelength validation of the new identification step (§14.3).
   not been tested and could plausibly surface a new failure mode, the
   same way each real bug in §9 was found via a new real spectrum rather
   than by reasoning about the algorithm in the abstract.
-- **MAROON-X's residual position scatter after RV correction**: see
-  §13.4 — real, confirmed not to be a broken search, but not yet
-  root-caused (candidates: the MAROON-X reader's known fiber-selection
-  ambiguity, real S/N, or per-order calibration drift).
+- **MAROON-X's much lower detection rate than Keck/GRACES (10/78 vs
+  78/78)**: see §13.4-13.5 — investigated via three real, independent
+  issues (a coarse-search misidentification bias in the RV estimate; a
+  units bug applying §6.7's noise calibration to a new context; a
+  missing minimum-prominence check in `identify_line()` that let a
+  monotonic-slope artifact register as a false detection, user-caught).
+  With all three fixed, confirmed the remaining gap is genuine, low
+  S/N for this specific exposure (0.29%/0.56%/2.14% median relative
+  photon error for Keck/GRACES/MAROON-X respectively -- MAROON-X is
+  ~4-7x noisier), not a remaining algorithm shortfall: several of the
+  78 linelist lines are intrinsically weak enough that they are
+  genuinely undetectable at MAROON-X's S/N even though they are 10-50σ
+  detections at Keck's.
 - **Coarse-wavelength-grid identification precision** (e.g. GRACES):
   see §12's validation discussion of Fe I 6716.222 Å — a discrete
   significance-profile peak can land one grid point away from the true
@@ -701,9 +710,12 @@ linelist used throughout this package's history):
   to EW measurement's own centering, not this prior identification
   step ("we just need to identify the line, so the EW fitting routine
   can measure the line strength").
-- MAROON-X: 13/78 detected at default settings, far below Keck/GRACES
-  — see §14.4, a separate, real, not-yet-root-caused issue distinct
-  from everything else in this section.
+- MAROON-X: 10/78 detected at final, strict settings, far below
+  Keck/GRACES — see §13.4-13.5 for the full investigation (three real,
+  independent issues found and fixed along the way, including a
+  genuine misidentification the user caught visually). Confirmed the
+  remaining gap is real, low S/N for this specific exposure (~4-7x
+  worse than Keck/GRACES), not an algorithm shortfall.
 
 ## 13. Radial-velocity / wavelength-shift robustness
 
@@ -814,7 +826,7 @@ point should be treated as having a wavelength/RV error of
 approximately double the star's true RV-implied shift, not a small
 correction.
 
-### 13.4 MAROON-X's residual scatter (open, not yet root-caused)
+### 13.4 MAROON-X's residual scatter (investigated and resolved -- see also §13.5)
 
 Applying the same pipeline to the real MAROON-X target: the named-line
 RV (Na D-based, -30.995 km/s) disagreed with the linelist RV (1.316 ±
@@ -825,21 +837,112 @@ this package (frequently contaminated by interstellar-medium or
 telluric/geocoronal absorption near the line core), consistent with
 the named-line estimate being the wrong one here, not the linelist.
 
-However, even using the (correctly preferred) linelist RV, MAROON-X's
-default-window (0.15 Å) detection rate is only 13/78, far below
-Keck/GRACES's 78/78. Confirmed this is a real residual-scatter issue,
-not a broken search: detection climbs steadily with search radius
-(13/23/32/45 out of 78 at 0.15/0.3/0.5/1.0 Å), plateauing exactly where
-the RV measurement's own 1.0 Å search radius does — meaning a single
-global multiplicative RV correction leaves substantially more real
-per-line position scatter for this target than for Keck or GRACES.
-Plausible causes, none yet investigated: the already-documented fiber-
-selection ambiguity in the MAROON-X reader (`readers.py` — the
-science-fiber index cannot be confirmed from file metadata; a wrong
-fiber could mean genuinely inconsistent signal across orders), real
-lower/variable S/N for this specific target, or per-order wavelength-
-calibration drift that one global RV cannot capture. Left as a known
-open item.
+However, even using the (then-preferred) linelist RV, MAROON-X's
+default-window (0.15 Å) detection rate was only 13/78, far below
+Keck/GRACES's 78/78. Investigated and found TWO real, independent,
+compounding causes (both now fixed):
+
+1. **Wide-search-radius misidentification biasing the RV estimate
+   itself, not just adding scatter.** Printing individual per-line
+   velocities from the coarse (1.0 Å) linelist RV pass showed no smooth
+   trend with wavelength or order -- including wide swings WITHIN a
+   single order (e.g. one order's own lines implying -30, +21, 0, -11,
+   and +27 km/s) -- inconsistent with a real RV or calibration drift,
+   consistent with the search radius being wide enough to lock onto an
+   unrelated real neighboring line in this densely-lined spectrum's
+   crowded regions. Confirmed directly: narrowing the search radius
+   alone (with nothing else changed) collapsed the scatter smoothly
+   (std 21.9/12.0/7.5/4.3/3.5 km/s at 1.0/0.5/0.3/0.2/0.15 Å) while the
+   MEDIAN stayed stable near +0.2 to +0.4 km/s throughout -- meaning the
+   true RV was already small and well-determined, but the WIDE pass's
+   OWN reported value (1.316 km/s, itself computed at 1.0 Å) was
+   measurably biased by the same misidentification, not merely noisier.
+   Fixed (§13.2's `measure_rv_from_linelist()`): now runs COARSE-then-
+   FINE, the way a standard cross-correlation RV search does -- the
+   coarse pass's own median velocity is applied as a trial correction,
+   then a second, much narrower pass (`refine_radius`, default 0.15 Å)
+   refines it, largely immune to the wide pass's own bias since most of
+   the true offset is already removed before the narrow, less-
+   ambiguous search runs.
+2. **A units bug in applying this document's own §6.7 noise-calibration
+   fix to a NEW context.** Attempting to apply the same empirical
+   noise-recalibration idea from continuum fitting (`err`'s theoretical,
+   Poisson-style scale doesn't match real MAROON-X data -- confirmed
+   independently, again, here: computed calibration factor median 0.34,
+   matching §6.7's continuum-fitting-context value almost exactly)
+   directly inside `identify_lines_in_spectrum()` at first produced NO
+   improvement, tracked down to a units mismatch: that function receives
+   NORMALIZED flux (~1.0 baseline), but the calibration formula
+   (borrowed verbatim from continuum.py, where `flux` means RAW counts)
+   computed `resid = flux - pred` directly, which is nonsensical when
+   `flux` is dimensionless and `pred` is in raw-count units. Fixed using
+   the algebraic equivalent for normalized flux, `resid = pred*(flux -
+   1.0)` (since `normalized_flux = raw_flux/pred` by definition) --
+   confirmed exactly reproduces the correct, unit-consistent calibration
+   once fixed.
+
+Combined, these two fixes took MAROON-X's detection rate from 13/78 to
+28/78, with a well-converged linelist RV (0.503 ± 0.677 km/s from 28
+lines, consistent with the ~0.2-0.5 km/s value found stable across
+every search radius during the investigation). Verified no regression
+on Keck/GRACES from either fix (both stay at 78/78; Keck's own
+linelist RV cross-check moved by <0.04 km/s).
+
+### 13.5 A real misidentification, and a minimum-prominence fix (user-caught)
+
+Visually reviewing the 28-detection MAROON-X result (`identify_lines()`
+diagnostic PDF), the user caught a genuine misidentification: Fe I
+5661.346 Å (order 17) was reported DETECTED at 3.0σ, but the "center"
+sat in the extreme blue wing of a much deeper, unrelated line, with no
+real feature of its own. Diagnosed precisely: the winning candidate's
+significance profile showed a smooth, monotonic RISE from the window's
+start right up to that point (values 0.60, 0.65, 0.59, 0.55, 1.19,
+0.83, 0.82, 1.42, 2.24, 3.03), heading into a real, much stronger
+feature that the search window (±0.15 Å) cut off before reaching --
+the "peak" registered as one only because the very next (and last)
+point in the window happened to be marginally lower (3.01 vs 3.03).
+Its `scipy.signal.find_peaks` prominence was 0.02 -- essentially zero,
+confirming it was not a real local feature at all, just the second-to-
+last sample of an unresolved slope, sitting only 0.023 Å from the
+search window's own edge.
+
+Fixed: `identify_line()` gained `min_prominence` (default:
+`min_significance` itself, so no new unjustified constant), passed to
+`find_peaks(..., prominence=min_prominence)`. A real, isolated
+detection should stand out from ITS OWN local surroundings by roughly
+as much as its absolute height; a point on a monotonic slope into a
+different, cut-off feature has near-zero prominence by construction,
+regardless of its absolute significance. Confirmed this specific case
+is now correctly rejected (`detected: False`).
+
+Effect across all three instruments: Keck unchanged (78/78, 0 blends —
+its real detections all have genuine, isolated prominence already).
+GRACES lost exactly one previously-marginal detection (77/78) -- Fe I
+7114.549 Å, ref EW 8.0 mA (the single weakest line in the entire
+linelist), sitting in a noisy, ambiguous stretch with no clear isolated
+dip at rest wavelength; a legitimate rejection, not a loss. **MAROON-X
+dropped sharply, from 28/78 to 10/78, with all 4 blend flags also
+disappearing** -- i.e., most of the fixed round's apparent recovery
+(§13.4) was itself low-confidence, edge-driven, or shoulder-of-another-
+line detections that a real prominence check correctly discards. The
+user anticipated this drop explicitly before it was measured.
+
+**This resolved what "the remaining gap" (§13.4) actually was**: not
+primarily the fiber-selection ambiguity or a subtler remaining bug, but
+real, quantitatively confirmed low S/N. Measuring each instrument's
+typical relative photon error directly: Keck 0.29% (S/N ~349), GRACES
+0.56% (S/N ~180), MAROON-X 2.14% (S/N ~47) -- roughly 4-7x worse than
+the other two. Since several of the 78 linelist lines are intrinsically
+weak (multiple under 20 mA, one as low as 8.0 mA), a line that is a
+confident 10-50σ detection at Keck's S/N would only be ~1.5-7σ at
+MAROON-X's for the identical true depth -- genuinely too marginal to
+trust, not an identification-algorithm shortfall. 10/78 at strict,
+uniform significance/prominence standards is the honest, correct
+answer for this specific exposure's real data quality, not a remaining
+bug to chase further. The fiber-selection ambiguity (`readers.py`)
+remains a separate, valid, but now lower-priority open question --
+low S/N alone is sufficient to explain the detection count without
+invoking it.
 
 ## 14. Commit reference
 
