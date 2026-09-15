@@ -18,10 +18,11 @@ from .gp_utils import SEKernel, Pred_GP
 from .combine import make_line, parabolic_refine
 from .plotting import make_plots_folder
 from .readers import read_spectrum
-from .radial_velocity import measure_effective_rv, C_KMS
+from .radial_velocity import measure_effective_rv, measure_rv_from_linelist, C_KMS
 from .response_correction import apply_response_correction as _apply_response_correction
 from .overlap_check import check_order_overlaps as _check_order_overlaps
 from .overlap_check import flagged_overlap_ranges as _flagged_overlap_ranges
+from .line_identification import identify_lines_in_spectrum as _identify_lines_in_spectrum
 
 
 class Spectrum_Data():
@@ -604,7 +605,9 @@ class Spectrum_Data():
         best_fit, C = np.polyfit(means, self.estimated_shift*(-1), 1, cov=True)
         self.rv = (np.round(best_fit[0]*3e5,3), np.round(np.sqrt(np.diag(C))[1], 3))
 
-    def apply_rv_shift(self, rv=None, lines=None, min_depth=0.02, verbose=False):
+    def apply_rv_shift(self, rv=None, lines=None, min_depth=0.02, verbose=False,
+                       cross_check=True, linelist_search_radius=1.0,
+                       linelist_min_significance=3.0, disagreement_kms=2.0):
         """
         RECOMMENDED default for preparing a spectrum for EW measurement.
         Shift every order by a single effective radial velocity, applied
@@ -622,6 +625,29 @@ class Spectrum_Data():
         normalize_all() must be run first (uses normalized_flux to locate
         line centers).
 
+        RV_REFERENCE_LINES has two real weaknesses on its own: it can be
+        entirely absent from a spectrum whose coverage happens to miss all
+        of Ca II H&K/Balmer/Mg b/Na D, and even when present, mixing
+        Balmer lines with metal lines in one average can be actively
+        wrong, not just imprecise -- confirmed on real data, the two
+        families disagreed by ~10 km/s (a real difference in line
+        formation physics between H and metal lines, which naive sigma-
+        clipping over only 3-4 lines has no way to separate from genuine
+        measurement noise). If a science linelist is already loaded
+        (self.lines, via load_lines()), this now also measures an
+        independent RV from it (radial_velocity.measure_rv_from_linelist(),
+        which reuses identify_lines()'s own detection-based centering --
+        see its docstring) and uses it as follows: as the ONLY estimate if
+        RV_REFERENCE_LINES found nothing usable at all; as a preferred
+        replacement if the two estimates disagree by more than
+        `disagreement_kms` (averaging over dozens of real linelist lines
+        is more robust than 3-4 mixed-species reference lines); otherwise
+        the (cheaper, already-computed) named-line RV is kept and the
+        linelist estimate serves only as a passive cross-check. Call
+        load_lines() before this if you want that cross-check available;
+        it's a silent no-op (identical to the old behavior) if no linelist
+        is loaded yet.
+
         Parameters
         ----------
         rv : float, km/s, optional -- apply this RV directly and skip line
@@ -630,7 +656,14 @@ class Spectrum_Data():
             radial_velocity.RV_REFERENCE_LINES.
         min_depth : float -- minimum line depth (in normalized flux) to
             trust a line's fitted center.
-        verbose : bool -- print the measured RV and which lines were used.
+        verbose : bool -- print the measured RV(s), which lines were used,
+            and the cross-check outcome.
+        cross_check : bool -- if False, use RV_REFERENCE_LINES only, same
+            as before this parameter existed.
+        linelist_search_radius, linelist_min_significance : passed to
+            measure_rv_from_linelist() as search_radius/min_significance.
+        disagreement_kms : how far the two estimates must differ before
+            the linelist-based one is preferred over the named-line one.
 
         Returns
         -------
@@ -638,28 +671,74 @@ class Spectrum_Data():
         """
         if rv is None:
             measured_rv, rv_err, used = measure_effective_rv(self, lines=lines, min_depth=min_depth)
-            if measured_rv is None:
+
+            linelist_rv, linelist_rv_err, linelist_n = None, None, 0
+            if cross_check and self.lines is not None and len(self.lines) > 0:
+                linelist_rv, linelist_rv_err, linelist_n = measure_rv_from_linelist(
+                    self.lines, self.wavelength, self.normalized_flux, self.obs_err, self.pred_all,
+                    search_radius=linelist_search_radius, min_significance=linelist_min_significance)
+
+            if measured_rv is None and linelist_rv is None:
                 raise ValueError(
                     "Could not measure an effective RV -- none of the reference "
                     "lines were found/usable in this spectrum's wavelength "
-                    "coverage. Pass rv= directly, or lines= with a custom set.")
-            if verbose:
-                print(f"Effective RV = {measured_rv:.3f} +/- {rv_err:.3f} km/s, "
-                      f"from {len(used)} line(s):")
-                for name, restw, order, v in used:
-                    print(f"  {name} ({restw} A, order {order}): v={v:.3f} km/s")
+                    "coverage, and no usable linelist-based fallback was "
+                    "available either (load_lines() first to enable that, or "
+                    "pass rv= directly).")
+            elif measured_rv is None:
+                if verbose:
+                    print(f"No usable RV_REFERENCE_LINES; falling back to linelist-based RV = "
+                          f"{linelist_rv:.3f} +/- {linelist_rv_err:.3f} km/s from {linelist_n} line(s).")
+                measured_rv, rv_err = linelist_rv, linelist_rv_err
+            else:
+                if verbose:
+                    print(f"Effective RV = {measured_rv:.3f} +/- {rv_err:.3f} km/s, "
+                          f"from {len(used)} line(s):")
+                    for name, restw, order, v in used:
+                        print(f"  {name} ({restw} A, order {order}): v={v:.3f} km/s")
+                if linelist_rv is not None:
+                    disagreement = abs(measured_rv - linelist_rv)
+                    if disagreement > disagreement_kms:
+                        if verbose:
+                            print(f"WARNING: named-line RV ({measured_rv:.3f} km/s) and linelist RV "
+                                  f"({linelist_rv:.3f} +/- {linelist_rv_err:.3f} km/s, {linelist_n} lines) "
+                                  f"disagree by {disagreement:.3f} km/s (> {disagreement_kms}) -- "
+                                  f"preferring the linelist RV as the more robust (larger-N) estimate.")
+                        measured_rv, rv_err = linelist_rv, linelist_rv_err
+                    elif verbose:
+                        print(f"Linelist cross-check OK: {linelist_rv:.3f} +/- {linelist_rv_err:.3f} km/s "
+                              f"from {linelist_n} line(s), within {disagreement_kms} km/s of the named-line RV.")
+
             self.rv = (round(measured_rv, 3), round(rv_err, 3))
             rv = measured_rv
         else:
             self.rv = (rv, 0.0)
 
         for order in range(len(self.wavelength)):
-            self.shifted_wavelength[order] = self.wavelength[order] * (1.0 + rv / C_KMS)
+            # v = c*(observed-rest)/rest (measure_line_velocity()'s
+            # convention: positive v = redshifted/receding), so
+            # observed = rest*(1+v/c) is the FORWARD relation -- to
+            # recover rest-frame wavelength from the observed spectrum
+            # (the actual point of this method) needs the INVERSE,
+            # rest = observed/(1+v/c) =~ observed*(1-v/c) for v << c.
+            # This sign was wrong from when this method was introduced
+            # (commit 8c3b32c): it used (1+v/c), which does not correct
+            # the shift but DOUBLES it. That escaped detection because
+            # the original validation compared two spectra DIFFERENTIALLY
+            # (star RV minus reference-star RV), which partially cancels
+            # a sign error applied consistently to both; confirmed wrong
+            # directly on real data once compared against absolute
+            # rest-wavelength positions from a real linelist (see
+            # DEVELOPMENT_LOG.md): applying (1+v/c) took a -73.1 mA
+            # pre-shift residual to -146.1 mA (doubled); (1-v/c) took it
+            # to 0.0 mA.
+            self.shifted_wavelength[order] = self.wavelength[order] * (1.0 - rv / C_KMS)
             # Angstrom-equivalent at the order's mean wavelength, kept for
-            # reporting/consistency with estimate_shift()'s convention --
+            # reporting/consistency with estimate_shift()'s convention
+            # (wave_shift(): shifted_wavelength = wavelength + shift) --
             # the actually-applied shift above is the correct multiplicative
             # one, not this per-order scalar approximation of it.
-            self.estimated_shift[order] = self.wavelength[order].mean() * (rv / C_KMS)
+            self.estimated_shift[order] = self.wavelength[order].mean() * (-rv / C_KMS)
 
         return rv
 
@@ -680,8 +759,70 @@ class Spectrum_Data():
         self.lines_found_position = np.array([np.nan]*len(self.lines))
         self.lines_check_flag = np.array([False]*len(self.lines))
         self.lines_flag_reasons = np.array(['']*len(self.lines), dtype=object)
+        #identify_lines() results -- a separate, prior step from EW
+        #measurement (see line_identification.py's module docstring);
+        #all default to "not run yet", distinct from lines_found_position
+        #(set by measure_ew() during actual measurement)
+        self.lines_id_detected = np.array([False]*len(self.lines))
+        self.lines_id_position = np.array([np.nan]*len(self.lines))
+        self.lines_id_order = np.array([None]*len(self.lines))
+        self.lines_id_significance = np.array([0.0]*len(self.lines))
+        self.lines_id_blended = np.array([False]*len(self.lines))
+        #distinguishes "identify_lines() never called" from "called and
+        #found nothing" -- lines_id_detected defaults to False either
+        #way, so check_for_flags() needs this to avoid flagging every
+        #single line as undetected when identify_lines() simply hasn't
+        #run yet
+        self.lines_id_run = False
         for i in range(len(self.lines)):
             self.lines_exd[i] = np.array([elmnt[i],ep[i],gf[i],rad[i]])
+
+    def identify_lines(self, **kwargs):
+        """
+        Locate every loaded line (self.lines) in the spectrum, as a
+        distinct step BEFORE any EW measurement is attempted -- see
+        line_identification.py's module docstring for the detection-
+        based approach and why it replaces "whatever the nearest local
+        minimum happens to be" with an explicit real-detection test.
+
+        Run this AFTER normalize_all() (and apply_rv_shift(), if used)
+        and load_lines(). Populates, per line:
+            lines_id_detected : bool -- a real absorption feature was
+                found somewhere in the search window; False means no
+                candidate cleared min_significance anywhere searched
+                (too weak for this spectrum's S/N, or genuinely absent)
+                -- distinct from a low-confidence detection, and NOT
+                silently treated as "found at the rest wavelength" the
+                way the older get_line_window()-based path would.
+            lines_id_position : identified center (Angstrom), NaN if
+                not detected.
+            lines_id_order : which order the (best) detection came
+                from, None if not detected in any candidate order.
+            lines_id_significance : the detection's depth in units of
+                local noise sigma (0 if not detected).
+            lines_id_blended : a second, competitive candidate exists
+                nearby -- the measured region isn't a clean, isolated
+                feature even though a center was identified.
+
+        **kwargs passed through to identify_line() (search_radius,
+        min_significance, position_tolerance, etc.)
+
+        Returns
+        -------
+        list of per-line result dicts (see
+        line_identification.identify_lines_in_spectrum()'s docstring).
+        """
+        results = _identify_lines_in_spectrum(
+            self.lines, self.shifted_wavelength, self.normalized_flux,
+            self.obs_err, self.pred_all, **kwargs)
+        for i, r in enumerate(results):
+            self.lines_id_detected[i] = r['detected']
+            self.lines_id_position[i] = r['center']
+            self.lines_id_order[i] = r['order']
+            self.lines_id_significance[i] = r['significance']
+            self.lines_id_blended[i] = r['blended']
+        self.lines_id_run = True
+        return results
 
     # def switch_ew_values(self):
     #     if self.temp_line_ew == None:
@@ -1016,7 +1157,15 @@ class Spectrum_Data():
         -- see overlap_check.py's module docstring) -- a continuum-
         placement problem this check catches even when nothing about the
         line's OWN fit looks wrong (e.g. a real order-edge droop found on
-        GRACES this way, invisible to every check above).
+        GRACES this way, invisible to every check above). If
+        identify_lines() was called first (self.lines_id_run -- see
+        line_identification.py's module docstring), also flags: (a) a
+        line identify_lines() never found a significant absorption
+        feature for at all (lines_id_detected False) -- distinct from
+        and prior to the position-offset check above, since a line
+        get_line_window() "finds" is never allowed to silently be pure
+        noise dressed up as a detection; (b) a line identify_lines()
+        flagged as blended (a second, competitive candidate nearby).
         """
         for i in range(len(self.lines)):
             self.lines_check_flag[i] = False
@@ -1059,6 +1208,23 @@ class Spectrum_Data():
                                     f"orders {rng['order_i']}/{rng['order_j']})")
                     print(self.lines[i], 'sits in a disputed order-overlap range '
                           f"(orders {rng['order_i']}/{rng['order_j']}, {rng['median_pct']:+.1f}%)")
+            #identification checks - only meaningful once identify_lines()
+            #has actually run (lines_id_detected defaults to False either
+            #way, so this must be gated on lines_id_run to avoid flagging
+            #every line as undetected when it simply hasn't run yet)
+            if self.lines_id_run:
+                if not self.lines_id_detected[i]:
+                    self.lines_check_flag[i] = True
+                    reasons.append('not detected during identification (no significant '
+                                    'absorption feature found near rest wavelength)')
+                    print(self.lines[i], 'was not detected during identify_lines() -- '
+                          'too weak for this spectrum\'s S/N, or genuinely absent')
+                elif self.lines_id_blended[i]:
+                    self.lines_check_flag[i] = True
+                    reasons.append(f'identified as blended (sig={self.lines_id_significance[i]:.1f}, '
+                                    'a competing candidate sits nearby)')
+                    print(self.lines[i], 'identified as blended -- a competing candidate '
+                          'sits close enough to be comparably significant')
             self.lines_flag_reasons[i] = '; '.join(reasons)
 
     def check_spectra(self, norm=True, lines=False):

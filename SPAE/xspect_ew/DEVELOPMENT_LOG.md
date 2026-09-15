@@ -550,6 +550,18 @@ file rather than the main linelist, the same treatment already applied
 (by convention, not yet by this automatic mechanism) to MAROON-X's
 independently-known-bad edge regions.
 
+### 9.6 Line identification and the wavelength-shift sign bug
+
+Once the continuum-fitting work in §6-9.5 reached a stable state, work
+shifted to the NEXT pipeline stage: locating each linelist entry in the
+spectrum (line identification), as a distinct step prior to and
+decoupled from EW measurement (which was, at this point, being
+developed independently/in parallel by a collaborator) — see §13 for
+the identification algorithm itself and §14 for what this work
+surfaced in wavelength-shift correction, including a significant,
+pre-existing sign bug in `apply_rv_shift()` found via direct,
+absolute-wavelength validation of the new identification step (§14.3).
+
 ## 10. Known, deliberately out-of-scope limitations
 
 - **MAROON-X order 48's telluric O₂ A-band** (and by the same
@@ -580,6 +592,18 @@ independently-known-bad edge regions.
   not been tested and could plausibly surface a new failure mode, the
   same way each real bug in §9 was found via a new real spectrum rather
   than by reasoning about the algorithm in the abstract.
+- **MAROON-X's residual position scatter after RV correction**: see
+  §13.4 — real, confirmed not to be a broken search, but not yet
+  root-caused (candidates: the MAROON-X reader's known fiber-selection
+  ambiguity, real S/N, or per-order calibration drift).
+- **Coarse-wavelength-grid identification precision** (e.g. GRACES):
+  see §12's validation discussion of Fe I 6716.222 Å — a discrete
+  significance-profile peak can land one grid point away from the true
+  (sub-pixel) line center on coarsely-sampled data. Within this
+  package's established real-data precision envelope and explicitly
+  not addressed (a sub-pixel refinement was proposed and declined by
+  the user, since it belongs to EW measurement's own centering, not
+  this prior identification step).
 
 ## 11. Test infrastructure
 
@@ -596,10 +620,228 @@ independently-known-bad edge regions.
 - `make_order_pdfs.py` (`/tmp`): generates one multi-page PDF per
   instrument with every order's normalized spectrum plotted, used for
   full-order-set visual review (§9's "113-page review").
+- `make_line_id_pdf.py` (`/tmp`): one page per linelist entry, showing
+  a window around each line with the rest wavelength and the
+  identify_lines()-identified center both marked, plus detection
+  status/significance/blend flag -- the visual-review counterpart to
+  §12's identification work, same role for identification as
+  make_order_pdfs.py serves for continuum fitting.
 - `Verification/xspect/*.pdf`: the rendered output of the above,
-  regenerated after each algorithm change described in §6-8.
+  regenerated after each algorithm change described in §6-8 and §12-13.
 
-## 12. Commit reference
+## 12. Line identification (before EW measurement)
+
+New module `line_identification.py` locates each linelist entry in a
+normalized, wavelength/RV-corrected spectrum as a distinct step
+**before** any EW measurement is attempted — deliberately separate from
+`line_profile.py`'s existing `get_line_window()`/`measure_ew()`
+machinery (used for actual EW measurement, being developed
+independently — see this document's introduction), so the two can
+evolve without conflicting.
+
+The previous (and still-used, by `get_line_window()`) approach was
+"whatever the single lowest flux point within ±0.1 Å happens to be,
+call that the line," with no test for whether a real feature is even
+present there. `identify_line()` instead runs an explicit detection
+test: it converts the local search window to a per-point "how many
+local-noise-sigma below continuum" significance profile (using each
+point's own already-instrument/response-corrected propagated error —
+see §6.7 for why this can't be assumed uniform), lightly smooths it,
+and finds candidate local minima via `scipy.signal.find_peaks` with a
+minimum-significance threshold (default 3σ). A line with no candidate
+clearing that threshold anywhere in the search window is reported as
+**not detected** — distinct from, and never silently converted into, a
+low-confidence position the way the older approach would. Among
+candidates that do clear the threshold, the one nearest the rest
+wavelength is preferred over a more significant but more distant one
+(scored as significance discounted by squared distance from the rest
+wavelength, in units of a real, previously-established position-
+precision scale, 0.07 Å); a second, competitive candidate nearby is
+recorded as a blend flag. `identify_lines_in_spectrum()` runs this
+across a full linelist and every order whose coverage could contain
+each line, keeping whichever candidate order gives the highest
+significance when more than one covers it (naturally preferring
+whichever order's local data/continuum quality is better in an overlap
+region, the same property §8's overlap check exploits).
+
+**Known, deliberately unaddressed limitation**: two lines close enough
+together that their combined significance profile has no resolvable
+valley between them are reported as one, correctly-centered detection
+with no blend flag — not wrong, but understates that the region isn't
+a single isolated line. Confirmed with a synthetic test (two
+comparable-depth lines 0.09 Å apart, each FWHM 0.15 Å): reported as a
+single un-blended detection. Flagging this class would need a real
+per-instrument "typical single-line width" reference this package does
+not establish anywhere yet; left as a known gap rather than an
+unjustified absolute threshold.
+
+**Validation** (bundled Keck solar sample, all 3 files combined for
+full linelist coverage; real GRACES target; the same 78-line Fe
+linelist used throughout this package's history):
+- Keck: 78/78 lines detected, 0 blend flags (after the wavelength-
+  shift sign fix in §14.3 — see there for the dramatically worse
+  numbers beforehand, which is how that bug was found).
+- GRACES: 78/78 lines detected, 0 blend flags.
+- Position precision (Keck, wide-search residual after RV correction):
+  RMS 14.6-26 mA depending on which named-line RV was used (§14.2),
+  matching or beating this package's previously-established real-data
+  precision benchmark (37 mA RMS, §3).
+- A real, spot-checked case (GRACES, Fe I 6716.222 Å, order 12) showed
+  a 36.6 mA offset traced to the true line center falling almost
+  exactly between two adjacent, nearly-tied-significance sample points
+  (18.51 vs 18.32σ) on GRACES's coarser wavelength grid — a genuine
+  pixel-grid precision limit, not a misidentification (the profile has
+  exactly one real, correctly-resolved peak; a separate, much deeper
+  feature ~0.57 Å away has no numerical influence at this search
+  radius). Confirmed as within the established real-data precision
+  envelope, not a new failure mode. A parabolic/sub-pixel refinement
+  around the winning peak (mirroring `combine.py`'s existing
+  `parabolic_refine()`) would recover this last bit of precision;
+  explicitly deferred by the user, since sub-pixel refinement belongs
+  to EW measurement's own centering, not this prior identification
+  step ("we just need to identify the line, so the EW fitting routine
+  can measure the line strength").
+- MAROON-X: 13/78 detected at default settings, far below Keck/GRACES
+  — see §14.4, a separate, real, not-yet-root-caused issue distinct
+  from everything else in this section.
+
+## 13. Radial-velocity / wavelength-shift robustness
+
+### 13.1 Motivation
+
+`apply_rv_shift()` (§3) depends on a small, fixed set of named
+reference lines (`RV_REFERENCE_LINES`: Ca II H&K, Balmer series, Mg b,
+Na D) being both present in an instrument's coverage and individually
+well-behaved. Validating the new line-identification step (§12)
+surfaced two real, separate problems with this: individual reference
+lines can disagree with each other by an amount too large to be
+measurement noise, and a spectrum with different wavelength coverage
+may have none of them at all. Per explicit user direction, addressed
+by keeping the named-line approach as the primary/fast path, but adding
+a linelist-based measurement as a fallback (when no named lines are
+usable) and cross-check (when they are, comparing the two and
+preferring the more robust one on disagreement) — not replacing the
+named-line approach outright, since "the overall goal is to identify
+the lines, so the code can measure EWs," not to build a general-purpose
+RV pipeline.
+
+### 13.2 Linelist-based RV and Balmer-line deprioritization
+
+New `radial_velocity.measure_rv_from_linelist()` reuses
+`identify_lines_in_spectrum()` (§12) — the same detection-based
+centering used for EW-measurement line identification itself, rather
+than introducing a third line-centering method into the package — with
+a much wider search radius (default 1.0 Å vs. identify_lines()'s own
+0.15 Å default for EW identification), since this runs BEFORE any
+wavelength correction and must tolerate however large the spectrum's
+real, uncorrected offset is. Velocities from all detected lines are
+combined via the same sigma-clipped mean `measure_effective_rv()`
+already used, but over dozens of lines instead of 3-4, so the clip is
+far more effective.
+
+Applying this to the bundled Keck sample directly motivated a second,
+smaller fix: the named-line RV varied by up to ~2.6 km/s across the
+three sample files (sunb/sunr/suni.fits) depending on which reference
+lines happened to be available, while the linelist-based RV was
+consistent to ~0.65 km/s across all three. Tracing this down: whichever
+file happened to lean on Balmer lines (sunb.fits: Ca II H&K + H-delta +
+H-gamma) showed internal disagreement up to ~11 km/s between individual
+reference lines — a real difference in line-formation physics between
+H and metal lines (broader, more pressure/NLTE-sensitive Balmer wings
+centering less precisely), not noise a 3-4-line sigma clip can reliably
+separate from a genuine measurement. `measure_effective_rv()` now tries
+metal lines (Ca II/Mg b/Na D) alone first when using the default
+reference set, falling back to include Balmer lines only when fewer
+than `min_metal_lines` (default 2) metal lines are available. An
+explicitly-passed custom `lines` dict bypasses this split entirely.
+Verified: the three Keck sample files' final RVs tightened from
+(-5.191, -2.628, -3.742) to (-3.338, -2.628, -3.742) km/s, all now
+within ~1.2 km/s of the linelist-based estimate, down from up to 2.6 km/s.
+
+`Spectrum_Data.apply_rv_shift()` gained `cross_check=True` (default):
+if the named-line RV is unavailable, the linelist RV is used as the
+sole estimate; if both are available and disagree by more than
+`disagreement_kms` (default 2.0 km/s), the linelist RV is preferred (as
+the more robust, larger-N estimate) with a clear warning; otherwise the
+(cheaper, already-computed) named-line RV is kept. Fully backward
+compatible: if no linelist is loaded (`load_lines()` not yet called),
+`cross_check` is a silent no-op and behavior is identical to before
+this work.
+
+### 13.3 A significant, pre-existing sign bug in `apply_rv_shift()`
+
+Building the cross-check above required computing an ABSOLUTE
+comparison (identified position vs. a real linelist's rest
+wavelengths) for the first time — every previous validation of
+`apply_rv_shift()` (§3) had been DIFFERENTIAL (one spectrum's RV minus
+another's). This absolute comparison immediately surfaced a serious,
+pre-existing bug: `apply_rv_shift()` (introduced in an earlier session,
+commit `8c3b32c`) applied `shifted_wavelength = wavelength * (1.0 +
+rv/c)`, but `measure_line_velocity()`'s velocity convention is `v =
+c*(observed-rest)/rest` (standard, positive = redshifted), meaning
+`observed = rest*(1+v/c)` is the FORWARD relation from rest to
+observed frame. Correcting an observed spectrum back to rest frame
+(the actual purpose of this method) needs the INVERSE, `rest =
+observed/(1+v/c) ≈ observed*(1-v/c)` for `v << c` — the sign was
+backwards.
+
+Confirmed directly and unambiguously on real data (Keck, sunr.fits): a
+raw, pre-shift residual (identified position vs. rest wavelength) of
+-73.1 mA became **-146.1 mA (doubled, same sign) under the existing
+`(1+v/c)` formula**, and **-0.0 mA under the corrected `(1-v/c)`
+formula**. This explains why the bug went undetected for as long as it
+did: the original validation (§3) compared `apply_rv_shift()`'s
+DIFFERENTIAL RV between two independently-shifted spectra against
+`estimate_shift()`'s own differential measurement of the same pair,
+and a consistent sign error applied to both sides of a difference
+partially cancels rather than clearly failing.
+
+Impact, measured directly with the full 78-line Keck+GRACES validation
+from §12: applying the (buggy) `(1+v/c)` formula collapsed Keck's
+identify_lines() default-window detection rate from 76/78 (with NO
+shift applied at all, relying on the search window's own margin to
+tolerate the raw uncorrected offset) to 14/78. After the fix, Keck and
+GRACES both reach 78/78. Fixed in `apply_rv_shift()`
+(`spectrum_data.py`); `estimated_shift`'s sign was flipped to match for
+consistency with `wave_shift()`'s convention (`shifted_wavelength =
+wavelength + shift`).
+
+**This bug affected every spectrum previously processed with
+`apply_rv_shift()`** (documented as the package's "RECOMMENDED
+default") prior to this fix. Anything downstream of an
+`apply_rv_shift()`-corrected wavelength solution from before this
+point should be treated as having a wavelength/RV error of
+approximately double the star's true RV-implied shift, not a small
+correction.
+
+### 13.4 MAROON-X's residual scatter (open, not yet root-caused)
+
+Applying the same pipeline to the real MAROON-X target: the named-line
+RV (Na D-based, -30.995 km/s) disagreed with the linelist RV (1.316 ±
+3.258 km/s, 45 lines) by 32 km/s — the cross-check correctly identified
+this as untrustworthy and fell back to the linelist estimate. Na D is
+itself a well-known problem line for stellar RV work independent of
+this package (frequently contaminated by interstellar-medium or
+telluric/geocoronal absorption near the line core), consistent with
+the named-line estimate being the wrong one here, not the linelist.
+
+However, even using the (correctly preferred) linelist RV, MAROON-X's
+default-window (0.15 Å) detection rate is only 13/78, far below
+Keck/GRACES's 78/78. Confirmed this is a real residual-scatter issue,
+not a broken search: detection climbs steadily with search radius
+(13/23/32/45 out of 78 at 0.15/0.3/0.5/1.0 Å), plateauing exactly where
+the RV measurement's own 1.0 Å search radius does — meaning a single
+global multiplicative RV correction leaves substantially more real
+per-line position scatter for this target than for Keck or GRACES.
+Plausible causes, none yet investigated: the already-documented fiber-
+selection ambiguity in the MAROON-X reader (`readers.py` — the
+science-fiber index cannot be confirmed from file metadata; a wrong
+fiber could mean genuinely inconsistent signal across orders), real
+lower/variable S/N for this specific target, or per-order wavelength-
+calibration drift that one global RV cannot capture. Left as a known
+open item.
+
+## 14. Commit reference
 
 | Commit | Summary |
 |---|---|
@@ -615,3 +857,4 @@ independently-known-bad edge regions.
 | `e2be2e2` | Fix response-corrected error propagation; percentile targeting |
 | `0a08008` | Recalibrate `lam`; add density-severity signal; empirical noise calibration |
 | `e6d016d` | Cross-order overlap check; EW-flagging integration |
+| *(pending)* | Line identification (§12); RV linelist cross-check and wavelength-shift sign fix (§13) |
