@@ -18,6 +18,6 @@ from .constants import ELEMENTS
 from .plotting import plot_line_info, plot_comparison_res
 from .combine import combine_files
 from .io_utils import load_object
-from .readers import read_spectrum, SpectrumFormatError, load_maroonx_response
+from .readers import read_spectrum, SpectrumFormatError, load_maroonx_response, get_maroonx_bands
 from .radial_velocity import measure_effective_rv, RV_REFERENCE_LINES
 from .response_correction import apply_response_correction

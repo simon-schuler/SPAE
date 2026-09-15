@@ -113,7 +113,33 @@ was rejected as if it were a cosmic ray). The smoothness penalty
 (`lam`/adaptive stiffening) is what keeps the fit from literally
 chasing the single highest point on the upper side -- it doesn't need
 its own sigma cap, and adding one reintroduces the same kind of
-self-reinforcing-bias failure this whole module was built to avoid."""
+self-reinforcing-bias failure this whole module was built to avoid.
+
+A third bias, smaller per-point but systematic, showed up specifically
+in densely-lined orders: the fit sat measurably (2-10%, worse with more
+lines) below the true continuum even in stretches with NO line nearby
+at all -- confirmed with a controlled synthetic test (known-flat true
+continuum, only the NUMBER of scattered lines varied): 0% error with no
+lines, growing to -4.4% with very dense lines, and NOT a convergence
+issue (identical at 15 vs 120 iterations -- a genuinely different
+equilibrium, not an under-run one). Root cause: the below-fit weight
+floor `p` (default 0.01) is small per point but never zero, and a
+densely-lined order has MANY absorbed points -- their cumulative pull,
+summed over the whole order via the smoothness penalty that ties
+everything together, measurably drags down the fit even where no single
+absorbed point is nearby. Confirmed directly: shrinking `p` toward zero
+on the same synthetic test shrinks the bias toward zero too (0.01 to
+0.00001 took -5.8% down to -0.08%). But `p` can't just be made small
+everywhere: doing that on the SLOPED synthetic test (a real large-scale
+decline, no dense blending) made it much WORSE (clean-region error rose
+from ~4% to ~15%) -- a small `p` rejects below-fit points so fast that a
+genuine downward slope the fit hasn't caught up to yet gets treated as
+absorption and locked out, the same self-reinforcing-bias shape as the
+above-fit case, just triggered from the other side. The fix reuses the
+SAME severity signal already computed for adaptive stiffening (dense
+blending and genuine slopes are exactly what it already tells apart):
+`p` is shrunk by up to `p_reduction_factor` in high-severity regions,
+left at its lenient base value elsewhere."""
 
 import numpy as np
 from scipy import sparse
@@ -123,7 +149,7 @@ from scipy.ndimage import maximum_filter1d, uniform_filter1d
 
 def fit_als_continuum(wave, flux, err, lam=2e4, p=0.01, n_iter=15, adaptive=True,
                        stiffen_factor=15.0, local_window=3.0, wide_window=25.0,
-                       severity_threshold=0.08, low_reject_sigma=2.5):
+                       severity_threshold=0.08, low_reject_sigma=2.5, p_reduction_factor=30.0):
     """
     Fit the continuum as the (noise-aware) upper envelope of flux via
     Asymmetric Least Squares (AsLS) smoothing: iteratively solve the
@@ -158,12 +184,16 @@ def fit_als_continuum(wave, flux, err, lam=2e4, p=0.01, n_iter=15, adaptive=True
         doing the work of resisting broad/blended regions -- lam itself
         can be smaller than it needed to be without adaptive stiffening,
         since it's no longer solely responsible for that.
-    p : weight floor for points far below the current fit (as a fraction
-        of full trust), 0 < p < 0.5.
+    p : BASE weight floor for points far below the current fit (as a
+        fraction of full trust), 0 < p < 0.5, used everywhere adaptive
+        stiffening isn't triggered -- see module docstring for why this
+        can't just be made small everywhere.
     n_iter : number of reweighting iterations.
     adaptive : if True (default), compute a per-point stiffness
         multiplier from local-vs-wide peak shortfall (see module
-        docstring) and use `lam * multiplier` instead of a flat `lam`.
+        docstring) and use `lam * multiplier` instead of a flat `lam`
+        (and shrink `p` by up to `p_reduction_factor` in the same
+        regions -- see module docstring for why both are needed).
     stiffen_factor : maximum multiple of `lam` applied where local peaks
         fall furthest short of the wider window's peak.
     local_window, wide_window : Angstrom widths of the two peak-finding
@@ -179,6 +209,9 @@ def fit_als_continuum(wave, flux, err, lam=2e4, p=0.01, n_iter=15, adaptive=True
         smoothly toward the rejection floor `p`. There is no equivalent
         cap above the fit -- see module docstring for why adding one
         made things worse, not better.
+    p_reduction_factor : maximum factor `p` is divided by in the same
+        high-severity regions `stiffen_factor` targets -- see module
+        docstring for the cumulative-bias bug this fixes.
 
     Returns
     -------
@@ -193,6 +226,7 @@ def fit_als_continuum(wave, flux, err, lam=2e4, p=0.01, n_iter=15, adaptive=True
     base_weight = 1.0 / err**2
 
     lam_vec = np.full(L - 2, lam)
+    p_vec = np.full(L, p)
     if adaptive and L > 4:
         dx = (wave[-1] - wave[0]) / (L - 1)
         local_pts = max(int(round(local_window / dx)), 1)
@@ -203,6 +237,7 @@ def fit_als_continuum(wave, flux, err, lam=2e4, p=0.01, n_iter=15, adaptive=True
         severity = np.clip((shortfall - severity_threshold) / (1.0 - severity_threshold), 0.0, 1.0)
         mult = 1.0 + (stiffen_factor - 1.0) * severity
         lam_vec = lam * mult[1:-1]  # align to d2's L-2 interior rows
+        p_vec = p / (1.0 + (p_reduction_factor - 1.0) * severity)
 
     penalty = d2.T @ sparse.diags(lam_vec, 0) @ d2
     w = base_weight.copy()
@@ -212,8 +247,8 @@ def fit_als_continuum(wave, flux, err, lam=2e4, p=0.01, n_iter=15, adaptive=True
         pred = spsolve((W + penalty).tocsc(), w * flux)
         z = (flux - pred) / err
         below_decay = np.exp(-0.5 * (z / low_reject_sigma)**2)
-        w = np.where(z >= 0, base_weight * (1.0 - p),
-                     base_weight * (p + (1.0 - 2.0 * p) * below_decay))
+        w = np.where(z >= 0, base_weight * (1.0 - p_vec),
+                     base_weight * (p_vec + (1.0 - 2.0 * p_vec) * below_decay))
 
     resid = flux - pred
     pred_var = np.full_like(wave, np.var(resid))

@@ -18,6 +18,22 @@ concatenating all chunks into one global curve and interpolating across
 chunk boundaries) avoids introducing spurious discontinuities at order
 edges, since per-order blaze shape can differ in absolute throughput even
 between adjacent orders.
+
+Wavelength overlap alone is NOT always enough to disambiguate, though:
+confirmed on real MAROON-X data, its two arms (blue/red) physically
+overlap near their dichroic split (both arms independently cover echelle
+orders 91-94), so a science order there can have TWO response chunks
+that both "contain" its mean wavelength, describing two different light
+paths with nearly identical wavelength ranges but very different
+absolute response curves. Picking the first match found (this function's
+original behavior) silently applies the wrong arm's calibration whenever
+that happens -- confirmed to produce a spurious, smoothly WRONG ~4x
+monotonic trend across an entire order (not just an edge artifact,
+because the mismatch is in the whole chunk's shape, not one bad pixel).
+When `science_bands`/`response_bands` are supplied, candidates are
+filtered to same-arm matches before picking one, resolving the ambiguity
+directly instead of guessing; see readers.get_maroonx_bands() for how to
+obtain `science_bands` for a MAROON-X file.
 """
 
 import numpy as np
@@ -25,7 +41,7 @@ from scipy.interpolate import interp1d
 
 
 def apply_response_correction(spectrum, response_wave, response, min_overlap_fraction=0.5,
-                               min_response_fraction=0.1):
+                               min_response_fraction=0.1, response_bands=None, science_bands=None):
     """
     Divide a response/blaze correction curve into spectrum.flux, per order.
 
@@ -63,6 +79,13 @@ def apply_response_correction(spectrum, response_wave, response, min_overlap_fra
         smoothly instead, at the cost of a few pixels' worth of
         independent information (an order typically overlaps its
         neighbors in wavelength anyway).
+    response_bands, science_bands : optional, parallel labels (any
+        hashable, e.g. 'blue'/'red') for response_wave/response and for
+        spectrum's own orders respectively. When both are given, a
+        response chunk is only considered a candidate match for an order
+        if their labels are equal -- see module docstring for why this
+        matters on real MAROON-X data. When either is None (default),
+        matching is wavelength-overlap-only, unchanged from before.
 
     Returns
     -------
@@ -74,14 +97,21 @@ def apply_response_correction(spectrum, response_wave, response, min_overlap_fra
         flux = spectrum.flux[i]
         order_mean = w.mean()
 
-        # find the response chunk whose range contains this order's mean
+        # find the response chunk(s) whose range contains this order's mean
         # wavelength (same "mean falls inside" matching principle used
-        # elsewhere in this package, e.g. estimate_shift())
-        best_chunk = None
-        for rw, rf in zip(response_wave, response):
-            if rw.min() <= order_mean <= rw.max():
-                best_chunk = (rw, rf)
-                break
+        # elsewhere in this package, e.g. estimate_shift()), then narrow to
+        # a same-arm match if band labels were supplied (see module
+        # docstring -- wavelength overlap alone is ambiguous for MAROON-X's
+        # two physically-overlapping arms)
+        band_iter = response_bands if response_bands is not None else [None] * len(response_wave)
+        candidates = [(rw, rf, b) for rw, rf, b in zip(response_wave, response, band_iter)
+                      if rw.min() <= order_mean <= rw.max()]
+        if science_bands is not None and response_bands is not None:
+            same_band = [c for c in candidates if c[2] == science_bands[i]]
+            if same_band:
+                candidates = same_band
+        candidates = [(rw, rf) for rw, rf, b in candidates]
+        best_chunk = candidates[0] if candidates else None
         if best_chunk is None:
             print(f'order {i} (mean {order_mean:.1f} A): no response-curve chunk covers this '
                   f'wavelength, left uncorrected')

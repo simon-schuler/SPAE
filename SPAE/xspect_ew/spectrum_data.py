@@ -144,7 +144,7 @@ class Spectrum_Data():
         self.temp_line_ew_err = None
 
     def apply_response_correction(self, response_wave, response, min_overlap_fraction=0.5,
-                                   min_response_fraction=0.1):
+                                   min_response_fraction=0.1, response_bands=None, science_bands=None):
         """
         Divide out an instrument response/blaze correction curve. General:
         works with a response curve from any source, matched to this
@@ -154,10 +154,17 @@ class Spectrum_Data():
         (self.flux), and normalize()'s continuum fit will be far more
         robust on an already-flattened spectrum.
 
-        For MAROON-X specifically: response_wave/response can come from
-        readers.load_maroonx_response('MAROON-X_PHOENIX_RESPONSE_...hd5')
-        -- a separate calibration file, not embedded in individual science
-        exposures (confirmed empty there).
+        For MAROON-X specifically: response_wave/response/response_bands
+        can come from readers.load_maroonx_response('MAROON-X_PHOENIX_
+        RESPONSE_...hd5') -- a separate calibration file, not embedded in
+        individual science exposures (confirmed empty there). Pass
+        science_bands=readers.get_maroonx_bands(sci_filename) too --
+        MAROON-X's two arms physically overlap in wavelength near their
+        dichroic split, so wavelength overlap alone can silently match a
+        science order to the WRONG arm's response chunk there (confirmed:
+        produces a spurious ~4x monotonic trend across the whole order,
+        not just an edge artifact). Without both band arguments, matching
+        falls back to wavelength-overlap-only, same as before.
 
         Returns
         -------
@@ -168,7 +175,8 @@ class Spectrum_Data():
         """
         return _apply_response_correction(self, response_wave, response,
                                            min_overlap_fraction=min_overlap_fraction,
-                                           min_response_fraction=min_response_fraction)
+                                           min_response_fraction=min_response_fraction,
+                                           response_bands=response_bands, science_bands=science_bands)
 
     def normalize_all(self, lam = 2e4, p = 0.01, n_iter = 15, adaptive = True, **als_kwargs):
         #loop through orders
