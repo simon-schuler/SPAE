@@ -12,7 +12,7 @@ from scipy.integrate import simpson
 from numpy.random import multivariate_normal
 
 from .constants import ELEMENTS
-from .continuum import Continuum_scan, iterative_continuum_select
+from .continuum import fit_als_continuum
 from .line_profile import get_line_window, gauss_model, gfit_simple, gauss_ew
 from .gp_utils import SEKernel, Pred_GP
 from .combine import make_line, parabolic_refine
@@ -170,15 +170,12 @@ class Spectrum_Data():
                                            min_overlap_fraction=min_overlap_fraction,
                                            min_response_fraction=min_response_fraction)
 
-    def normalize_all(self, window_width = 1.5, continuum_depth = 90, degree = 3,
-                       n_iterations = 5, low_reject_sigma = 2.5, high_reject_sigma = 5.0):
+    def normalize_all(self, lam = 2e4, p = 0.01, n_iter = 15, adaptive = True, **als_kwargs):
         #loop through orders
         for i in range(len(self.flux)):
 
-            #fit continuum with an iteratively sigma-clipped low-order polynomial
-            self.normalize(i, window_width, continuum_depth, degree=degree,
-                            n_iterations=n_iterations, low_reject_sigma=low_reject_sigma,
-                            high_reject_sigma=high_reject_sigma)
+            #fit continuum via Asymmetric Least Squares smoothing
+            self.normalize(i, lam=lam, p=p, n_iter=n_iter, adaptive=adaptive, **als_kwargs)
 
             #Replace un-normalized points with value before it
             #This should only be replacing the last point in the
@@ -190,29 +187,47 @@ class Spectrum_Data():
 
         return None
 
-    def normalize(self, order, window_width = 1.5, continuum_depth = 90, clip = [-999,-999],
-                  degree = 3, n_iterations = 5, low_reject_sigma = 2.5, high_reject_sigma = 5.0):
+    def normalize(self, order, clip = [-999,-999], lam = 2e4, p = 0.01, n_iter = 15,
+                  adaptive = True, **als_kwargs):
         """
-        Fit and divide out the continuum for one order.
+        Fit and divide out the continuum for one order via Asymmetric
+        Least Squares (AsLS) smoothing (fit_als_continuum(), continuum.py).
 
-        Continuum_scan's local-window percentile selection (window_width,
-        continuum_depth) is used only as an INITIAL guess; the final
-        continuum-point selection and fit come from
-        iterative_continuum_select() (continuum.py), which refines that
-        guess via GLOBAL (order-wide), iteratively sigma-clipped low-order
-        polynomial fit. This fixes a real failure mode of trusting the
-        local-window selection as final: a window sitting entirely inside
-        a moderately broad/strong line has no true-continuum points to
-        select at all, and was measured (see conversation/session notes)
-        to bias the fitted continuum low there by 20-70% -- silently
-        making any such line (and anything sharing its local fit) look
-        shallower than it really is, i.e. underestimating its EW. A
-        first attempt at fixing this with a globally-refit Gaussian
-        Process did NOT work (same bug, same magnitude) -- see
-        continuum.py's module docstring for why a rigid low-order
-        polynomial fit is structurally the right tool here instead.
-        degree/n_iterations/low_reject_sigma/high_reject_sigma control
-        the refinement; see iterative_continuum_select()'s docstring.
+        Every previous approach here (Continuum_scan's local-window
+        selection, a GP, a low-order polynomial, a piecewise spline) fit
+        to a HARD selection of "continuum" points, decided by some
+        threshold that wasn't locally aware -- and every one of them
+        eventually broke on real data where that threshold left a
+        stretch of an order with too few trusted points (a broad line, a
+        real order edge, a real large-scale continuum slope, or just an
+        ordinary-looking stretch that happened to sit a bit below the
+        order's brightest region). AsLS has no hard mask at all: every
+        point gets a soft, iteratively-updated weight (favoring points
+        above the current fit as likely continuum, without ever fully
+        discarding points below it), and a smoothness penalty (`lam`)
+        constrains the whole curve continuously rather than through
+        discrete segments -- so no stretch of an order can end up
+        completely unconstrained the way a starved spline segment could.
+
+        A single global `lam` still had a real limit -- not stiff enough
+        to resist a real, densely-blended stretch (found on a real Keck
+        order), but a `lam` stiff enough to resist that overshot a real
+        GRACES order's genuine large-scale continuum decline. `adaptive`
+        (default True) fixes this by stiffening the fit locally wherever
+        the data itself shows an extended stretch lacking a true nearby
+        continuum peak (whether from dense blending or one broad line),
+        while leaving `lam` at its flexible base value everywhere else
+        (including across a real large-scale slope, which doesn't trip
+        this criterion) -- see fit_als_continuum()'s docstring for the
+        detection method and its parameters (stiffen_factor,
+        local_window, wide_window, severity_threshold, passed through
+        via **als_kwargs).
+
+        See continuum.py's module docstring for the full history of what
+        this replaced and why each earlier attempt failed on real data.
+
+        lam/p/n_iter/adaptive control the fit; see
+        fit_als_continuum()'s docstring.
         """
         if clip[0] != -999 and clip[1] != -999:
             #clipped = True
@@ -227,18 +242,10 @@ class Spectrum_Data():
         flux = self.flux[order][clipl:clipr]
         err = np.sqrt(flux)
 
-        continuum_scan_obj = Continuum_scan(window_width, continuum_depth)
-        continuum_scan_obj.load_data(wave, flux)
-        continuum_scan_obj.scan()
-        initial_select = continuum_scan_obj.get_selected()
-        del continuum_scan_obj
+        pred, pred_var = fit_als_continuum(wave, flux, err, lam=lam, p=p, n_iter=n_iter,
+                                           adaptive=adaptive, **als_kwargs)
 
-        cont, pred, pred_var = iterative_continuum_select(
-            wave, flux, err, initial_select, degree=degree,
-            n_iterations=n_iterations, low_reject_sigma=low_reject_sigma,
-            high_reject_sigma=high_reject_sigma)
-
-        self.continuum[order][clipl:clipr] = cont
+        self.continuum[order][clipl:clipr] = flux >= pred
         self.pred_all[order][clipl:clipr] = pred
         self.pred_var_all[order][clipl:clipr] = pred_var
         self.obs_err[order][clipl:clipr] = err
