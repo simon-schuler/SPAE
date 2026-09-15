@@ -857,4 +857,4 @@ open item.
 | `e2be2e2` | Fix response-corrected error propagation; percentile targeting |
 | `0a08008` | Recalibrate `lam`; add density-severity signal; empirical noise calibration |
 | `e6d016d` | Cross-order overlap check; EW-flagging integration |
-| *(pending)* | Line identification (§12); RV linelist cross-check and wavelength-shift sign fix (§13) |
+| `0dd202c` | Line identification (§12); RV linelist cross-check and wavelength-shift sign fix (§13) |
