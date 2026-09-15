@@ -20,6 +20,8 @@ from .plotting import make_plots_folder
 from .readers import read_spectrum
 from .radial_velocity import measure_effective_rv, C_KMS
 from .response_correction import apply_response_correction as _apply_response_correction
+from .overlap_check import check_order_overlaps as _check_order_overlaps
+from .overlap_check import flagged_overlap_ranges as _flagged_overlap_ranges
 
 
 class Spectrum_Data():
@@ -139,6 +141,11 @@ class Spectrum_Data():
         #flagged. Set by check_for_flags(); make_ew_doc() uses this to
         #explain why a line was routed to the flagged-lines file.
         self.lines_flag_reasons = None
+        #wavelength ranges where two orders' overlap disagreed badly
+        #enough to distrust either one there -- set by
+        #flag_order_overlaps(), consulted by check_for_flags(). Empty
+        #(no-op) until flag_order_overlaps() is called.
+        self.overlap_flag_ranges = []
         #used to switch between Adamow ew calculation and simpson's rule integration
         self.temp_line_ew = None
         self.temp_line_ew_err = None
@@ -177,6 +184,50 @@ class Spectrum_Data():
                                            min_overlap_fraction=min_overlap_fraction,
                                            min_response_fraction=min_response_fraction,
                                            response_bands=response_bands, science_bands=science_bands)
+
+    def check_order_overlaps(self, min_overlap_points=10):
+        """
+        Compare normalized_flux between every pair of orders whose
+        wavelength ranges overlap -- see overlap_check.py's module
+        docstring for why this is a useful, ground-truth-free
+        consistency check (it's how the MAROON-X arm-mismatch bug was
+        originally found, just automated across every overlapping pair
+        instead of relying on noticing two orders share a line). Run
+        this AFTER normalize_all() (and apply_rv_shift(), if used).
+
+        Returns
+        -------
+        list of dicts, sorted worst-first -- see
+        overlap_check.check_order_overlaps()'s docstring for the fields.
+        """
+        return _check_order_overlaps(self, min_overlap_points=min_overlap_points)
+
+    def flag_order_overlaps(self, threshold_pct=2.0, min_overlap_points=10):
+        """
+        Run check_order_overlaps() and remember which wavelength ranges
+        disagree badly enough to distrust (see
+        overlap_check.flagged_overlap_ranges()'s docstring for the
+        default threshold's rationale). check_for_flags() consults
+        self.overlap_flag_ranges automatically -- call this once before
+        check_for_flags() (or make_ew_doc(), which calls it for you) if
+        you want that check included; otherwise it's a silent no-op,
+        same as never calling it.
+
+        A line is flagged if its REST wavelength falls inside a flagged
+        range, regardless of which of the two disagreeing orders it's
+        actually measured from -- deliberately conservative: this check
+        doesn't try to decide WHICH of the two orders is at fault (often
+        genuinely ambiguous), only that the region is in dispute.
+
+        Returns
+        -------
+        list of dicts -- the flagged subset; see
+        overlap_check.flagged_overlap_ranges()'s docstring for the
+        fields. Also stored on self.overlap_flag_ranges.
+        """
+        results = _check_order_overlaps(self, min_overlap_points=min_overlap_points)
+        self.overlap_flag_ranges = _flagged_overlap_ranges(results, threshold_pct=threshold_pct)
+        return self.overlap_flag_ranges
 
     def normalize_all(self, lam = 2e3, p = 0.01, n_iter = 15, adaptive = True, **als_kwargs):
         #loop through orders
@@ -959,7 +1010,13 @@ class Spectrum_Data():
         code locked onto a neighboring feature/blend/noise dip rather than
         the intended line -- see the wavelength-shift robustness testing in
         conversation/session notes for how large this risk can be when a
-        spectrum's wavelength correction is not well constrained.
+        spectrum's wavelength correction is not well constrained. Also
+        flags a line landing inside a disputed order-overlap range, if
+        flag_order_overlaps() was called first (self.overlap_flag_ranges
+        -- see overlap_check.py's module docstring) -- a continuum-
+        placement problem this check catches even when nothing about the
+        line's OWN fit looks wrong (e.g. a real order-edge droop found on
+        GRACES this way, invisible to every check above).
         """
         for i in range(len(self.lines)):
             self.lines_check_flag[i] = False
@@ -992,6 +1049,16 @@ class Spectrum_Data():
                     reasons.append(f'position off by {np.round(position_offset*1000,1)} mA (possible misidentification)')
                     print(self.lines[i], 'found position is', np.round(position_offset*1000,1),
                           'mA from rest wavelength -- possible misidentification, inspect before trusting this EW')
+            #order-overlap check - line sits in a wavelength range where
+            #two orders' normalized flux disagreed badly enough to
+            #distrust either one there (see flag_order_overlaps())
+            for rng in (self.overlap_flag_ranges or []):
+                if rng['wave_lo'] <= self.lines[i] <= rng['wave_hi']:
+                    self.lines_check_flag[i] = True
+                    reasons.append(f"order-overlap disagreement ({rng['median_pct']:+.1f}%, "
+                                    f"orders {rng['order_i']}/{rng['order_j']})")
+                    print(self.lines[i], 'sits in a disputed order-overlap range '
+                          f"(orders {rng['order_i']}/{rng['order_j']}, {rng['median_pct']:+.1f}%)")
             self.lines_flag_reasons[i] = '; '.join(reasons)
 
     def check_spectra(self, norm=True, lines=False):

@@ -21,3 +21,4 @@ from .io_utils import load_object
 from .readers import read_spectrum, SpectrumFormatError, load_maroonx_response, get_maroonx_bands
 from .radial_velocity import measure_effective_rv, RV_REFERENCE_LINES
 from .response_correction import apply_response_correction
+from .overlap_check import check_order_overlaps, print_overlap_report, flagged_overlap_ranges
