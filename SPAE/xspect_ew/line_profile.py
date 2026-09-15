@@ -124,6 +124,63 @@ def gfit_direct(x_array, y_array, y_err, mu, sigma, baseline):
         return None, None, p0
 
 
+def estimate_local_continuum(x, y, y_err, x0, min_points=5, clip_sigma=3.0):
+    """Robust local (linear) continuum level from a set of presumed-
+    continuum points -- e.g. a line's wing, outside its own detected
+    boundary -- instead of assuming the global normalization already put
+    this window's continuum at exactly norm.
+
+    Deliberately a separate ESTIMATION step, not a parameter jointly
+    fit alongside the line: letting continuum and line amplitude trade
+    off against each other in one fit, seeded from only the line's own
+    handful of core points, was confirmed in practice to overfit badly on
+    weaker lines (many >50% EW swings, some the wrong direction, on a
+    real test spectrum) -- a local continuum should be set by the many
+    nearby continuum points, not by the line's own few points fighting an
+    optimizer for it.
+
+    Two-pass: first a straight median/MAD pass rejects points that are
+    themselves part of a different, deeper absorption feature (not just
+    noise -- a plain sigma-clip breaks down if that feature occupies a
+    large fraction of the wing, so this is a coarse defense, not a
+    substitute for the caller excluding an obviously separate line's own
+    core); second, a photon-noise-weighted linear fit (continuum =
+    c0 + c1*(x-x0)) to the surviving points captures a slowly-varying
+    residual from imperfect global normalization, not just a flat offset.
+
+    Returns
+    -------
+    c0, c1 : fitted local continuum level (at x0) and slope
+    c0_err : standard error on c0 from the fit -- large when few/noisy
+        wing points actually constrain it, so a correction from a poorly-
+        sampled wing doesn't get treated as confidently as one from a
+        clean, well-sampled one (see measure_ew()'s use of this in its EW
+        error budget)
+    keep : boolean mask into x/y of points actually used (after clipping)
+    """
+    keep = np.zeros(len(x), dtype=bool)
+    if len(x) < min_points:
+        return 0., 0., np.inf, keep
+
+    med = np.median(y)
+    mad = np.median(np.abs(y-med)) * 1.4826
+    clip = max(mad, np.median(y_err))
+    keep = y > (med - clip_sigma*clip)
+    if keep.sum() < min_points:
+        return 0., 0., np.inf, keep
+
+    xc, yc, ec = x[keep]-x0, y[keep], np.clip(y_err[keep], 1e-6, None)
+    try:
+        coeffs, cov = np.polyfit(xc, yc, 1, w=1./ec, cov=True)
+        c1, c0 = coeffs
+        c0_err = np.sqrt(cov[1, 1])
+    except (np.linalg.LinAlgError, ValueError):
+        # degenerate fit (e.g. all points at the same x) -- fall back to
+        # a flat (no-slope) robust estimate
+        c0, c1, c0_err = float(np.median(yc)), 0., float(np.std(yc)/np.sqrt(len(yc)))
+    return c0, c1, c0_err, keep
+
+
 def gauss_ew(a, fwhm):
     if a == 0 or fwhm == 0:
         return 0
@@ -152,19 +209,24 @@ def gauss_model_err(x, bf, pcov):
     return np.sqrt(np.abs(var))
 
 
+#EW = 500*A*sqrt(pi/ln2)*FWHM = 500*A*sqrt(pi/ln2)*(sigma*2.355) = EW_K*A*sigma
+#(see gauss_ew) -- exposed so callers propagating an extra, independently-
+#estimated source of amplitude uncertainty (e.g. measure_ew()'s local
+#continuum uncertainty) into an EW uncertainty can reuse the same constant.
+EW_K = 500. * np.sqrt(np.pi/np.log(2)) * 2.355
+
+
 def gauss_ew_err(a, sigma, pcov):
     """Propagate a Gaussian fit's parameter covariance to an EW uncertainty.
 
-    EW = 500*a*sqrt(pi/ln2)*(sigma*2.355) = K*a*sigma (see gauss_ew), so this
-    is the standard first-order error propagation for a product of two
-    correlated fit parameters: var(EW) = K^2 * (sigma^2*var(a) +
-    a^2*var(sigma) + 2*a*sigma*cov(a,sigma)). a is gauss_model's amplitude
-    (index 0) and sigma its stddev (index 2), matching gfit_direct's
-    parameter order.
+    EW = EW_K*a*sigma, so this is the standard first-order error
+    propagation for a product of two correlated fit parameters:
+    var(EW) = EW_K^2 * (sigma^2*var(a) + a^2*var(sigma) +
+    2*a*sigma*cov(a,sigma)). a is gauss_model's amplitude (index 0) and
+    sigma its stddev (index 2), matching gfit_direct's parameter order.
     """
     if a == 0 or sigma == 0 or pcov is None:
         return 0.
-    K = 500. * np.sqrt(np.pi/np.log(2)) * 2.355
     var_a, var_sigma, cov_a_sigma = pcov[0, 0], pcov[2, 2], pcov[0, 2]
-    var_ew = K**2 * (sigma**2*var_a + a**2*var_sigma + 2*a*sigma*cov_a_sigma)
+    var_ew = EW_K**2 * (sigma**2*var_a + a**2*var_sigma + 2*a*sigma*cov_a_sigma)
     return np.sqrt(abs(var_ew))

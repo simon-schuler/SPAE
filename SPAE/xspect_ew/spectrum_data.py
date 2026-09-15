@@ -12,7 +12,8 @@ from scipy.integrate import simpson
 
 from .constants import ELEMENTS
 from .continuum import Continuum_scan, iterative_continuum_select
-from .line_profile import get_line_window, gauss_model, gfit_direct, gauss_ew, gauss_ew_err, gauss_model_err
+from .line_profile import (get_line_window, gauss_model, gfit_direct, gauss_ew, gauss_ew_err,
+                            gauss_model_err, estimate_local_continuum, EW_K)
 from .combine import make_line, parabolic_refine
 from .plotting import make_plots_folder
 from .readers import read_spectrum
@@ -704,7 +705,7 @@ class Spectrum_Data():
         flagged_doc.close()
         return np.array(removed_lines)
 
-    def measure_ew(self, i, order, plot = False, ex_params = [0,0,0,0], save_plot = False, window_size = 1.5, show_plot = True):
+    def measure_ew(self, i, order, plot = False, ex_params = [0,0,0,0], save_plot = False, window_size = 1.5, show_plot = True, fit_continuum = True):
         #extra parameters [0] - shift continuum
         #                 [1] - left boundary in Angstroms
         #                 [2] - right boundary in Angstroms
@@ -712,6 +713,12 @@ class Spectrum_Data():
         #show_plot: set False to save/build the figure without blocking on
         #plt.show() -- used by measure_all_ew(save_all=True) so a QC plot
         #for every line doesn't pop up (and need closing) one at a time
+        #fit_continuum: estimate a local linear continuum level+slope (c0,
+        #c1) from this line's own wing data (see estimate_local_continuum)
+        #rather than assuming the global normalization already put this
+        #window's continuum exactly at norm -- fixes fits biased by
+        #imperfect normalization. Set False to fall back to the old fixed-
+        #continuum-at-norm behavior.
         norm = 1.0
         wind, found_line, line_bound,dy = get_line_window(self.lines[i],self.shifted_wavelength[order],self.normalized_flux[order],ex_params[1],ex_params[2],ex_params[3], window_size)
 
@@ -750,46 +757,117 @@ class Spectrum_Data():
         # misidentification (see its docstring)
         self.lines_found_position[i] = found_line
 
-        other_than_line = np.where((measure_x_array <= line_bound[0])|(measure_x_array >= line_bound[1]))
-        only_line = np.where((measure_x_array >= line_bound[0])|(measure_x_array <= line_bound[1]))
-        flat_wing = measure_y_array.copy() + ex_params[0]
-        flat_wing[other_than_line] = norm
+        #in_line/other_than_line: boolean split of the fit window into the
+        #line's own core (between its detected boundaries) and everything
+        #else. other_than_line keeps the original inclusive (<=/>=)
+        #formula; in_line is built as its exact complement (~) rather than
+        #independently with its own inclusive bounds on both sides -- two
+        #independently-inclusive formulas double-cover whichever real data
+        #point happens to sit exactly ON a boundary (line_bound itself IS
+        #an actual wavelength grid value, so this isn't just a theoretical
+        #edge case), silently pulling that point into "the line" for
+        #in_line's purposes while ALSO still getting pinned to continuum
+        #by other_than_line -- confirmed to shift fit results measurably.
+        #(only_line used to be built with `|` instead of `&`, which is
+        #true for virtually every point regardless of line_bound -- fixed,
+        #since it's what restricts the chi-square/Simpson checks below to
+        #the line itself instead of the whole window.)
+        other_than_line = (measure_x_array <= line_bound[0]) | (measure_x_array >= line_bound[1])
+        in_line = ~other_than_line
+        only_line = np.where(in_line)
         #highlight points within errors of continuum (or 1.0)
         upper_cont_bounds = measure_y_array+ ex_params[0] + 2*temp_err_array/temp_pred_array
         lower_cont_bounds = measure_y_array+ ex_params[0] - 2*temp_err_array/temp_pred_array
         points_within_norm = np.where((norm > lower_cont_bounds)&(norm < upper_cont_bounds))
+
         #Direct weighted Gaussian fit to the real data -- no GP smoothing,
         #no Monte Carlo resampling. Invert the continuum-normalized flux
         #into a positive-going bump first, since gauss_model/gauss_ew
         #expect a positive amplitude for an absorption line.
         xtest = measure_x_array
-        y_fit = (-1)*(flat_wing - norm)
+        full_y = measure_y_array + ex_params[0]  # real, unflattened data
+        y_fit = norm - full_y
         y_err = 2*temp_err_array/temp_pred_array
 
-        bf, pcov, p0 = gfit_direct(xtest, y_fit, y_err, found_line, 0.5, 0.)
+        wing_idx = np.where(other_than_line)[0]
+        c0, c1, c0_err = norm, 0., 0.  # "no correction": continuum assumed flat at norm
+        if fit_continuum:
+            #Estimate the local continuum (level+slope) from the real wing
+            #data -- outside this line's own detected boundary -- robustly
+            #excluding points that look like a different, deeper feature,
+            #rather than assuming this window's continuum is already
+            #exactly at norm. This is a separate ESTIMATION step, not a
+            #parameter fit jointly with the line: letting continuum and
+            #amplitude trade off in one fit, seeded from only the line's
+            #own handful of core points, was confirmed to overfit badly on
+            #weaker lines (see estimate_local_continuum()'s docstring) --
+            #a local continuum should be set by the many nearby continuum
+            #points, not the line's own few. estimate_local_continuum()
+            #works in real-flux space (it clips LOW outliers, i.e.
+            #deeper-absorption contamination) -- c0/c1 here are the real
+            #continuum level/slope, not yet the inverted-space offset the
+            #rest of this function uses.
+            c0, c1, c0_err, _ = estimate_local_continuum(
+                xtest[wing_idx], full_y[wing_idx], y_err[wing_idx], found_line)
 
+        #convert to the inverted-space offset (norm - real continuum) that
+        #y_fit/gauss_model operate in throughout the rest of this function
+        cont_offset = norm - (c0 + c1*(xtest-found_line))
+        y_detrend = y_fit - cont_offset
+
+        if fit_continuum:
+            #fit the line against the now continuum-corrected data: the
+            #line's own core, plus any wing points that don't still look
+            #like a separate deeper feature after detrending -- giving the
+            #fit real leverage on where the (now properly zeroed) baseline
+            #sits, against a genuinely corrected local continuum
+            fit_mask = in_line.copy()
+            fit_mask[wing_idx] = np.abs(y_detrend[wing_idx]) < 5*np.median(y_err[wing_idx])
+            line_hwidth = max((line_bound[1]-line_bound[0])/2.0, 0.01)
+            sigma_guess = line_hwidth/1.5
+            bf, pcov, p0 = gfit_direct(xtest[fit_mask], y_detrend[fit_mask], y_err[fit_mask],
+                                        found_line, sigma_guess, 0.)
+        else:
+            #legacy: fit over the WHOLE window, with wing points pinned to
+            #exactly 0 rather than excluded -- confirmed to matter, not
+            #just be equivalent-but-wasteful: pinning gives the fit strong
+            #baseline=0 leverage from dozens of points, and simply
+            #excluding them instead (as the fit_continuum branch does,
+            #appropriately, once they're genuinely detrended) measurably
+            #hurt convergence/stability here where they're NOT detrended
+            fit_y = y_detrend.copy()
+            fit_y[other_than_line] = 0.
+            fit_mask = in_line  # only used below to pick the Simpson integration domain
+            bf, pcov, p0 = gfit_direct(xtest, fit_y, y_err, found_line, 0.5, 0.)
+        fail_bf = np.array([0., found_line, 0., 0.])
         if bf is None:
             print('Gaussian fit did not converge')
             print('If line is close to an edge, try remeasuring line with a smaller window size')
-            bf = np.array([0., found_line, 0., 0.])
+            bf = fail_bf
 
         ew = abs(gauss_ew(bf[0], bf[2]*2.355))
-        ew_err = gauss_ew_err(bf[0], bf[2], pcov)
+        #propagate BOTH the Gaussian fit's own covariance AND the local
+        #continuum estimate's uncertainty (c0_err, ~0 when fit_continuum is
+        #False) -- a correction drawn from a poorly-sampled/noisy wing
+        #shouldn't be reported as confidently as one from a clean wing, even
+        #though it's applied identically to the central EW value either way
+        ew_err = np.sqrt(gauss_ew_err(bf[0], bf[2], pcov)**2 + (EW_K*bf[2]*c0_err)**2)
 
         #sanity bounds -- below 2 mA the line is too shallow/undetected to
         #trust, above 200 mA the fit likely locked onto the wrong (blended
         #or saturated) feature
         if bf[0] == 0 or not (2 < ew < 200):
-            bf = np.array([0., found_line, 0., 0.])
+            bf = fail_bf
             ew = 0.
             ew_err = 0.
             pcov = None  # don't shade a fit band for a rejected/failed fit
 
         best_bf = bf
-        fit_gauss = gauss_model(xtest,best_bf[0],best_bf[1],best_bf[2],best_bf[3])*(-1)+norm
+        #predicted real flux = norm - (line dip + local continuum offset)
+        fit_gauss = norm - (gauss_model(xtest, *best_bf) + cont_offset)
         #set values for line
 
-        diff = (fit_gauss[only_line] - flat_wing[only_line])**2
+        diff = (fit_gauss[only_line] - full_y[only_line])**2
         self.lines_gauss_Xsquare[i] = np.sum(diff)
 
         self.lines_bf_params[i] = best_bf
@@ -799,10 +877,17 @@ class Spectrum_Data():
             self.lines_ew_simp[i] = 0
             self.lines_ew_simp_err[i] = np.nan
         else:
-            #Simpson's-rule integration of the fitted (flattened) profile,
+            #Simpson's-rule integration of the continuum-corrected profile,
             #as a cross-check on the Gaussian EW above -- a point estimate,
-            #not a resampled distribution, so it carries no error of its own
-            self.lines_ew_simp[i] = simpson(y_fit[only_line], xtest[only_line])*1000
+            #not a resampled distribution, so it carries no error of its
+            #own. Integrated over fit_mask (same points the fit itself
+            #used), not just the line's own narrow core (only_line): that
+            #core can be just a handful of points spanning well under the
+            #Gaussian's full area for a line whose auto-detected boundary
+            #undershoots its true width, which was confirmed to make this
+            #cross-check read ~2x low on real lines in the bundled sample
+            #even though the Gaussian fit itself was fine.
+            self.lines_ew_simp[i] = simpson(y_detrend[fit_mask], xtest[fit_mask])*1000
             self.lines_ew_simp_err[i] = np.nan
         print('line to measure:', ELEMENTS[self.lines_exd[i][0]],self.lines[i], '- Line found:', found_line)
         print('EW:',np.round(self.lines_ew[i],2),u"±",np.round(self.lines_ew_err[i],2), 'simps-int:', np.round(self.lines_ew_simp[i],2),u"±", np.round(self.lines_ew_simp_err[i],2))
@@ -828,7 +913,14 @@ class Spectrum_Data():
                 model_err = gauss_model_err(xtest, best_bf, pcov)
                 fit_view.fill_between(xtest, fit_gauss-model_err, fit_gauss+model_err,
                          color = '#377eb8', alpha = 0.25, zorder = 1, label = r'fit $\pm1\sigma$')
-            fit_view.plot([xtest[0],xtest[-1]],[norm,norm], '--', color = '#4daf4a')
+            fit_view.plot([xtest[0],xtest[-1]],[norm,norm], '--', color = '#4daf4a', label = 'assumed continuum (norm)')
+            if fit_continuum:
+                #the estimated LOCAL continuum level (c0, c1), so you can
+                #see directly how far the global normalization was off
+                #here -- this is what fixes a fit biased by imperfect
+                #normalization
+                local_cont = norm - cont_offset
+                fit_view.plot(xtest, local_cont, ':', color = '#ff7f00', lw = 2, label = 'estimated local continuum')
             fit_view.legend(loc='best', fontsize=8)
 
             data_view = fig.add_subplot(122)
@@ -878,7 +970,7 @@ class Spectrum_Data():
             self.lines_exp[i] = np.array(ex_params)
             print('extra params:',ex_params)
 
-    def measure_all_ew(self, exclude_lines= [], plot_lines=[], ex_params = {}, window_size = 1.5, save_all = False):
+    def measure_all_ew(self, exclude_lines= [], plot_lines=[], ex_params = {}, window_size = 1.5, save_all = False, fit_continuum = True):
         """
         Measure every loaded line's EW.
 
@@ -890,6 +982,9 @@ class Spectrum_Data():
         block on hundreds of plot windows); list specific wavelengths in
         plot_lines as well if you also want those shown live as they're
         measured.
+
+        fit_continuum=True (default) corrects for imperfect global
+        continuum normalization per-line -- see measure_ew()'s docstring.
         """
         if save_all:
             make_plots_folder()
@@ -915,12 +1010,12 @@ class Spectrum_Data():
                     if save_all:
                         plot = True
                         self.measure_ew(i,order, plot, exp, True, window_size,
-                                         show_plot=(self.lines[i] in plot_lines))
+                                         show_plot=(self.lines[i] in plot_lines), fit_continuum=fit_continuum)
                     else:
-                        self.measure_ew(i,order, plot, exp, False, window_size)
+                        self.measure_ew(i,order, plot, exp, False, window_size, fit_continuum=fit_continuum)
         #self.lines_bf_params = np.array(self.lines_bf_params)
 
-    def measure_line_ew(self,line,ex_params=[0,0,0,0], save_line = False, save_plot = False, window_size = 1.5):
+    def measure_line_ew(self,line,ex_params=[0,0,0,0], save_line = False, save_plot = False, window_size = 1.5, fit_continuum = True):
         if save_plot:
             make_plots_folder()
         i = np.where(self.lines == line)[0][0]
@@ -935,7 +1030,7 @@ class Spectrum_Data():
                     self.lines_ew_err[i] = np.nan
                     self.lines_ew_simp_err[i] = np.nan
                     #self.lines_check_flag[i] = False
-                    self.measure_ew(i,order, True, ex_params, save_plot, window_size)
+                    self.measure_ew(i,order, True, ex_params, save_plot, window_size, fit_continuum=fit_continuum)
                     found = True
                     if save_line:
                         with open('line_'+str(line)+'.txt','w') as f:
