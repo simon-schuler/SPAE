@@ -248,7 +248,15 @@ class Spectrum_Data():
 
         wave = self.wavelength[order][clipl:clipr]
         flux = self.flux[order][clipl:clipr]
-        err = np.sqrt(flux)
+        # self.obs_err carries the correct per-point error: sqrt(flux) as
+        # set at __init__ time for an uncorrected order, or (if
+        # apply_response_correction() has run) sqrt(raw_counts)/response --
+        # NOT recomputed as sqrt(flux) here, which would silently drop the
+        # response-division noise amplification (see
+        # response_correction.py's module docstring for the real bug this
+        # caused: an artificial continuum-fit gradient across an otherwise
+        # clean, response-corrected MAROON-X order).
+        err = self.obs_err[order][clipl:clipr]
 
         pred, pred_var = fit_als_continuum(wave, flux, err, lam=lam, p=p, n_iter=n_iter,
                                            adaptive=adaptive, **als_kwargs)
@@ -256,7 +264,6 @@ class Spectrum_Data():
         self.continuum[order][clipl:clipr] = flux >= pred
         self.pred_all[order][clipl:clipr] = pred
         self.pred_var_all[order][clipl:clipr] = pred_var
-        self.obs_err[order][clipl:clipr] = err
         self.normalized_flux[order][clipl:clipr] = flux/pred
         return None
 

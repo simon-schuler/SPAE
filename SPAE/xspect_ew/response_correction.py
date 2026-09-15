@@ -138,6 +138,29 @@ def apply_response_correction(spectrum, response_wave, response, min_overlap_fra
         corrected = flux.copy()
         corrected[valid] = flux[valid] / resp_on_grid[valid]
 
+        # obs_err must be divided by the SAME response curve as flux, not
+        # just recomputed as sqrt(corrected) downstream -- confirmed real
+        # bug: sqrt(raw_counts)/response is the correct propagated Poisson
+        # error on response-corrected flux, but sqrt(corrected_flux) alone
+        # silently drops the 1/response factor. Since response tapers
+        # non-uniformly across an order (blaze-like shape, not flat), this
+        # under-estimates the true error MORE in low-response stretches
+        # than high-response ones, handing fit_als_continuum's below-fit
+        # weighting (1/err^2) artificially high confidence there and
+        # letting ordinary noise excursions get chased as if they were
+        # trustworthy signal. Confirmed on a real MAROON-X order (48):
+        # this alone produced a smooth ~19-percentage-point fitted-
+        # continuum overshoot across an 83-A "clean" stretch with no
+        # absorption at all, worst at the order's true edge (lowest
+        # relative response) and fading toward the order's response peak
+        # -- not a telluric- or line-density-driven effect, since a
+        # neighboring order (56) with comparably deep telluric absorption
+        # but a flatter relative-response profile in ITS clean region
+        # showed no such gradient.
+        obs_err = spectrum.obs_err[i]
+        corrected_err = obs_err.copy()
+        corrected_err[valid] = obs_err[valid] / resp_on_grid[valid]
+
         n_bridged = (~valid).sum()
         if n_bridged:
             # w is wavelength-sorted, so w[valid]/corrected[valid] are too --
@@ -145,11 +168,15 @@ def apply_response_correction(spectrum, response_wave, response, min_overlap_fra
             bridge = interp1d(w[valid], corrected[valid], kind='linear', bounds_error=False,
                                fill_value=(corrected[valid][0], corrected[valid][-1]))
             corrected[~valid] = bridge(w[~valid])
+            err_bridge = interp1d(w[valid], corrected_err[valid], kind='linear', bounds_error=False,
+                                   fill_value=(corrected_err[valid][0], corrected_err[valid][-1]))
+            corrected_err[~valid] = err_bridge(w[~valid])
             print(f'order {i}: {n_bridged}/{len(w)} points below the response floor '
                   f'({min_response_fraction:.0%} of chunk peak), bridged via interpolation '
                   f'from neighboring corrected points')
 
         spectrum.flux[i] = corrected
+        spectrum.obs_err[i] = corrected_err
         corrected_orders.append(i)
 
     return corrected_orders

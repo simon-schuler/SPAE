@@ -139,17 +139,45 @@ above-fit case, just triggered from the other side. The fix reuses the
 SAME severity signal already computed for adaptive stiffening (dense
 blending and genuine slopes are exactly what it already tells apart):
 `p` is shrunk by up to `p_reduction_factor` in high-severity regions,
-left at its lenient base value elsewhere."""
+left at its lenient base value elsewhere.
+
+A fourth bias is really a mismatch between what the fit targets and
+what "continuum" means for real, not-perfectly-clean stellar spectra:
+the low_reject_sigma-based decay above was tuned to bring the fit down
+to the MEAN of the noise (undoing the earlier "tracks above the local
+peak" overshoot), but `low_reject_sigma` (2.5) is wide enough that it
+barely discounts anything within about 2 sigma either side -- the bulk
+of a Gaussian -- so in practice the fit settles close to the raw
+CENTROID of nearby points, not a true upper envelope, even though the
+weighting is nominally asymmetric (full trust above, decay below).
+Confirmed by inspection: real Poisson noise scatters roughly
+symmetrically around that centroid, so about half of any clean stretch
+visibly pokes up above the fitted line -- consistent with fitting a
+mean, not an envelope. For real echelle data this matters even away
+from any resolved line: pervasive weak/blended absorption depresses the
+observed centroid below the TRUE (line-free) continuum almost
+everywhere, so a mean-tracking fit inherits that depression, worst in
+densely-lined stretches (e.g. Keck's red order edges) but present even
+in nominally "clean" regions. `target_percentile` (default 80) restores
+a controlled upward bias, expressed in units of each point's own
+photon-noise sigma rather than an arbitrary fraction of flux (which
+would be a wildly different amount of correction depending on
+brightness) -- applied as a POST-HOC shift of the already-converged
+mean-tracking fit, not folded into the iteration itself, so none of the
+above convergence/stability behavior changes; only the final reported
+level does."""
 
 import numpy as np
 from scipy import sparse
 from scipy.sparse.linalg import spsolve
 from scipy.ndimage import maximum_filter1d, uniform_filter1d
+from scipy.stats import norm
 
 
 def fit_als_continuum(wave, flux, err, lam=2e4, p=0.01, n_iter=15, adaptive=True,
                        stiffen_factor=15.0, local_window=3.0, wide_window=25.0,
-                       severity_threshold=0.08, low_reject_sigma=2.5, p_reduction_factor=30.0):
+                       severity_threshold=0.08, low_reject_sigma=2.5, p_reduction_factor=30.0,
+                       target_percentile=80.0):
     """
     Fit the continuum as the (noise-aware) upper envelope of flux via
     Asymmetric Least Squares (AsLS) smoothing: iteratively solve the
@@ -212,6 +240,17 @@ def fit_als_continuum(wave, flux, err, lam=2e4, p=0.01, n_iter=15, adaptive=True
     p_reduction_factor : maximum factor `p` is divided by in the same
         high-severity regions `stiffen_factor` targets -- see module
         docstring for the cumulative-bias bug this fixes.
+    target_percentile : where the reported continuum should sit within
+        the LOCAL photon-noise distribution, not within flux itself --
+        80 means roughly "mean + 0.84 sigma" (norm.ppf(0.80)), not "80%
+        of the flux value." Converted once to a sigma multiplier and
+        applied as a flat additive shift, in units of the noise scale AT
+        the fitted continuum level (err rescaled by sqrt(pred/flux), so
+        it reflects true continuum brightness rather than being
+        artificially small inside an absorption line where flux itself
+        is depressed) -- see module docstring for why the base iteration
+        settles near the noise MEAN and needs this correction on top.
+        50 reproduces the old (uncorrected) mean-tracking behavior.
 
     Returns
     -------
@@ -224,6 +263,34 @@ def fit_als_continuum(wave, flux, err, lam=2e4, p=0.01, n_iter=15, adaptive=True
     L = len(flux)
     d2 = sparse.diags([1.0, -2.0, 1.0], [0, 1, 2], shape=(L - 2, L))
     base_weight = 1.0 / err**2
+
+    # lam/p are absolute numbers, calibrated (via this module's synthetic
+    # ground-truth test, test_normalize.py: Poisson noise on a ~50,000-
+    # count continuum, giving err~224, weight~4e-10... no -- weight =
+    # 1/err^2 ~ 1/224^2 ~ 2e-5) against ONE particular data scale. lam
+    # itself doesn't know what units flux/err are in, so (W + penalty)'s
+    # balance between "trust the data" and "stay smooth" only behaves the
+    # way lam/p were tuned for when the data's typical weight stays near
+    # that same ~2e-5 scale. Response-corrected flux (MAROON-X) can sit
+    # many orders of magnitude away from it (millions of counts, weight
+    # ~1e-7 to 1e-10) -- not just a uniformly bigger/smaller problem, but
+    # a qualitatively different, badly-conditioned regime where lam is
+    # effectively far stiffer, relative to the data, than it was ever
+    # tuned to be. Confirmed on a real MAROON-X order: correcting its
+    # error to properly reflect response-division noise (see
+    # response_correction.py) pushed typical weight far below this scale
+    # and made the AsLS reweighting iteration converge to a non-physical
+    # fixed point (predicted continuum ~35x the actual flux) instead of
+    # the small, stable correction seen on every other order -- even
+    # though the per-point error itself was now correct. Rescaling lam by
+    # the order's own typical weight relative to the calibration
+    # reference restores the SAME relative balance regardless of what
+    # absolute units flux/err happen to be in -- a no-op for Keck/GRACES-
+    # scale data (where this ratio is already ~1).
+    _CALIBRATION_WEIGHT = 1.0 / 224.0**2
+    typical_weight = np.median(base_weight)
+    if typical_weight > 0:
+        lam = lam * typical_weight / _CALIBRATION_WEIGHT
 
     lam_vec = np.full(L - 2, lam)
     p_vec = np.full(L, p)
@@ -249,6 +316,13 @@ def fit_als_continuum(wave, flux, err, lam=2e4, p=0.01, n_iter=15, adaptive=True
         below_decay = np.exp(-0.5 * (z / low_reject_sigma)**2)
         w = np.where(z >= 0, base_weight * (1.0 - p_vec),
                      base_weight * (p_vec + (1.0 - 2.0 * p_vec) * below_decay))
+
+    if target_percentile != 50.0:
+        sigma_offset = norm.ppf(target_percentile / 100.0)
+        flux_floor = np.maximum(flux, 1e-3 * np.median(flux[flux > 0]) if np.any(flux > 0) else 1.0)
+        continuum_scale = np.clip(pred / flux_floor, 0.0, 100.0)
+        err_at_continuum = err * np.sqrt(continuum_scale)
+        pred = pred + sigma_offset * err_at_continuum
 
     resid = flux - pred
     pred_var = np.full_like(wave, np.var(resid))
