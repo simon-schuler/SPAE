@@ -74,6 +74,11 @@ def apply_response_correction(spectrum, response_wave, response, min_overlap_fra
         flux = spectrum.flux[i]
         order_mean = w.mean()
 
+        if spectrum.continuum[i].any():
+            print(f'order {i}: normalize() already ran on this order -- its continuum fit and '
+                  f'obs_err were computed from the PRE-correction flux and are now stale. '
+                  f're-run normalize() for this order after response correction.')
+
         # find the response chunk whose range contains this order's mean
         # wavelength (same "mean falls inside" matching principle used
         # elsewhere in this package, e.g. estimate_shift())
@@ -108,6 +113,19 @@ def apply_response_correction(spectrum, response_wave, response, min_overlap_fra
         corrected = flux.copy()
         corrected[valid] = flux[valid] / resp_on_grid[valid]
 
+        # obs_err must be divided by the same response curve as flux, not
+        # recomputed as sqrt(corrected) -- dividing a Poisson quantity by a
+        # deterministic factor R scales its sigma by 1/R, not 1/sqrt(R)
+        # (sqrt(raw/R) undershoots the true sigma(raw)/R, worst at low R,
+        # i.e. exactly at the order edges this function already treats
+        # carefully above). spectrum.obs_err[i] is the correct pre-
+        # correction sigma(raw) at this point (set from raw flux at
+        # Spectrum_Data construction, untouched since), so it's this
+        # function's job -- not normalize()'s -- to carry it through.
+        err = spectrum.obs_err[i]
+        corrected_err = err.copy()
+        corrected_err[valid] = err[valid] / resp_on_grid[valid]
+
         n_bridged = (~valid).sum()
         if n_bridged:
             # w is wavelength-sorted, so w[valid]/corrected[valid] are too --
@@ -115,11 +133,15 @@ def apply_response_correction(spectrum, response_wave, response, min_overlap_fra
             bridge = interp1d(w[valid], corrected[valid], kind='linear', bounds_error=False,
                                fill_value=(corrected[valid][0], corrected[valid][-1]))
             corrected[~valid] = bridge(w[~valid])
+            bridge_err = interp1d(w[valid], corrected_err[valid], kind='linear', bounds_error=False,
+                                   fill_value=(corrected_err[valid][0], corrected_err[valid][-1]))
+            corrected_err[~valid] = bridge_err(w[~valid])
             print(f'order {i}: {n_bridged}/{len(w)} points below the response floor '
                   f'({min_response_fraction:.0%} of chunk peak), bridged via interpolation '
                   f'from neighboring corrected points')
 
         spectrum.flux[i] = corrected
+        spectrum.obs_err[i] = corrected_err
         corrected_orders.append(i)
 
     return corrected_orders

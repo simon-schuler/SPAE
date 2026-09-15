@@ -9,12 +9,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.interpolate import interp1d
 from scipy.integrate import simpson
-from numpy.random import multivariate_normal
 
 from .constants import ELEMENTS
 from .continuum import Continuum_scan, iterative_continuum_select
-from .line_profile import get_line_window, gauss_model, gfit_simple, gauss_ew
-from .gp_utils import SEKernel, Pred_GP
+from .line_profile import get_line_window, gauss_model, gfit_direct, gauss_ew, gauss_ew_err, gauss_model_err
 from .combine import make_line, parabolic_refine
 from .plotting import make_plots_folder
 from .readers import read_spectrum
@@ -225,7 +223,14 @@ class Spectrum_Data():
 
         wave = self.wavelength[order][clipl:clipr]
         flux = self.flux[order][clipl:clipr]
-        err = np.sqrt(flux)
+        # obs_err is maintained alongside self.flux -- set from raw Poisson
+        # shot noise (sqrt(raw counts)) at construction, and correctly
+        # rescaled by apply_response_correction() if that was applied.
+        # Recomputing sqrt(flux) here instead would silently be wrong once
+        # response correction has run, since flux is then raw/R and
+        # sqrt(raw/R) != sigma(raw)/R -- see apply_response_correction()'s
+        # docstring.
+        err = self.obs_err[order][clipl:clipr]
 
         continuum_scan_obj = Continuum_scan(window_width, continuum_depth)
         continuum_scan_obj.load_data(wave, flux)
@@ -241,7 +246,8 @@ class Spectrum_Data():
         self.continuum[order][clipl:clipr] = cont
         self.pred_all[order][clipl:clipr] = pred
         self.pred_var_all[order][clipl:clipr] = pred_var
-        self.obs_err[order][clipl:clipr] = err
+        # obs_err[order][clipl:clipr] is already `err` (read from self.obs_err
+        # above, not recomputed) -- nothing to write back
         self.normalized_flux[order][clipl:clipr] = flux/pred
         return None
 
@@ -322,6 +328,7 @@ class Spectrum_Data():
 
             #combining flux values for each wavelength value
             combined_flux = np.zeros(len(self.shifted_wavelength[i]))
+            combined_err = np.zeros(len(self.shifted_wavelength[i]))
 
             print('A order', i, 'B order', b_order[i][0][0])
 
@@ -344,10 +351,19 @@ class Spectrum_Data():
                 loc = np.where(diff_array == diff_array.min())
                 #add A flux with B flux at location where diff = 0
                 combined_flux[j] = self.flux[i][j] + spectB.flux[b_order[i][0][0]][le:re][loc]
+                #errors add in quadrature (independent measurements), using
+                #each spectrum's own already-correct obs_err rather than
+                #recomputing sqrt(combined_flux) -- which would be wrong
+                #for the same reason it's wrong in normalize(): if either
+                #spectrum has already been response-corrected, its flux is
+                #no longer a raw Poisson count, so sqrt() of it is not its
+                #true sigma (see apply_response_correction()'s docstring)
+                combined_err[j] = np.sqrt(self.obs_err[i][j]**2
+                                           + spectB.obs_err[b_order[i][0][0]][le:re][loc][0]**2)
             #print(combined_flux)
             #collect flux values for each order
             combined_flux_orders[i] = combined_flux
-            self.obs_err[i] = np.sqrt(combined_flux)
+            self.obs_err[i] = combined_err
 
             plt.plot(self.shifted_wavelength[i], self.flux[i], label = 'A')
             plt.plot(spectB.wavelength[b_order[i][0][0]], spectB.flux[b_order[i][0][0]], label = 'B')
@@ -688,11 +704,14 @@ class Spectrum_Data():
         flagged_doc.close()
         return np.array(removed_lines)
 
-    def measure_ew(self, i, order, plot = False, ex_params = [0,0,0,0], save_plot = False, window_size = 1.5):
+    def measure_ew(self, i, order, plot = False, ex_params = [0,0,0,0], save_plot = False, window_size = 1.5, show_plot = True):
         #extra parameters [0] - shift continuum
         #                 [1] - left boundary in Angstroms
         #                 [2] - right boundary in Angstroms
         #                 [3] - line center in Angstroms
+        #show_plot: set False to save/build the figure without blocking on
+        #plt.show() -- used by measure_all_ew(save_all=True) so a QC plot
+        #for every line doesn't pop up (and need closing) one at a time
         norm = 1.0
         wind, found_line, line_bound,dy = get_line_window(self.lines[i],self.shifted_wavelength[order],self.normalized_flux[order],ex_params[1],ex_params[2],ex_params[3], window_size)
 
@@ -739,72 +758,52 @@ class Spectrum_Data():
         upper_cont_bounds = measure_y_array+ ex_params[0] + 2*temp_err_array/temp_pred_array
         lower_cont_bounds = measure_y_array+ ex_params[0] - 2*temp_err_array/temp_pred_array
         points_within_norm = np.where((norm > lower_cont_bounds)&(norm < upper_cont_bounds))
-        #GP fit
-        xtest = np.linspace(measure_x_array[0], measure_x_array[-1], len(measure_x_array))
-        m,C=Pred_GP(SEKernel,[1,100],measure_x_array,flat_wing,2*temp_err_array/temp_pred_array, xtest)
-        try:
-            samples = multivariate_normal(m,C,500)
-        except:
-            print('SVD did not converge, setting samples to 0')
+        #Direct weighted Gaussian fit to the real data -- no GP smoothing,
+        #no Monte Carlo resampling. Invert the continuum-normalized flux
+        #into a positive-going bump first, since gauss_model/gauss_ew
+        #expect a positive amplitude for an absorption line.
+        xtest = measure_x_array
+        y_fit = (-1)*(flat_wing - norm)
+        y_err = 2*temp_err_array/temp_pred_array
+
+        bf, pcov, p0 = gfit_direct(xtest, y_fit, y_err, found_line, 0.5, 0.)
+
+        if bf is None:
+            print('Gaussian fit did not converge')
             print('If line is close to an edge, try remeasuring line with a smaller window size')
-            samples = np.array([0]*500)
+            bf = np.array([0., found_line, 0., 0.])
 
-        m_plot=m.copy()
-        m = (-1)*(m-1)
-        samp_ew = np.zeros(len(samples))
-        a_values = np.zeros(len(samples))
-        mu_values = np.zeros(len(samples))
-        sig_values = np.zeros(len(samples))
-        base_values = np.zeros(len(samples))
-        simp_values = np.zeros(len(samples))
-        plot_gaussian = False
-        for j in range(len(samples)):
-            #plt.plot(xtest,(-1)*(samples[j]-1), 'b--')
-            bf, err, p0 = gfit_simple(xtest, (-1)*(samples[j]-1), found_line, 0.5,0)
-            #print('best fit:', bf, err, p0)
-            #if bf[0] > 0.0:
-            if abs(gauss_ew(bf[0], bf[2]*2.355)) > 2 and abs(gauss_ew(bf[0], bf[2]*2.355)) < 200:
-                samp_ew[j] = abs(gauss_ew(bf[0], bf[2]*2.355))
-                a_values[j] = bf[0]
-                mu_values[j] = bf[1]
-                sig_values[j] = abs(bf[2])
-                base_values[j] = bf[3]
+        ew = abs(gauss_ew(bf[0], bf[2]*2.355))
+        ew_err = gauss_ew_err(bf[0], bf[2], pcov)
 
-                #simpson's rule integration
-                # line_inpterp = interp1d(measure_x_array, flat_wing, kind='linear', bounds_error = False)
-                # x = np.linspace(flat_wing[0], flat_wing[-1],100)
-                # result_y = line_inpterp(x)
+        #sanity bounds -- below 2 mA the line is too shallow/undetected to
+        #trust, above 200 mA the fit likely locked onto the wrong (blended
+        #or saturated) feature
+        if bf[0] == 0 or not (2 < ew < 200):
+            bf = np.array([0., found_line, 0., 0.])
+            ew = 0.
+            ew_err = 0.
+            pcov = None  # don't shade a fit band for a rejected/failed fit
 
-                #y =  gauss_model(x,bf[0],bf[1],bf[2],abs(bf[3]))-abs(bf[3])
-                simp_values[j] = simpson((-1)*(samples[j]-1), xtest)*1000 #integrates each sample data
-            else:
-                samp_ew[j] = 0
-                a_values[j] = 0
-                mu_values[j] = 0
-                sig_values[j] = 0
-                base_values[j] = 0
-                simp_values[j] = 0
-
-        best_bf = np.array([a_values[np.where(a_values!=0)].mean(),mu_values[np.where(mu_values!=0)].mean(),sig_values[np.where(sig_values!=0)].mean(),base_values[np.where(base_values!=0)].mean()])
-        fit_gauss = gauss_model(xtest,best_bf[0],best_bf[1],best_bf[2],best_bf[3])*(-1)+1
+        best_bf = bf
+        fit_gauss = gauss_model(xtest,best_bf[0],best_bf[1],best_bf[2],best_bf[3])*(-1)+norm
         #set values for line
 
         diff = (fit_gauss[only_line] - flat_wing[only_line])**2
         self.lines_gauss_Xsquare[i] = np.sum(diff)
 
-
-        #self.lines_gauss_Xsquare[i] = chisquare(fit_gauss[only_line], flat_wing[only_line])[0]
         self.lines_bf_params[i] = best_bf
-        if len(samp_ew[np.where(samp_ew==0)]) == len(samples):
-            self.lines_ew[i] = 0
-            self.lines_ew_err[i] = 0
+        self.lines_ew[i] = ew
+        self.lines_ew_err[i] = ew_err
+        if ew == 0:
             self.lines_ew_simp[i] = 0
-            self.lines_ew_simp_err[i] = 0
+            self.lines_ew_simp_err[i] = np.nan
         else:
-            self.lines_ew[i] = samp_ew[np.where(samp_ew!=0)].mean()
-            self.lines_ew_err[i] = samp_ew[np.where(samp_ew!=0)].std()
-            self.lines_ew_simp[i] = simp_values[np.where(simp_values!=0)].mean()
-            self.lines_ew_simp_err[i] = simp_values[np.where(simp_values!=0)].std()
+            #Simpson's-rule integration of the fitted (flattened) profile,
+            #as a cross-check on the Gaussian EW above -- a point estimate,
+            #not a resampled distribution, so it carries no error of its own
+            self.lines_ew_simp[i] = simpson(y_fit[only_line], xtest[only_line])*1000
+            self.lines_ew_simp_err[i] = np.nan
         print('line to measure:', ELEMENTS[self.lines_exd[i][0]],self.lines[i], '- Line found:', found_line)
         print('EW:',np.round(self.lines_ew[i],2),u"±",np.round(self.lines_ew_err[i],2), 'simps-int:', np.round(self.lines_ew_simp[i],2),u"±", np.round(self.lines_ew_simp_err[i],2))
 
@@ -819,15 +818,18 @@ class Spectrum_Data():
             fit_view.errorbar(measure_x_array,measure_y_array + ex_params[0],
                  yerr=2*temp_err_array/temp_pred_array,capsize=0,fmt='.', color = 'k', label = 'cont', zorder = 2)
             fit_view.scatter(measure_x_array[points_within_norm],measure_y_array[points_within_norm] + ex_params[0], s = 10, c='#4daf4a', zorder = 3, alpha = 0.8)
-            fit_view.fill_between(xtest,m_plot+2*np.sqrt(np.diag(C)),
-                     m_plot-2*np.sqrt(np.diag(C)),color='#999999',alpha=0.5)
             fit_view.plot([self.lines[i],self.lines[i]],[norm,norm*0.95], '--', color = 'k', alpha = 0.75)
             fit_view.plot([found_line,found_line],[norm,norm*0.95], '-', color='k')
             fit_view.plot([line_bound[0],line_bound[0]],[norm*1.025,norm*0.95], '--', color = '#e41a1c', alpha = 0.5)
             fit_view.plot([line_bound[1],line_bound[1]],[norm*1.025,norm*0.95], '--', color = '#e41a1c', alpha = 0.5)
             fit_view.annotate(str(self.lines[i]), xy = [self.lines[i], norm*1.025])
-            fit_view.plot(xtest, fit_gauss, '--', color = '#377eb8', lw= 2)
+            fit_view.plot(xtest, fit_gauss, '--', color = '#377eb8', lw= 2, label = 'Gaussian fit')
+            if pcov is not None:
+                model_err = gauss_model_err(xtest, best_bf, pcov)
+                fit_view.fill_between(xtest, fit_gauss-model_err, fit_gauss+model_err,
+                         color = '#377eb8', alpha = 0.25, zorder = 1, label = r'fit $\pm1\sigma$')
             fit_view.plot([xtest[0],xtest[-1]],[norm,norm], '--', color = '#4daf4a')
+            fit_view.legend(loc='best', fontsize=8)
 
             data_view = fig.add_subplot(122)
             data_view.grid()
@@ -862,7 +864,10 @@ class Spectrum_Data():
             if save_plot:
                 fig_title = ELEMENTS[self.lines_exd[i][0]] + '_' + str(self.lines[i]) + '_' + str(order) + '.pdf'
                 plt.savefig('line_plots/'+fig_title)
-            plt.show()
+            if show_plot:
+                plt.show()
+            else:
+                plt.close(fig)
 
             print('#-----------------------#')
 
@@ -874,6 +879,18 @@ class Spectrum_Data():
             print('extra params:',ex_params)
 
     def measure_all_ew(self, exclude_lines= [], plot_lines=[], ex_params = {}, window_size = 1.5, save_all = False):
+        """
+        Measure every loaded line's EW.
+
+        save_all=True additionally saves a per-line fit-quality plot (data,
+        best-fit Gaussian, +-1sigma shaded fit uncertainty) for EVERY line to
+        line_plots/<element>_<wavelength>_<order>.pdf -- use this to review
+        fit quality across a whole linelist. Those figures are built and
+        saved without being shown interactively (so hundreds of lines don't
+        block on hundreds of plot windows); list specific wavelengths in
+        plot_lines as well if you also want those shown live as they're
+        measured.
+        """
         if save_all:
             make_plots_folder()
 
@@ -896,7 +913,9 @@ class Spectrum_Data():
                         if self.lines[i] in ex_params.keys():
                             exp = ex_params[self.lines[i]]
                     if save_all:
-                        self.measure_ew(i,order, plot, exp, True, window_size)
+                        plot = True
+                        self.measure_ew(i,order, plot, exp, True, window_size,
+                                         show_plot=(self.lines[i] in plot_lines))
                     else:
                         self.measure_ew(i,order, plot, exp, False, window_size)
         #self.lines_bf_params = np.array(self.lines_bf_params)
