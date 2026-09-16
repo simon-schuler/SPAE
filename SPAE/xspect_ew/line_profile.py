@@ -124,7 +124,7 @@ def gfit_direct(x_array, y_array, y_err, mu, sigma, baseline):
         return None, None, p0
 
 
-def estimate_local_continuum(x, y, y_err, min_points=5, clip_sigma=3.0, ref_keep=None, ref_strict=False):
+def estimate_local_continuum(x, y, y_err, min_points=5, clip_sigma=3.0, ref_keep=None):
     """Robust local (flat) continuum level from a set of presumed-
     continuum points -- e.g. a line's wing, outside its own detected
     boundary -- instead of assuming the global normalization already put
@@ -160,23 +160,13 @@ def estimate_local_continuum(x, y, y_err, min_points=5, clip_sigma=3.0, ref_keep
         high-S/N reference spectrum, too shallow for THIS spectrum's own
         noise to catch via the median/MAD clip above) ANDed into the clip
         below rather than replacing it. None (default) leaves behavior
-        identical to not having a reference atlas at all.
-    ref_strict : if the atlas flags nearly everything in this candidate
-        set as non-continuum (fewer than min_points survive ref_keep
-        alone), ref_strict=True respects that as a real, atlas-driven
-        contamination verdict and lets this call fail outright (0., inf) --
-        appropriate for a caller with its own fallback if this one side
-        fails (e.g. estimate_local_continuum_sloped(), which just
-        disqualifies the slope and uses the flat estimate instead).
-        ref_strict=False (default) instead falls back to the median/MAD-
-        only clip in that situation, since THIS is usually the top-level
-        call with no further fallback of its own -- returning a usable,
-        if imperfect, number beats returning c0_err=inf and breaking the
-        measurement outright (confirmed on Fe I 5587.574 at a 2.5 A
-        window: an unusually densely line-blanketed stretch of solar
-        spectrum left the atlas with fewer than min_points "safe" points
-        in the ENTIRE wing, not just one side, so there was no fallback
-        estimate left to disqualify to).
+        identical to not having a reference atlas at all. If the atlas
+        flags nearly everything in the candidate set as non-continuum
+        (fewer than min_points survive ref_keep alone), that's respected
+        as a real, atlas-driven contamination verdict -- see the comment
+        at its use below for why this can (correctly) return a hard
+        failure (0., inf) rather than quietly falling back to the atlas-
+        unaware clip.
 
     Returns
     -------
@@ -197,18 +187,26 @@ def estimate_local_continuum(x, y, y_err, min_points=5, clip_sigma=3.0, ref_keep
     clip = max(mad, np.median(y_err))
     keep = y > (med - clip_sigma*clip)
     if ref_keep is not None:
-        if ref_strict and ref_keep.sum() < min_points:
+        if ref_keep.sum() < min_points:
             #the atlas itself found fewer than min_points points that look
             #like continuum ANYWHERE in this candidate set -- a real,
             #atlas-driven contamination verdict (confirmed on Fe I
-            #6220.776's blue wing: ref_keep was all-False there, correctly
-            #matching a window riddled with absorption almost everywhere),
-            #not noise from a marginal disagreement with the median/MAD
-            #clip below -- respect it rather than silently reverting to
-            #the atlas-unaware clip, which was overriding a unanimous,
-            #correct contamination verdict with contaminated data. Only
-            #for ref_strict callers, which have their own fallback if this
-            #returns a hard failure -- see ref_strict's docstring above.
+            #6220.776's blue wing and Fe II 5234.625's WHOLE window: both
+            #matched a window riddled with real, broad absorption -- the
+            #atlas's own flux tracks our data's shape closely there, it's
+            #not an atlas artifact), not noise from a marginal disagreement
+            #with the median/MAD clip below -- respect it rather than
+            #silently reverting to the atlas-unaware clip, which would
+            #override a unanimous, correct contamination verdict with
+            #contaminated data (confirmed: this was silently producing a
+            #biased-low continuum on 5234.625 before this fix). A caller
+            #with no usable continuum left here isn't being deprived of a
+            #fallback that would have helped -- it's being told the truth:
+            #this window doesn't have one. measure_ew()'s auto_widen retry
+            #already exists to try a wider window when that happens, and
+            #check_for_flags() already excludes a line whose error comes
+            #back too large as a result -- an honest large error beats a
+            #confident wrong number.
             keep = keep & ref_keep
         else:
             #the atlas DID find enough usable continuum somewhere in this
@@ -341,10 +339,10 @@ def estimate_local_continuum_sloped(x, y, y_err, x0, min_points=5, clip_sigma=3.
     ref_keep_red = ref_keep[red] if ref_keep is not None else None
     c0_b, err_b, keep_b = estimate_local_continuum(
         x[blue], y[blue], y_err[blue], min_points=min_points, clip_sigma=clip_sigma,
-        ref_keep=ref_keep_blue, ref_strict=True)
+        ref_keep=ref_keep_blue)
     c0_r, err_r, keep_r = estimate_local_continuum(
         x[red], y[red], y_err[red], min_points=min_points, clip_sigma=clip_sigma,
-        ref_keep=ref_keep_red, ref_strict=True)
+        ref_keep=ref_keep_red)
     diagnostics.update(n_blue=int(keep_b.sum()), n_red=int(keep_r.sum()),
                         c0_blue=c0_b, c0_blue_err=err_b, c0_red=c0_r, c0_red_err=err_r)
 
