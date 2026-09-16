@@ -17,7 +17,7 @@ from .line_profile import (get_line_window, gauss_model, gfit_direct, gauss_ew, 
 from .combine import make_line, parabolic_refine
 from .plotting import make_plots_folder
 from .readers import read_spectrum
-from .radial_velocity import measure_effective_rv, measure_rv_from_linelist, C_KMS
+from .radial_velocity import measure_effective_rv, measure_rv_ccf, C_KMS
 from .response_correction import apply_response_correction as _apply_response_correction
 from .overlap_check import check_order_overlaps as _check_order_overlaps
 from .overlap_check import flagged_overlap_ranges as _flagged_overlap_ranges
@@ -639,8 +639,8 @@ class Spectrum_Data():
         self.rv = (np.round(best_fit[0]*3e5,3), np.round(np.sqrt(np.diag(C))[1], 3))
 
     def apply_rv_shift(self, rv=None, lines=None, min_depth=0.02, verbose=False,
-                       cross_check=True, linelist_search_radius=1.0,
-                       linelist_min_significance=3.0, disagreement_kms=2.0):
+                       cross_check=True, ccf_v_min=-250.0, ccf_v_max=250.0, ccf_v_step=0.5,
+                       ccf_min_significance=5.0, disagreement_kms=2.0):
         """
         RECOMMENDED default for preparing a spectrum for EW measurement.
         Shift every order by a single effective radial velocity, applied
@@ -658,33 +658,54 @@ class Spectrum_Data():
         normalize_all() must be run first (uses normalized_flux to locate
         line centers).
 
-        RV_REFERENCE_LINES has two real weaknesses on its own: it can be
+        RV_REFERENCE_LINES has real weaknesses on its own: it can be
         entirely absent from a spectrum whose coverage happens to miss all
-        of Ca II H&K/Balmer/Mg b/Na D, and even when present, mixing
-        Balmer lines with metal lines in one average can be actively
-        wrong, not just imprecise -- confirmed on real data, the two
-        families disagreed by ~10 km/s (a real difference in line
-        formation physics between H and metal lines, which naive sigma-
-        clipping over only 3-4 lines has no way to separate from genuine
-        measurement noise). If a science linelist is already loaded
-        (self.lines, via load_lines()), this now also measures an
-        independent RV from it (radial_velocity.measure_rv_from_linelist(),
-        which reuses identify_lines()'s own detection-based centering --
-        see its docstring) and uses it as follows: as the ONLY estimate if
-        RV_REFERENCE_LINES found nothing usable at all; as a preferred
-        replacement if the two estimates disagree by more than
-        `disagreement_kms` (averaging over dozens of real linelist lines
-        is more robust than 3-4 mixed-species reference lines); otherwise
-        the (cheaper, already-computed) named-line RV is kept and the
-        linelist estimate serves only as a passive cross-check. Call
-        load_lines() before this if you want that cross-check available;
-        it's a silent no-op (identical to the old behavior) if no linelist
-        is loaded yet.
+        of Ca II H&K/Balmer/Mg b/Na D, mixing Balmer lines with metal
+        lines in one average can be actively wrong (confirmed on real
+        data, the two families disagreed by ~10 km/s -- a real difference
+        in line formation physics, not just noise), and even a single
+        named line's own per-line search window can contain more than one
+        comparably strong absorption feature in a densely-blended region,
+        letting an unweighted Gaussian fit lock onto the wrong one --
+        confirmed on a real, genuinely high-velocity star (HD_10383, true
+        RV ~+107 km/s): only 2 of 10 reference lines were usable at all,
+        and those 2 disagreed with EACH OTHER by ~51 km/s.
+
+        If a science linelist is already loaded (self.lines, via
+        load_lines()), this also cross-checks against
+        radial_velocity.measure_rv_ccf() -- a cross-correlation against
+        the WHOLE linelist (typically dozens of lines) rather than a
+        handful of named ones, searched over a wide, continuous velocity
+        grid rather than a small per-line Angstrom window. This is used
+        as the ONLY estimate if RV_REFERENCE_LINES found nothing usable,
+        and PREFERRED over the named-line estimate whenever its
+        significance clears `ccf_min_significance` (confirmed on real
+        data: correctly recovers both a genuinely large shift the named-
+        line method got badly wrong, HD_10383 at ~+107 km/s, and a small,
+        already-well-known shift, the Sun at ~-2.6 km/s, from the exact
+        same 78-line solar linelist with no per-target tuning -- see
+        measure_rv_ccf()'s own docstring for the full validation and why
+        it structurally can't hit either failure mode above). An earlier
+        version of this cross-check (measure_rv_from_linelist(), still
+        available but no longer used here) used a small per-line search
+        radius for the same purpose; confirmed on the same HD_10383 case
+        that this has its own hard ceiling on the shift it can ever find
+        (set by the radius, translated through c/lambda) and silently
+        locks onto an unrelated nearby feature instead of failing loudly
+        once a real shift exceeds it. Call load_lines() before this if
+        you want the cross-check available; it's a silent no-op
+        (identical to the old behavior) if no linelist is loaded yet.
 
         Parameters
         ----------
         rv : float, km/s, optional -- apply this RV directly and skip line
-            measurement (e.g. if the RV is already known from elsewhere).
+            measurement (e.g. if the RV is already known from elsewhere,
+            or confirmed independently -- see measure_rv_ccf()'s docstring
+            for why HD_10383 needed this: a wide, unweighted, symmetric
+            search window can flip a correct measurement to the wrong
+            sign when a second strong feature falls within it, so a
+            manual, corroborated check across >1 independent line is
+            worth doing before trusting any automated value blindly).
         lines : {name: (rest_wavelength, window)}, optional -- defaults to
             radial_velocity.RV_REFERENCE_LINES.
         min_depth : float -- minimum line depth (in normalized flux) to
@@ -693,10 +714,17 @@ class Spectrum_Data():
             and the cross-check outcome.
         cross_check : bool -- if False, use RV_REFERENCE_LINES only, same
             as before this parameter existed.
-        linelist_search_radius, linelist_min_significance : passed to
-            measure_rv_from_linelist() as search_radius/min_significance.
-        disagreement_kms : how far the two estimates must differ before
-            the linelist-based one is preferred over the named-line one.
+        ccf_v_min, ccf_v_max, ccf_v_step : passed to measure_rv_ccf() as
+            v_min/v_max/v_step -- the trial velocity grid searched.
+        ccf_min_significance : minimum measure_rv_ccf() peak significance
+            to trust/prefer it at all (default 5.0 -- both real validation
+            cases scored 17-20, comfortable margin above this floor;
+            below it, the CCF found no clean peak, e.g. too few of this
+            linelist's lines actually present/detectable in this target).
+        disagreement_kms : how far the named-line and CCF estimates must
+            differ before printing a note about it (verbose only -- purely
+            diagnostic now, doesn't affect which estimate is used; see
+            ccf_min_significance for that).
 
         Returns
         -------
@@ -705,42 +733,63 @@ class Spectrum_Data():
         if rv is None:
             measured_rv, rv_err, used = measure_effective_rv(self, lines=lines, min_depth=min_depth)
 
-            linelist_rv, linelist_rv_err, linelist_n = None, None, 0
+            ccf_rv, ccf_significance = None, None
             if cross_check and self.lines is not None and len(self.lines) > 0:
-                linelist_rv, linelist_rv_err, linelist_n = measure_rv_from_linelist(
-                    self.lines, self.wavelength, self.normalized_flux, self.obs_err, self.pred_all,
-                    search_radius=linelist_search_radius, min_significance=linelist_min_significance)
+                ccf_rv, ccf_significance, _, _ = measure_rv_ccf(
+                    self.lines, self.wavelength, self.normalized_flux,
+                    v_min=ccf_v_min, v_max=ccf_v_max, v_step=ccf_v_step)
+            ccf_usable = ccf_rv is not None and ccf_significance >= ccf_min_significance
 
-            if measured_rv is None and linelist_rv is None:
+            if measured_rv is None and not ccf_usable:
                 raise ValueError(
                     "Could not measure an effective RV -- none of the reference "
                     "lines were found/usable in this spectrum's wavelength "
-                    "coverage, and no usable linelist-based fallback was "
-                    "available either (load_lines() first to enable that, or "
-                    "pass rv= directly).")
-            elif measured_rv is None:
+                    "coverage, and the linelist-based cross-correlation (if a "
+                    "linelist was even loaded) found no significant peak either "
+                    "(load_lines() first to enable that, or pass rv= directly).")
+
+            if verbose and measured_rv is not None:
+                print(f"Named-line RV = {measured_rv:.3f} +/- {rv_err:.3f} km/s, "
+                      f"from {len(used)} line(s):")
+                for name, restw, order, v in used:
+                    print(f"  {name} ({restw} A, order {order}): v={v:.3f} km/s")
+            disagreement = (abs(measured_rv - ccf_rv)
+                             if (measured_rv is not None and ccf_rv is not None) else None)
+            if verbose and ccf_rv is not None:
+                trust_note = "" if ccf_usable else f" (below ccf_min_significance={ccf_min_significance}, not used)"
+                print(f"Linelist cross-correlation RV = {ccf_rv:.3f} km/s "
+                      f"(significance={ccf_significance:.1f}){trust_note}")
+            if verbose and disagreement is not None and disagreement > disagreement_kms:
+                print(f"NOTE: named-line and cross-correlation RVs disagree by "
+                      f"{disagreement:.3f} km/s (> {disagreement_kms}) -- likely "
+                      f"the named-line fit locked onto a competing nearby feature "
+                      f"(see measure_rv_ccf()'s docstring for a real confirmed case).")
+
+            if ccf_usable:
+                #preferred whenever it clears the significance floor, whether
+                #or not it agrees with the named-line estimate -- confirmed
+                #more robust in both directions on real data (see docstring)
                 if verbose:
-                    print(f"No usable RV_REFERENCE_LINES; falling back to linelist-based RV = "
-                          f"{linelist_rv:.3f} +/- {linelist_rv_err:.3f} km/s from {linelist_n} line(s).")
-                measured_rv, rv_err = linelist_rv, linelist_rv_err
-            else:
-                if verbose:
-                    print(f"Effective RV = {measured_rv:.3f} +/- {rv_err:.3f} km/s, "
-                          f"from {len(used)} line(s):")
-                    for name, restw, order, v in used:
-                        print(f"  {name} ({restw} A, order {order}): v={v:.3f} km/s")
-                if linelist_rv is not None:
-                    disagreement = abs(measured_rv - linelist_rv)
-                    if disagreement > disagreement_kms:
-                        if verbose:
-                            print(f"WARNING: named-line RV ({measured_rv:.3f} km/s) and linelist RV "
-                                  f"({linelist_rv:.3f} +/- {linelist_rv_err:.3f} km/s, {linelist_n} lines) "
-                                  f"disagree by {disagreement:.3f} km/s (> {disagreement_kms}) -- "
-                                  f"preferring the linelist RV as the more robust (larger-N) estimate.")
-                        measured_rv, rv_err = linelist_rv, linelist_rv_err
-                    elif verbose:
-                        print(f"Linelist cross-check OK: {linelist_rv:.3f} +/- {linelist_rv_err:.3f} km/s "
-                              f"from {linelist_n} line(s), within {disagreement_kms} km/s of the named-line RV.")
+                    print("-> using the cross-correlation RV.")
+                #measure_rv_ccf() doesn't (yet) produce a formal statistical
+                #error the way the per-line Gaussian fits do. Reuse the
+                #named-line estimate's error as a rough stand-in ONLY when
+                #the two estimates actually agree -- a disagreement is
+                #itself evidence the named-line fit (and, by extension, its
+                #own error bar) isn't trustworthy here: confirmed on
+                #HD_10383, whose named-line point estimate was ~53 km/s off,
+                #so its formal 18.2 km/s error is not a meaningful precision
+                #floor for the CCF value being adopted instead. Falls back
+                #to a fixed placeholder otherwise, sized to both real
+                #validation cases' actual method-to-method scatter (~1-2
+                #km/s) rather than either 0 (false precision) or the
+                #discredited named-line error (false confidence the wrong
+                #way).
+                trustworthy_error = (measured_rv is not None and disagreement is not None
+                                      and disagreement <= disagreement_kms)
+                measured_rv, rv_err = ccf_rv, (rv_err if trustworthy_error else 1.5)
+            elif verbose:
+                print("-> using the named-line RV.")
 
             self.rv = (round(measured_rv, 3), round(rv_err, 3))
             rv = measured_rv

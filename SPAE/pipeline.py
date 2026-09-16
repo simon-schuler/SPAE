@@ -31,7 +31,7 @@ from .analysis import analyze_run, summarize
 
 def measure_star_ew(spectrum_path, linelist_path, output_dir, reference_atlas_path=None,
                      resolving_power=None, window_size=1.5, review=False, save_plots=None,
-                     doc_title='STARNAME, PROJECT, YEAR; ', **measure_kwargs):
+                     rv=None, doc_title='STARNAME, PROJECT, YEAR; ', **measure_kwargs):
     """Stage 1: measure every line's EW for one star and write the final
     MOOG-format linelist, either unattended or with a human review pass.
 
@@ -50,6 +50,20 @@ def measure_star_ew(spectrum_path, linelist_path, output_dir, reference_atlas_pa
     reference_atlas_path : str or None -- see Spectrum_Data.
         load_reference_atlas(); only meaningful for a target this
         actually has a matching high-S/N reference for (so far: the Sun)
+    rv : float, km/s, optional -- apply this RV directly instead of
+        measuring one (see Spectrum_Data.apply_rv_shift()'s own `rv`
+        parameter). Use this when the automated determination is known to
+        be wrong -- confirmed on a real case (HD_10383): both the named-
+        reference-line estimate (52.3 km/s, from only 2 disagreeing Balmer
+        lines) and the linelist cross-check (0.8 km/s) were wrong: the
+        true RV, confirmed independently from two unrelated strong,
+        unambiguous lines (H-alpha and Mg b1, agreeing to ~2 km/s) was
+        ~+107 km/s. A third candidate, Na D1, looked plausible in
+        isolation but was almost certainly interstellar contamination,
+        not the star's own photospheric line -- worth checking directly
+        (e.g. plotting a wide window around a few strong lines) rather
+        than trusting either the automated value or a single manual line
+        without corroboration, before overriding with an rv= here.
     review : bool -- False (default): fully automated, no prompts.
         True: after measuring, pause and show each flagged line's plot
         and reason(s) one at a time, and ask whether to keep it anyway
@@ -77,8 +91,17 @@ def measure_star_ew(spectrum_path, linelist_path, output_dir, reference_atlas_pa
 
     spec = Spectrum_Data(spectrum_path)
     spec.normalize_all()
-    spec.apply_rv_shift()
+    #load_lines() BEFORE apply_rv_shift(): apply_rv_shift()'s own docstring
+    #says calling it in this order lets it cross-check the (few, sometimes
+    #mixed-Balmer/metal) named-reference-line RV against a linelist-based
+    #RV averaged over the whole science linelist -- confirmed to matter on
+    #a real case (HD_10383): only 2 usable reference lines, both Balmer,
+    #disagreeing with EACH OTHER by ~51 km/s (78.0 vs 26.5 km/s), giving an
+    #effective RV of just 52.3+/-18.2 km/s with no cross-check at all in
+    #the old (wrong) order, since self.lines was still None at this point
     spec.load_lines(linelist_path)
+    spec.apply_rv_shift(rv=rv, verbose=True)
+    print(f'applied RV: {spec.rv[0]} +/- {spec.rv[1]} km/s')
     if reference_atlas_path is not None:
         spec.load_reference_atlas(reference_atlas_path, resolving_power=resolving_power)
 
