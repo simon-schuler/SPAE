@@ -946,7 +946,7 @@ class Spectrum_Data():
                       'explicitly instead. Reference atlas NOT loaded.')
                 self.ref_wave, self.ref_flux = None, None
 
-    def measure_ew(self, i, order, plot = False, ex_params = [0,0,0,0], save_plot = False, window_size = 1.5, show_plot = True, fit_continuum = True):
+    def measure_ew(self, i, order, plot = False, ex_params = [0,0,0,0], save_plot = False, window_size = 1.5, show_plot = True, fit_continuum = True, auto_widen = True, widen_window_size = 2.5):
         #extra parameters [0] - shift continuum
         #                 [1] - left boundary in Angstroms
         #                 [2] - right boundary in Angstroms
@@ -960,6 +960,11 @@ class Spectrum_Data():
         #continuum exactly at norm -- fixes fits biased by imperfect
         #normalization. Set False to fall back to the old fixed-
         #continuum-at-norm behavior.
+        #auto_widen: automatically retry once with widen_window_size if
+        #this line's fit quality is poor at window_size -- see the retry
+        #check below, right after ew/ew_err are finalized, for exactly
+        #what "poor" means and why. Sits on top of fit_continuum=True;
+        #has no effect when fit_continuum=False.
         norm = 1.0
         wind, found_line, line_bound,dy = get_line_window(self.lines[i],self.shifted_wavelength[order],self.normalized_flux[order],ex_params[1],ex_params[2],ex_params[3], window_size)
 
@@ -1130,6 +1135,27 @@ class Spectrum_Data():
             ew_err = 0.
             pcov = None  # don't shade a fit band for a rejected/failed fit
 
+        #Automated quality-triggered retry: an outright failed fit, or a
+        #>10% relative EW error (the same threshold check_for_flags() uses
+        #downstream) usually means this window's wing didn't leave enough
+        #clean, uncontaminated points to trust -- confirmed on Fe I
+        #5579.335: a strong neighbor ~0.6 A away left only 6 points to
+        #constrain a 4-parameter Gaussian, EW error 25 mA on a 10 mA line,
+        #and simply widening the window to 2.5 A (bringing in real clean
+        #continuum further out, since the neighbor's own core was already
+        #fully inside the 1.5 A window, not truncated at its edge) fixed
+        #it: error dropped to 0.65 mA with an unchanged central value.
+        #auto_widen=False on the recursive call below is what stops this
+        #at a single retry rather than an unbounded escalation.
+        quality_failed = (ew == 0) or (ew_err >= 0.1*ew)
+        if auto_widen and fit_continuum and quality_failed and window_size < widen_window_size:
+            print(f'line {self.lines[i]}: EW {ew:.2f}+/-{ew_err:.2f} at window_size='
+                  f'{window_size} looks unreliable -- retrying with window_size='
+                  f'{widen_window_size}')
+            self.measure_ew(i, order, plot, ex_params, save_plot, widen_window_size,
+                             show_plot, fit_continuum, auto_widen=False)
+            return
+
         best_bf = bf
         #predicted real flux = norm - (line dip + local continuum offset)
         fit_gauss = norm - (gauss_model(xtest, *best_bf) + cont_offset)
@@ -1230,7 +1256,7 @@ class Spectrum_Data():
             self.lines_exp[i] = np.array(ex_params)
             print('extra params:',ex_params)
 
-    def measure_all_ew(self, exclude_lines= [], plot_lines=[], ex_params = {}, window_size = 1.5, save_all = False, fit_continuum = True):
+    def measure_all_ew(self, exclude_lines= [], plot_lines=[], ex_params = {}, window_size = 1.5, save_all = False, fit_continuum = True, auto_widen = True, widen_window_size = 2.5):
         """
         Measure every loaded line's EW.
 
@@ -1245,6 +1271,11 @@ class Spectrum_Data():
 
         fit_continuum=True (default) corrects for imperfect global
         continuum normalization per-line -- see measure_ew()'s docstring.
+
+        auto_widen=True (default) automatically retries a line once at
+        widen_window_size if it comes out of window_size looking
+        unreliable -- see measure_ew()'s docstring for exactly what
+        triggers a retry. No effect when fit_continuum=False.
         """
         if save_all:
             make_plots_folder()
@@ -1268,12 +1299,14 @@ class Spectrum_Data():
                     if save_all:
                         plot = True
                         self.measure_ew(i,order, plot, exp, True, window_size,
-                                         show_plot=(self.lines[i] in plot_lines), fit_continuum=fit_continuum)
+                                         show_plot=(self.lines[i] in plot_lines), fit_continuum=fit_continuum,
+                                         auto_widen=auto_widen, widen_window_size=widen_window_size)
                     else:
-                        self.measure_ew(i,order, plot, exp, False, window_size, fit_continuum=fit_continuum)
+                        self.measure_ew(i,order, plot, exp, False, window_size, fit_continuum=fit_continuum,
+                                         auto_widen=auto_widen, widen_window_size=widen_window_size)
         #self.lines_bf_params = np.array(self.lines_bf_params)
 
-    def measure_line_ew(self,line,ex_params=[0,0,0,0], save_line = False, save_plot = False, window_size = 1.5, fit_continuum = True):
+    def measure_line_ew(self,line,ex_params=[0,0,0,0], save_line = False, save_plot = False, window_size = 1.5, fit_continuum = True, auto_widen = True, widen_window_size = 2.5):
         if save_plot:
             make_plots_folder()
         i = np.where(self.lines == line)[0][0]
@@ -1286,7 +1319,8 @@ class Spectrum_Data():
                     self.lines_bf_params[i] = None
                     self.lines_ew_err[i] = np.nan
                     #self.lines_check_flag[i] = False
-                    self.measure_ew(i,order, True, ex_params, save_plot, window_size, fit_continuum=fit_continuum)
+                    self.measure_ew(i,order, True, ex_params, save_plot, window_size, fit_continuum=fit_continuum,
+                                    auto_widen=auto_widen, widen_window_size=widen_window_size)
                     found = True
                     if save_line:
                         with open('line_'+str(line)+'.txt','w') as f:
