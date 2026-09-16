@@ -556,11 +556,11 @@ Once the continuum-fitting work in §6-9.5 reached a stable state, work
 shifted to the NEXT pipeline stage: locating each linelist entry in the
 spectrum (line identification), as a distinct step prior to and
 decoupled from EW measurement (which was, at this point, being
-developed independently/in parallel by a collaborator) — see §13 for
-the identification algorithm itself and §14 for what this work
+developed independently/in parallel by a collaborator) — see §12 for
+the identification algorithm itself and §13 for what this work
 surfaced in wavelength-shift correction, including a significant,
 pre-existing sign bug in `apply_rv_shift()` found via direct,
-absolute-wavelength validation of the new identification step (§14.3).
+absolute-wavelength validation of the new identification step (§13.3).
 
 ## 10. Known, deliberately out-of-scope limitations
 
@@ -690,11 +690,11 @@ unjustified absolute threshold.
 full linelist coverage; real GRACES target; the same 78-line Fe
 linelist used throughout this package's history):
 - Keck: 78/78 lines detected, 0 blend flags (after the wavelength-
-  shift sign fix in §14.3 — see there for the dramatically worse
+  shift sign fix in §13.3 — see there for the dramatically worse
   numbers beforehand, which is how that bug was found).
 - GRACES: 78/78 lines detected, 0 blend flags.
 - Position precision (Keck, wide-search residual after RV correction):
-  RMS 14.6-26 mA depending on which named-line RV was used (§14.2),
+  RMS 14.6-26 mA depending on which named-line RV was used (§13.2),
   matching or beating this package's previously-established real-data
   precision benchmark (37 mA RMS, §3).
 - A real, spot-checked case (GRACES, Fe I 6716.222 Å, order 12) showed
@@ -1064,7 +1064,83 @@ near the position-tolerance boundary. Left as a known open item for the
 EW-measurement phase (independently developed -- see §12's decoupling
 note), not a bug in this module.
 
-## 14. Commit reference
+## 14. Line-identification S/N floor (synthetic sweep)
+
+Motivation: MAROON-X's much lower real detection rate (§13.4-13.6)
+raised a broader, forward-looking question -- what is this package's
+own FUNCTIONAL S/N limit for line identification, independent of any
+one real spectrum's particular quirks? Split deliberately into two
+separate studies matching this module's own decoupling from EW
+measurement (§12): this section characterizes IDENTIFICATION only; an
+EW-measurement-stage characterization is deferred until that
+(independently developed) code is available.
+
+**Method**: start from real Keck data (`sunr.fits`, 53/78 linelist
+lines covered), not a fully synthetic spectrum, so real line
+shapes/blends/continuum shape are preserved and only the noise is
+synthetic. For each target relative photon error, add zero-mean
+Gaussian noise to the RAW (pre-normalization) counts with variance
+`max(0, target^2*flux^2 - flux)` -- i.e. exactly enough, in quadrature
+with the existing native Poisson noise, to bring the TOTAL relative
+error to the target value -- and override `obs_err` to the same target
+exactly (`target * flux`), rather than re-deriving it from the noisy
+flux. This isolates "how does identification degrade with true S/N"
+from "does the code correctly know its own noise level", which was
+already investigated separately (§6.7, §13.4's units bug). The full
+realistic pipeline (`normalize_all -> load_lines -> apply_rv_shift ->
+identify_lines`) is re-run at each level, so continuum-fitting quality
+degrades too, matching how a genuinely fainter real exposure behaves.
+5 independent noise seeds per level; detection rate measured against
+only the 53 lines this file can ever cover (not all 78).
+
+**Result** (detection rate = mean +/- std over 5 seeds; see
+`Verification/xspect/sn_sweep_identification.png`):
+
+| target rel. error | S/N (~1/err) | detection rate | med \|offset\| |
+|---|---|---|---|
+| 0.29% (Keck native) | 349 | 100.0% | 22.1 mA |
+| 0.56% (GRACES-like) | 180 | 100.0% | 20.9 mA |
+| 2.14% (MAROON-X's old, order-median figure) | 47 | 99.6 +/- 0.8% | 21.7 mA |
+| 3% | 33 | 96.2 +/- 2.4% | 21.8 mA |
+| 4% | 25 | 93.2 +/- 0.9% | 22.8 mA |
+| 6% | 17 | 87.2 +/- 1.4% | 22.8 mA |
+| 8% | 12.5 | 81.5 +/- 2.2% | 23.2 mA |
+| 10% | 10 | 78.1 +/- 3.3% | 24.3 mA |
+| 15% | 6.7 | 69.1 +/- 2.6% | 26.5 mA |
+| 20% | 5 | 59.2 +/- 1.9% | 28.5 mA |
+| 25% | 4 | 50.6 +/- 6.6% | 28.7 mA |
+| 30% | 3.3 | 43.0 +/- 6.5% | 25.9 mA |
+| 40% | 2.5 | 37.0 +/- 4.4% | 24.9 mA |
+| 50% | 2 | 35.5 +/- 6.2% | 34.7 mA |
+
+**Conclusion**: the identification ALGORITHM's own degradation is
+smooth and graceful, not a cliff -- detection rate is still ~99.6% at a
+relative error matching MAROON-X's real (old, order-median) noise
+figure, and only crosses 50% around a ~25% relative error (S/N ~4),
+flattening to an asymptotic floor around 35% (the population of very
+strong lines that survive almost any noise level). This threshold is
+more than an order of magnitude worse than the noisiest real instrument
+used anywhere in this project (MAROON-X's real per-line local relative
+error is ~0.59%, confirmed in §13.6 -- essentially indistinguishable
+from GRACES's 0.56%). **This confirms directly, not just by inference,
+that MAROON-X's real 12/78 detection rate is NOT an identification-
+algorithm S/N limitation**: a spectrum with MAROON-X's actual per-line
+noise level, if it had Keck-like (narrow, un-broadened) line profiles,
+would be expected to detect ~99.6% of lines, not ~15%. Combined with
+§13.6's rotational-broadening hypothesis (this is a moving-group target
+likely to be a faster rotator than the Sun even with otherwise
+solar-like Teff/logg/[Fe/H], per the user), the remaining MAROON-X gap
+is best attributed to a genuine property of that specific star, not a
+package limitation -- consistent with the user's decision to keep this
+spectrum in the analysis sample rather than exclude it, since its
+independently-derived stellar parameters will allow a direct check once
+the full SPAE pipeline (EW measurement through abundances) is run on it.
+
+A parallel EW-measurement-stage S/N characterization is deferred until
+that (separately developed) code is available, per the user's original
+two-step framing of this question.
+
+## 15. Commit reference
 
 | Commit | Summary |
 |---|---|
