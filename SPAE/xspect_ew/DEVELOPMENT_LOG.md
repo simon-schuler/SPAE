@@ -1046,6 +1046,24 @@ remains correctly rejected throughout. All final MAROON-X detections
 now have plausible significance-to-catalogued-strength ratios and
 `|offset| <= 0.067` Å.
 
+**One remaining MAROON-X case flagged for later, not fixed here**: Fe I
+5546.991 Å (order 19, 6.0σ, offset +0.034 Å) looks like a real, clean,
+isolated dip -- returns fully to baseline on both sides, no cross-order
+disagreement, no order-edge or window-truncation signature, and the
+AsLS continuum fit through this region is smooth with no ringing near
+the huge unrelated line 0.5 Å redward. But it's shallower (~5-6%) than
+naively expected for a 27.7 mA line at this resolution, and the user
+noted the region is noisy enough that a cosmic ray may have hit the
+center pixel, distorting the profile. Deliberately left as detected
+(not enough here to justify rejecting a statistically legitimate,
+isolated 6σ candidate): the user's assessment is that this class of
+problem -- a single bad pixel inside an otherwise real line -- is
+better addressed with an explicit cosmic-ray/outlier check at the EW
+MEASUREMENT step, not by making identification itself more skeptical
+near the position-tolerance boundary. Left as a known open item for the
+EW-measurement phase (independently developed -- see §12's decoupling
+note), not a bug in this module.
+
 ## 14. Commit reference
 
 | Commit | Summary |
