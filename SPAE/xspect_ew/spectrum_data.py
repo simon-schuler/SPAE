@@ -157,6 +157,15 @@ class Spectrum_Data():
         #flagged. Set by check_for_flags(); make_ew_doc() uses this to
         #explain why a line was routed to the flagged-lines file.
         self.lines_flag_reasons = None
+        #line - True if a human reviewer explicitly decided to keep this
+        #line despite check_for_flags() otherwise flagging it (see
+        #pipeline.py's interactive review step). check_for_flags() always
+        #recomputes lines_check_flag from scratch on every call, including
+        #the one make_ew_doc() makes internally -- this is the one piece
+        #of per-line state that check_for_flags() itself won't overwrite,
+        #so a review decision actually survives to the final output
+        #instead of being silently recomputed away.
+        self.lines_human_keep = None
         #wavelength ranges where two orders' overlap disagreed badly
         #enough to distrust either one there -- set by
         #flag_order_overlaps(), consulted by check_for_flags(). Empty
@@ -781,6 +790,7 @@ class Spectrum_Data():
         self.lines_found_position = np.array([np.nan]*len(self.lines))
         self.lines_check_flag = np.array([False]*len(self.lines))
         self.lines_flag_reasons = np.array(['']*len(self.lines), dtype=object)
+        self.lines_human_keep = np.array([False]*len(self.lines))
         #identify_lines() results -- a separate, prior step from EW
         #measurement (see line_identification.py's module docstring);
         #all default to "not run yet", distinct from lines_found_position
@@ -900,6 +910,13 @@ class Spectrum_Data():
                 current_line = "{0:14s}{1:11s}{2:8s}{3:15s}{4:17s}{5:10s}{6:5s}\n".format(wave,elmnt,ep,gf,rad,ew,err)
                 if self.lines_check_flag[i]:
                     flagged_doc.write(current_line.rstrip('\n') + '   # ' + self.lines_flag_reasons[i] + '\n')
+                elif self.lines_human_keep[i] and self.lines_flag_reasons[i]:
+                    #kept in the main linelist by an explicit human review
+                    #decision, not because nothing looked wrong -- note why
+                    #it would otherwise have been flagged, so this isn't
+                    #silently indistinguishable from an uncontroversial line
+                    doc.write(current_line.rstrip('\n') + '   # human-reviewed, kept despite: '
+                              + self.lines_flag_reasons[i] + '\n')
                 else:
                     doc.write(current_line)
             else:
@@ -1511,6 +1528,12 @@ class Spectrum_Data():
                     print(self.lines[i], 'identified as blended -- a competing candidate '
                           'sits close enough to be comparably significant')
             self.lines_flag_reasons[i] = '; '.join(reasons)
+            #a human reviewer's explicit "keep it anyway" (see pipeline.py)
+            #overrides every check above -- reasons/lines_flag_reasons stay
+            #populated either way, so make_ew_doc() can still note WHY this
+            #line needed a human decision even though it ends up kept
+            if self.lines_human_keep[i]:
+                self.lines_check_flag[i] = False
 
     def check_spectra(self, norm=True, lines=False):
         orders = len(self.wavelength)
