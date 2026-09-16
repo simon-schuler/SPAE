@@ -30,7 +30,7 @@ from .analysis import analyze_run, summarize
 
 
 def measure_star_ew(spectrum_path, linelist_path, output_dir, reference_atlas_path=None,
-                     resolving_power=None, window_size=1.5, review=False,
+                     resolving_power=None, window_size=1.5, review=False, save_plots=None,
                      doc_title='STARNAME, PROJECT, YEAR; ', **measure_kwargs):
     """Stage 1: measure every line's EW for one star and write the final
     MOOG-format linelist, either unattended or with a human review pass.
@@ -43,10 +43,10 @@ def measure_star_ew(spectrum_path, linelist_path, output_dir, reference_atlas_pa
     output_dir : str -- created if it doesn't exist; holds
         linelist_with_ew.txt (main output), linelist_with_ew_flagged.txt
         (untrustworthy lines, for review, not automatic use), and --
-        only when review=True -- line_plots/ (this function chdir()s
-        there for the run so measure_all_ew(save_all=True)'s relative
-        line_plots/ output lands inside output_dir rather than wherever
-        the caller happened to be)
+        whenever save_plots ends up True -- line_plots/ (this function
+        chdir()s there for the run so measure_all_ew(save_all=True)'s
+        relative line_plots/ output lands inside output_dir rather than
+        wherever the caller happened to be)
     reference_atlas_path : str or None -- see Spectrum_Data.
         load_reference_atlas(); only meaningful for a target this
         actually has a matching high-S/N reference for (so far: the Sun)
@@ -54,6 +54,12 @@ def measure_star_ew(spectrum_path, linelist_path, output_dir, reference_atlas_pa
         True: after measuring, pause and show each flagged line's plot
         and reason(s) one at a time, and ask whether to keep it anyway
         (see _review_flagged_lines())
+    save_plots : bool or None -- whether to save every line's QC plot to
+        output_dir/line_plots/, independent of review (a fully automated
+        run can still want a full plot audit trail, e.g. for later
+        manual spot-checking). None (default) follows review, i.e. the
+        previous all-or-nothing behavior; pass True/False explicitly to
+        decouple the two.
     **measure_kwargs : forwarded to measure_all_ew() (e.g. exclude_lines,
         fit_continuum, auto_widen, widen_window_size, slope_sig_thresh)
 
@@ -62,6 +68,9 @@ def measure_star_ew(spectrum_path, linelist_path, output_dir, reference_atlas_pa
     ew_path, flagged_path : str -- the two output file paths
     spec : the Spectrum_Data instance, for any further inspection
     """
+    if save_plots is None:
+        save_plots = review
+
     os.makedirs(output_dir, exist_ok=True)
     ew_path = os.path.join(output_dir, 'linelist_with_ew.txt')
     flagged_path = os.path.join(output_dir, 'linelist_with_ew_flagged.txt')
@@ -73,10 +82,9 @@ def measure_star_ew(spectrum_path, linelist_path, output_dir, reference_atlas_pa
     if reference_atlas_path is not None:
         spec.load_reference_atlas(reference_atlas_path, resolving_power=resolving_power)
 
-    if review:
+    if save_plots:
         #save_all=True is what produces line_plots/<element>_<wave>_
-        #<order>.pdf for every line -- needed so the reviewer has
-        #something to look at below, not just the printed reason
+        #<order>.pdf for every line
         cwd = os.getcwd()
         os.chdir(output_dir)
         try:
