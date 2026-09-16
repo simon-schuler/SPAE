@@ -27,6 +27,7 @@ format without editing this file at all.
 
 import numpy as np
 from astropy.io import fits
+from scipy.ndimage import median_filter
 
 
 class SpectrumFormatError(Exception):
@@ -86,6 +87,98 @@ def _read_graces(hdul, **kwargs):
         mask = order_row == o
         wavelength[i] = wave_row[mask].astype(float) * 10.0  # nm -> Angstrom
         flux[i] = flux_row[mask].astype(float)
+    return wavelength, flux, None
+
+
+# ---------------------------------------------------------------------------
+# FITS: GRACES / CFHT OPERA pipeline -- merged "intensity" (.i) format
+# ---------------------------------------------------------------------------
+# A different OPERA output variant from the per-order "spectrum" (.m) format
+# above -- confirmed against a real file: no 'Order' column at all, every
+# echelle order already merged into one continuous ~194000-point array. The
+# file offers FOUR wavelength/intensity/errorbar column triplets (COL1-3,
+# 4-6, 7-9, 10-12) -- Normalized/UnNormalized crossed with autowave-
+# corrected/uncorrected -- distinguished only by each COLn's header COMMENT
+# (e.g. "UnNormalized, no autowave correction"), since the VALUES are
+# identical repeated 'Wavelength'/'Intensity'/'ErrorBar' labels. Per this
+# module's "prefer raw/uncorrected" design principle, always uses the
+# UnNormalized, no-autowave-correction triplet -- found by matching each
+# triplet's comment text, not a hardcoded column position, in case a future
+# file orders these differently.
+#
+# Since there's no Order column, orders are recovered by detecting
+# wavelength BOUNDARIES -- the less-robust heuristic the .m reader above
+# deliberately avoids in favor of its explicit Order column, used here only
+# because this format gives us nothing better. A boundary is either a
+# negative jump (adjacent orders OVERLAP, common at bluer wavelengths --
+# confirmed: -2.7 to -3.7 A against a normal ~0.0026 A point spacing, three
+# orders of magnitude of contrast) OR an abnormally large POSITIVE jump
+# relative to the local point spacing (adjacent orders have a real
+# wavelength GAP instead, confirmed to be how redder orders behave in a
+# real file -- coverage stops overlapping past ~820 nm, so a negative-jump-
+# only check silently merged the reddest ~5 orders into one, 39101-point,
+# 2270-A-wide "order" at ~22x coarser effective sampling than everywhere
+# else). Comparing each diff against a ROLLING local median (not a single
+# global threshold) is needed either way, since real point spacing itself
+# grows gradually and smoothly from blue to red across the whole spectrum.
+# Confirmed against a real file: recovers exactly 35 orders, matching this
+# instrument's known-good order count from the .m format's explicit Order
+# column, with smoothly increasing order sizes throughout (no more merged
+# segments).
+
+_GRACES_INTENSITY_WANT_COMMENT_FRAGMENTS = ['unnormalized', 'no autowave']
+
+
+def _graces_intensity_col_groups(header):
+    """Return the (wave_idx, flux_idx, err_idx) row indices for the
+    'UnNormalized, no autowave correction' triplet, found via each COLn's
+    COMMENT text (not its value -- see module note above) -- or None if
+    this header doesn't have the expected repeating-triplet structure."""
+    n = 1
+    labels = []
+    while f'COL{n}' in header:
+        labels.append((str(header[f'COL{n}']).strip(),
+                        str(header.comments[f'COL{n}']).strip().lower()))
+        n += 1
+    if len(labels) < 3 or len(labels) % 3 != 0:
+        return None
+    for i in range(0, len(labels), 3):
+        (wave_label, wave_comment), (flux_label, _), (err_label, _) = labels[i:i + 3]
+        if (wave_label == 'Wavelength' and flux_label == 'Intensity' and err_label == 'ErrorBar'
+                and all(frag in wave_comment for frag in _GRACES_INTENSITY_WANT_COMMENT_FRAGMENTS)):
+            return i, i + 1, i + 2
+    return None
+
+
+def _detect_graces_intensity(hdul):
+    header = hdul[0].header
+    if _GRACES_ORDER_LABEL in _graces_col_map(header):
+        return False  # the per-order '.m' format above already handles this
+    return _graces_intensity_col_groups(header) is not None
+
+
+def _read_graces_intensity(hdul, **kwargs):
+    header = hdul[0].header
+    data = hdul[0].data
+    wave_idx, flux_idx, _ = _graces_intensity_col_groups(header)
+    wave_row = data[wave_idx].astype(float) * 10.0  # nm -> Angstrom
+    flux_row = data[flux_idx].astype(float)
+    print("Detected GRACES/OPERA merged-intensity format -- using the "
+          "UnNormalized, no-autowave-correction column triplet; splitting "
+          "back into per-order chunks via wavelength-boundary detection (no "
+          "Order column available in this format)")
+
+    diffs = np.diff(wave_row)
+    local_spacing = median_filter(diffs, size=101, mode='nearest')
+    boundary = (diffs < 0) | (diffs > 5.0 * local_spacing)
+    edges = np.concatenate(([0], np.where(boundary)[0] + 1, [len(wave_row)]))
+
+    wavelength = np.empty(len(edges) - 1, dtype=object)
+    flux = np.empty(len(edges) - 1, dtype=object)
+    for i in range(len(edges) - 1):
+        sl = slice(edges[i], edges[i + 1])
+        wavelength[i] = wave_row[sl]
+        flux[i] = flux_row[sl]
     return wavelength, flux, None
 
 
@@ -361,12 +454,14 @@ def load_maroonx_response(filename):
 
 _FITS_FORMATS = [
     (_detect_graces, _read_graces, 'graces'),
+    (_detect_graces_intensity, _read_graces_intensity, 'graces_intensity'),
     (_detect_keck_makee, _read_keck_makee, 'keck_hires'),
     (_detect_binary_table, _read_binary_table, 'fits_table'),
 ]
 
 _NAMED_READERS = {
     'graces': _read_graces,
+    'graces_intensity': _read_graces_intensity,
     'keck_hires': _read_keck_makee,
     'fits_table': _read_binary_table,
     'maroonx': _read_maroonx,

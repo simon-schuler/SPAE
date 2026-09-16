@@ -1140,7 +1140,108 @@ A parallel EW-measurement-stage S/N characterization is deferred until
 that (separately developed) code is available, per the user's original
 two-step framing of this question.
 
-## 15. Commit reference
+## 15. New GRACES format, a negative-flux bug, and whole-order outlier flagging
+
+Motivated by testing/improving `combine_spectra()` (multi-exposure
+co-addition) -- the user provided two real GRACES exposures of the same
+star (Theia 456-6, `N20220115G0040i.fits`/`N20220118G0038i.fits`) as test
+data, which turned out to use a GRACES/OPERA output variant this package
+didn't support yet.
+
+### 15.1 New reader: GRACES/OPERA merged "intensity" (.i) format
+
+Different from the already-supported per-order "spectrum" (.m) format
+(§7's original GRACES reader): no `Order` column at all -- every echelle
+order pre-merged into one continuous ~194000-point array. The header is
+fully self-documenting (verified via its own source, not assumed): 4
+wavelength/intensity/errorbar column triplets (`COL1-3`, `4-6`, `7-9`,
+`10-12`), Normalized/UnNormalized crossed with autowave-corrected
+(telluric-line-based)/uncorrected, distinguished only by each `COLn`'s
+header COMMENT (the VALUES are identical repeated 'Wavelength'/
+'Intensity'/'ErrorBar' labels). Confirmed directly against the OPERA
+pipeline's own C++ source (`operaGenerateLEFormats.cpp`,
+github.com/CFHT/OPERA): "UnNormalized" = `RawFluxInElectronsPerElement`
+(a literal copy of the raw extracted flux, no background subtraction),
+"no autowave correction" = `ThArCalibratedInNM` (comparison-lamp
+wavelength solution only, no telluric-line fine correction) -- both the
+least-processed options, matching this module's established "prefer
+raw/uncorrected" design principle exactly the way GRACES's `.m` format's
+`RawFlux` column did.
+
+New `_read_graces_intensity()`/`_detect_graces_intensity()` in
+`readers.py` (registered as `'graces_intensity'`). Since there's no Order
+column, orders are recovered by detecting wavelength BOUNDARIES -- a
+less robust heuristic than the `.m` reader's explicit column, used only
+because this format gives us nothing better. A first attempt (negative
+jumps only, i.e. order OVERLAP) silently merged the reddest ~5 orders
+into one 39101-point, 2270-A-wide "order" at ~22x coarser effective
+sampling than everywhere else, because real order overlap stops past
+~820 nm and adjacent orders there have a small wavelength GAP instead
+(a forward jump, not a negative one). Fixed: flag a boundary at either a
+negative jump OR an abnormally large positive jump relative to a ROLLING
+local median spacing (needed either way, since real point spacing itself
+grows gradually and smoothly from blue to red). Confirmed against both
+real files: recovers exactly 35 orders, matching this instrument's
+known-good order count from the `.m` format, with smoothly increasing
+order sizes throughout. No regression confirmed on the existing `.m`
+GRACES file, Keck, or MAROON-X.
+
+### 15.2 Negative raw flux crashing an entire order's continuum fit
+
+GRACES's real raw ("UnNormalized") flux can be genuinely negative --
+confirmed via the OPERA source above (ordinary CCD read noise
+symmetrically scattering a near-zero-signal pixel below zero after
+bias/dark subtraction, not a data error -- more common here simply
+because these two exposures are fainter, SNR ~20-70 per the header, than
+anything tested against so far). `Spectrum_Data.__init__`'s initial
+`obs_err = sqrt(flux)` produced NaN for those points, and even a modest
+fraction of NaN weights (539/4055, ~13%, in one real order) was confirmed
+to corrupt the ENTIRE order's AsLS continuum fit output, not just the
+affected points. Fixed: `sqrt(abs(flux))` -- keeps the correct order of
+magnitude of Poisson-like noise at that pixel either way, and is a
+general fix (not format-specific), since any sufficiently faint spectrum
+in any format could hit the same failure mode.
+
+### 15.3 Whole-order outlier flagging (new `outlier_check.py`)
+
+Fixing 15.2 let `normalize_all()` complete without crashing, but order 0
+of both real files still came back with an absurd median normalized flux
+of ~0.055 (should be ~0.9-1.0). Root cause: a single raw-flux point at
+~28,000-60,000x the order's own typical scale (154.16 million vs. a
+~5,475 median) was dragging the AsLS fit up across the WHOLE order via
+its smoothness-penalty coupling. Confirmed NOT a random cosmic ray: the
+same defect appears at the same wavelength (~400.56 nm) and nearly the
+same pixel index (540/4055 vs. 540/4054) in BOTH independent exposures,
+taken 3 days apart -- a fixed, reproducible detector/pipeline defect
+(plausibly related to GRACES's dual-amplifier readout boundary), not
+noise. Per the user's explicit preference and this package's established
+flag-and-exclude precedent (§8's overlap check) rather than trying to
+make the shared AsLS routine itself robust to every possible corruption:
+new `outlier_check.py` / `Spectrum_Data.flag_bad_orders()`, wired into
+`check_for_flags()` exactly like `overlap_flag_ranges` (new
+`self.bad_order_ranges`, same `wave_lo`/`wave_hi` key convention, same
+silent-no-op-until-called behavior).
+
+**Getting the detection metric right took one real iteration**: a first
+attempt (median absolute deviation, symmetric around the order's median)
+false-flagged 11 of 35 real orders in the first test file alone, whose
+only "outlier" was a genuine, deep, real spectral feature (Na D at
+5889.95 A, H-alpha at 6562.63 A, the O2 B telluric band at 6869.59 A)
+sitting in an otherwise very low-scatter stretch. Root cause: deep
+ABSORPTION already has purpose-built, asymmetric handling in the
+continuum-fitting routine itself (§6) -- this check only needs to catch
+the failure mode that mechanism can't, an extreme point ABOVE the
+order's own natural peak level, so checking symmetrically was both
+unnecessary and actively wrong. Fixed: compare the order's single
+highest point against its own 99th-percentile flux (max/p99), not a
+median-centered measure. Confirmed directly against every real spectrum
+in this project's test set (Keck, both GRACES formats, MAROON-X
+pre-/post-response-correction): every genuine order sits at max/p99 <=
+1.51, while the real defect sits at 96.7-713 in the two test files --
+a >60x gap between the two clusters, with the default `outlier_factor`
+(20.0) sitting at that gap's log-space midpoint.
+
+## 16. Commit reference
 
 | Commit | Summary |
 |---|---|

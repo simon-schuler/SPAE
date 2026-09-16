@@ -22,6 +22,7 @@ from .radial_velocity import measure_effective_rv, measure_rv_from_linelist, C_K
 from .response_correction import apply_response_correction as _apply_response_correction
 from .overlap_check import check_order_overlaps as _check_order_overlaps
 from .overlap_check import flagged_overlap_ranges as _flagged_overlap_ranges
+from .outlier_check import check_bad_orders as _check_bad_orders
 from .line_identification import identify_lines_in_spectrum as _identify_lines_in_spectrum
 
 
@@ -86,7 +87,17 @@ class Spectrum_Data():
             self.continuum[i] = false_array
             self.pred_all[i] = np.full(len(self.wavelength[i]), 0)
             self.pred_var_all[i] = np.full(len(self.wavelength[i]), 0)
-            self.obs_err[i] = np.sqrt(self.flux[i])
+            # abs(), not a bare sqrt: real raw-electron counts (e.g. GRACES's
+            # "UnNormalized" flux column) can be genuinely negative --
+            # ordinary CCD read noise scattering a near-zero-signal pixel
+            # below zero after bias/dark subtraction, not a data error. A
+            # bare sqrt(negative) is NaN, and even a modest fraction of NaN
+            # weights was confirmed to corrupt an ENTIRE order's AsLS
+            # continuum fit, not just the affected points (real GRACES
+            # order with 539/4055, ~13%, negative-flux points came back
+            # fully NaN). abs() keeps the correct ORDER OF MAGNITUDE of
+            # Poisson-like noise at that pixel either way.
+            self.obs_err[i] = np.sqrt(np.abs(self.flux[i]))
         #print('empty continuum arrays created', self.continuum)
         #Old way of setting these variables (change back if above code causes problems)
         # self.continuum = np.full((len(self.wavelength),len(self.wavelength[0])), False)
@@ -147,6 +158,11 @@ class Spectrum_Data():
         #flag_order_overlaps(), consulted by check_for_flags(). Empty
         #(no-op) until flag_order_overlaps() is called.
         self.overlap_flag_ranges = []
+        #wavelength ranges of whole orders containing an extreme,
+        #non-astrophysical raw-flux outlier (cosmic ray/detector defect)
+        #-- set by flag_bad_orders(), consulted by check_for_flags().
+        #Empty (no-op) until flag_bad_orders() is called.
+        self.bad_order_ranges = []
         #used to switch between Adamow ew calculation and simpson's rule integration
         self.temp_line_ew = None
         self.temp_line_ew_err = None
@@ -229,6 +245,36 @@ class Spectrum_Data():
         results = _check_order_overlaps(self, min_overlap_points=min_overlap_points)
         self.overlap_flag_ranges = _flagged_overlap_ranges(results, threshold_pct=threshold_pct)
         return self.overlap_flag_ranges
+
+    def flag_bad_orders(self, outlier_factor=20.0):
+        """
+        Detect whole orders whose RAW flux contains an extreme, non-
+        astrophysical outlier (cosmic ray or a fixed detector/amplifier-
+        boundary defect) -- see outlier_check.py's module docstring for
+        why this matters: a single such point was confirmed to corrupt an
+        ENTIRE order's AsLS continuum fit, not just the affected point.
+        Works on raw flux, so it can (and should) be called BEFORE
+        normalize_all() -- catches the problem at its source rather than
+        only after it has already produced a bad fit.
+
+        check_for_flags() consults self.bad_order_ranges automatically --
+        call this once before check_for_flags() (or make_ew_doc(), which
+        calls it for you) if you want this check included; otherwise it's
+        a silent no-op, same as never calling it. Same deliberately-
+        conservative philosophy as flag_order_overlaps(): flags the whole
+        order's wavelength range rather than trying to salvage it (e.g.
+        by masking just the bad point and re-fitting), since a defect
+        this extreme is a data-quality problem this package can't fix,
+        only report.
+
+        Returns
+        -------
+        list of dicts -- the flagged subset; see
+        outlier_check.check_bad_orders()'s docstring for the fields. Also
+        stored on self.bad_order_ranges.
+        """
+        self.bad_order_ranges = _check_bad_orders(self, outlier_factor=outlier_factor)
+        return self.bad_order_ranges
 
     def normalize_all(self, lam = 2e3, p = 0.01, n_iter = 15, adaptive = True, **als_kwargs):
         #loop through orders
@@ -1157,7 +1203,11 @@ class Spectrum_Data():
         -- see overlap_check.py's module docstring) -- a continuum-
         placement problem this check catches even when nothing about the
         line's OWN fit looks wrong (e.g. a real order-edge droop found on
-        GRACES this way, invisible to every check above). If
+        GRACES this way, invisible to every check above). Also flags a
+        line landing inside a whole order flagged by flag_bad_orders()
+        (self.bad_order_ranges -- see outlier_check.py's module
+        docstring), an extreme raw-flux outlier (cosmic ray/detector
+        defect) confirmed to corrupt an entire order's continuum fit. If
         identify_lines() was called first (self.lines_id_run -- see
         line_identification.py's module docstring), also flags: (a) a
         line identify_lines() never found a significant absorption
@@ -1208,6 +1258,17 @@ class Spectrum_Data():
                                     f"orders {rng['order_i']}/{rng['order_j']})")
                     print(self.lines[i], 'sits in a disputed order-overlap range '
                           f"(orders {rng['order_i']}/{rng['order_j']}, {rng['median_pct']:+.1f}%)")
+            #bad-order check - line sits in an order flagged for an
+            #extreme raw-flux outlier (cosmic ray/detector defect) that
+            #would corrupt the whole order's continuum fit (see
+            #flag_bad_orders())
+            for rng in (self.bad_order_ranges or []):
+                if rng['wave_lo'] <= self.lines[i] <= rng['wave_hi']:
+                    self.lines_check_flag[i] = True
+                    reasons.append(f"order {rng['order']} has an extreme raw-flux outlier "
+                                    f"({rng['outlier_factor']:.0f}x robust scale)")
+                    print(self.lines[i], f"sits in order {rng['order']}, flagged for an extreme "
+                          f"raw-flux outlier ({rng['outlier_factor']:.0f}x robust scale)")
             #identification checks - only meaningful once identify_lines()
             #has actually run (lines_id_detected defaults to False either
             #way, so this must be gated on lines_id_run to avoid flagging
