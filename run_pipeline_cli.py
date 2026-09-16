@@ -73,6 +73,11 @@ WINDOW_SIZE = 1.5
 REVIEW = False  # True: pause after measurement for interactive human review
                 # of flagged lines (run this script from a real terminal,
                 # not a notebook, if you turn this on -- it blocks on input())
+SAVE_PLOTS = True  # save every line's QC plot to line_plots/ -- confirmed
+                    # to cost ~0.4 s/line (matplotlib figure + vector PDF
+                    # savefig), dwarfing the actual fit itself (a few ms/
+                    # line); set False to skip plotting entirely for a much
+                    # faster run when you don't need the full audit trail
 
 # MCMC (see SPAE.spae.run_spae())
 X_0 = (5777, 4.44, 0.01, 1.38)   # (teff, logg, feh, micro) initial guess
@@ -143,11 +148,12 @@ def main():
                 spectrum_path, LINELIST_PATH, directory,
                 reference_atlas_path=REFERENCE_ATLAS_PATH,
                 resolving_power=RESOLVING_POWER,
-                window_size=WINDOW_SIZE, review=REVIEW, save_plots=True)
+                window_size=WINDOW_SIZE, review=REVIEW, save_plots=SAVE_PLOTS)
             print(f'EW measurement time: {time.time()-t0:.2f} s')
             print(f'main linelist:    {ew_path}')
             print(f'flagged linelist: {flagged_path}')
-            print(f'line plots:       {os.path.join(directory, "line_plots")}')
+            if SAVE_PLOTS:
+                print(f'line plots:       {os.path.join(directory, "line_plots")}')
         finally:
             sys.stdout, sys.stderr = stdout_orig, stderr_orig
     print(f'EW measurement log: {ew_log_path}')
