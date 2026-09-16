@@ -592,19 +592,21 @@ absolute-wavelength validation of the new identification step (§14.3).
   not been tested and could plausibly surface a new failure mode, the
   same way each real bug in §9 was found via a new real spectrum rather
   than by reasoning about the algorithm in the abstract.
-- **MAROON-X's much lower detection rate than Keck/GRACES (10/78 vs
-  78/78)**: see §13.4-13.5 — investigated via three real, independent
+- **MAROON-X's much lower detection rate than Keck/GRACES (12/78 vs
+  78/78)**: see §13.4-13.6 — investigated via five real, independent
   issues (a coarse-search misidentification bias in the RV estimate; a
   units bug applying §6.7's noise calibration to a new context; a
   missing minimum-prominence check in `identify_line()` that let a
-  monotonic-slope artifact register as a false detection, user-caught).
-  With all three fixed, confirmed the remaining gap is genuine, low
-  S/N for this specific exposure (0.29%/0.56%/2.14% median relative
-  photon error for Keck/GRACES/MAROON-X respectively -- MAROON-X is
-  ~4-7x noisier), not a remaining algorithm shortfall: several of the
-  78 linelist lines are intrinsically weak enough that they are
-  genuinely undetectable at MAROON-X's S/N even though they are 10-50σ
-  detections at Keck's.
+  monotonic-slope artifact register as a false detection, user-caught;
+  cross-order arbitration trusting raw significance over position,
+  user-caught; a missing hard `position_tolerance` acceptance ceiling
+  for uncontested single-order candidates). With all five fixed,
+  confirmed the remaining gap is genuine, low S/N for this specific
+  exposure (0.29%/0.56%/2.14% median relative photon error for
+  Keck/GRACES/MAROON-X respectively -- MAROON-X is ~4-7x noisier), not
+  a remaining algorithm shortfall: several of the 78 linelist lines are
+  intrinsically weak enough that they are genuinely undetectable at
+  MAROON-X's S/N even though they are 10-50σ detections at Keck's.
 - **Coarse-wavelength-grid identification precision** (e.g. GRACES):
   see §12's validation discussion of Fe I 6716.222 Å — a discrete
   significance-profile peak can land one grid point away from the true
@@ -710,12 +712,12 @@ linelist used throughout this package's history):
   to EW measurement's own centering, not this prior identification
   step ("we just need to identify the line, so the EW fitting routine
   can measure the line strength").
-- MAROON-X: 10/78 detected at final, strict settings, far below
-  Keck/GRACES — see §13.4-13.5 for the full investigation (three real,
-  independent issues found and fixed along the way, including a
-  genuine misidentification the user caught visually). Confirmed the
-  remaining gap is real, low S/N for this specific exposure (~4-7x
-  worse than Keck/GRACES), not an algorithm shortfall.
+- MAROON-X: 12/78 detected at final, strict settings, far below
+  Keck/GRACES — see §13.4-13.6 for the full investigation (five real,
+  independent issues found and fixed along the way, including three
+  genuine misidentifications/false-negatives the user caught visually).
+  Confirmed the remaining gap is real, low S/N for this specific
+  exposure (~4-7x worse than Keck/GRACES), not an algorithm shortfall.
 
 ## 13. Radial-velocity / wavelength-shift robustness
 
@@ -943,6 +945,106 @@ bug to chase further. The fiber-selection ambiguity (`readers.py`)
 remains a separate, valid, but now lower-priority open question --
 low S/N alone is sufficient to explain the detection count without
 invoking it.
+
+### 13.6 Three more real misidentifications (user-caught), and two structural fixes
+
+Visually reviewing the (now 78/78) GRACES PDF, the user flagged four
+more questionable identifications. Direct diagnosis of each against the
+raw per-order data:
+
+- **Fe I 6392.535 Å** ("near order edge"): the winning candidate came
+  from order 14, whose own boundary sits only ~2.4 Å past this
+  wavelength. Confirmed order 14's flux there is a continuum-
+  normalization artifact, not a real line: it declines monotonically,
+  never recovering, all the way to that order's literal last data
+  point (0.93 five Å out, down to 0.48 at the very edge). Order 13 (57
+  Å interior), covering the same true wavelength via the overlap,
+  independently found a correctly-centered, appropriately shallow
+  (~6%, 21.6σ) dip essentially exactly at rest wavelength -- the real
+  answer, but LOWER raw significance (21.6 vs. order 14's 76.8) than
+  the artifact, so the existing highest-significance-wins cross-order
+  arbitration in `identify_lines_in_spectrum()` picked the wrong one.
+- **Fe I 6745.090 Å** ("strong absorption to the blue"): same root
+  cause, different flavor. Order 12 found a correctly-centered,
+  appropriately weak (~4%, 8.1σ) dip essentially exactly at rest
+  wavelength. Order 11 found a real, well-formed, but 0.033 Å-offset,
+  much deeper (~10%, 18.9σ) feature -- too deep for this 8.1 mÅ line,
+  more likely a genuinely different absorption nearby. Cross-order
+  arbitration again picked the deeper, mispositioned answer.
+- **Fe I 7114.549 Å** ("strong absorption surrounding line"): the
+  opposite failure -- a real line wrongly REJECTED, not misidentified.
+  There IS a genuine ~5-6% dip essentially at rest wavelength (raw
+  significance 10.5σ, comfortably above the 3.0 floor), but this
+  specific part of order 10 is coarsely sampled (6 points across the
+  ±0.15 Å window), and a separate, shallower dip just outside the
+  window to the left kept that window's own edge value elevated
+  (8.8σ), artificially capping the correctly-centered peak's prominence
+  at 1.7 -- under the 3.0 floor -- purely because the narrow window
+  never showed the point further out where the profile truly returns
+  toward baseline.
+- **Fe II 6113.222 Å**: no such entry exists; nearest is Fe I 6113.322
+  Å (12.2 mÅ), which the linelist itself annotates `#close to another
+  line at base`. The identified center is 0.031 Å off, consistent with
+  that documented neighbor pulling the apparent center without
+  producing a resolvable second peak -- the blend-without-a-resolvable-
+  valley limitation already noted in the module's own docstring (§12),
+  not a new bug.
+
+Two of these four are the SAME underlying defect (cross-order
+arbitration trusting raw significance with no position or plausibility
+check); one is a distinct, opposite defect (prominence miscomputed from
+too narrow a window); one is a already-documented, accepted limitation.
+Fixed the two real bugs in `line_identification.py`:
+
+1. **`identify_line()` now computes the significance profile (and thus
+   prominence) over a WIDER `context_radius` window** (default
+   `2*search_radius`) than the window used to accept a candidate's
+   POSITION (still `search_radius`, further tightened below).
+   Candidates found outside the acceptance window but inside the
+   context window inform prominence only, never a reported position.
+   This directly fixes the Fe I 7114.549 false negative (its true
+   local valley only becomes visible with the wider context) while
+   simultaneously making order 14's Fe I 6392.535 artifact WORSE, not
+   better disguised -- confirmed it never returns toward baseline even
+   ±0.6 Å out, i.e. it's a real, extended, non-line-shaped artifact, not
+   just a narrow-window sampling accident.
+2. **Cross-order arbitration in `identify_lines_in_spectrum()` now
+   prefers the candidate positioned CLOSER to rest_wave, not the one
+   with higher raw significance** (ties within 0.005 Å broken by
+   significance). Two overlapping orders are two independent
+   measurements of the same true spectrum; if they disagree on WHERE
+   the line is by more than noise can explain, that disagreement is
+   itself the signal that one of them is looking at something else.
+   Confirmed this alone flips both the 6392.535 and 6745.090 cases to
+   the correct order.
+3. A widened context window alone does not stop a single, uncontested
+   candidate (no competing order) from winning purely because nothing
+   else was in its window. Checking the offset distribution directly
+   confirmed this WAS a real, separate problem specifically for
+   MAROON-X: every confirmed-good Keck/GRACES detection has
+   `|offset| <= 0.058` Å, but before this fix MAROON-X had several
+   accepted detections at 0.08-0.14 Å with statistically absurd
+   significance for their catalogued strength (e.g. 115σ for a 10.5 mÅ
+   line -- clearly a different, real, much stronger feature, not the
+   catalogued one). Fixed: the final accepted candidate must now fall
+   within `min(search_radius, position_tolerance)` (0.07 Å default),
+   not the full, wider `search_radius` (0.15 Å) -- `search_radius`
+   still governs how far the search for CANDIDATES extends, but
+   `position_tolerance`, this package's own measured RV-corrected
+   real-data precision, now gates final acceptance. Zero effect on
+   Keck/GRACES (neither ever had an offset past 0.058 Å to begin with).
+
+Effect across all three instruments, verified directly: **Keck 78/78,
+GRACES 78/78** (both 0 blends -- GRACES gained back Fe I 7114.549 via
+fix 1, its only previous loss). **MAROON-X: 12/78** (0 blends) -- up
+from 10/78 (net +2 genuine recoveries, both near-zero offset: Fe I
+6726.666 and Fe I 7114.549), after an intermediate check (fix 1 alone,
+before fix 3) had spiked it to a false-looking 22/78 that the offset-
+distribution check above caught and fix 3 corrected back down. The
+original user-caught misidentification from §13.5 (Fe I 5661.346)
+remains correctly rejected throughout. All final MAROON-X detections
+now have plausible significance-to-catalogued-strength ratios and
+`|offset| <= 0.067` Å.
 
 ## 14. Commit reference
 
