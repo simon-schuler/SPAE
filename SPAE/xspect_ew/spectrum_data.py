@@ -12,7 +12,8 @@ from scipy.interpolate import interp1d
 from .constants import ELEMENTS
 from .continuum import fit_als_continuum
 from .line_profile import (get_line_window, gauss_model, gfit_direct, gauss_ew, gauss_ew_err,
-                            gauss_model_err, estimate_local_continuum, EW_K)
+                            gauss_model_err, estimate_local_continuum,
+                            estimate_local_continuum_sloped, EW_K)
 from .combine import make_line, parabolic_refine
 from .plotting import make_plots_folder
 from .readers import read_spectrum
@@ -946,7 +947,7 @@ class Spectrum_Data():
                       'explicitly instead. Reference atlas NOT loaded.')
                 self.ref_wave, self.ref_flux = None, None
 
-    def measure_ew(self, i, order, plot = False, ex_params = [0,0,0,0], save_plot = False, window_size = 1.5, show_plot = True, fit_continuum = True, auto_widen = True, widen_window_size = 2.5):
+    def measure_ew(self, i, order, plot = False, ex_params = [0,0,0,0], save_plot = False, window_size = 1.5, show_plot = True, fit_continuum = True, auto_widen = True, widen_window_size = 2.5, slope_sig_thresh = 3.0, slope_min_points = 5, slope_internal_sig_thresh = 3.0):
         #extra parameters [0] - shift continuum
         #                 [1] - left boundary in Angstroms
         #                 [2] - right boundary in Angstroms
@@ -960,6 +961,12 @@ class Spectrum_Data():
         #continuum exactly at norm -- fixes fits biased by imperfect
         #normalization. Set False to fall back to the old fixed-
         #continuum-at-norm behavior.
+        #slope_sig_thresh, slope_min_points: DIAGNOSTIC ONLY -- passed to
+        #estimate_local_continuum_sloped() (see its docstring), which is
+        #computed and reported/plotted in parallel with the flat local
+        #continuum above but does NOT (yet) drive the reported EW itself.
+        #Exposed here so both can be tuned against real lines before
+        #deciding whether the sloped method should become the default.
         #auto_widen: automatically retry once with widen_window_size if
         #this line's fit quality is poor at window_size -- see the retry
         #check below, right after ew/ew_err are finalized, for exactly
@@ -1156,6 +1163,52 @@ class Spectrum_Data():
                              show_plot, fit_continuum, auto_widen=False)
             return
 
+        #DIAGNOSTIC: a parallel conditionally-sloped local continuum,
+        #computed and reported/plotted alongside the flat one above -- does
+        #NOT (yet) drive the reported EW itself (self.lines_ew below still
+        #comes from the flat fit). See estimate_local_continuum_sloped()'s
+        #docstring: exists to let slope_sig_thresh/slope_min_points be
+        #tuned against real lines before deciding whether this should
+        #become the default.
+        bf_slope, pcov_slope, ew_slope, ew_err_slope, cont_offset_slope = None, None, None, None, None
+        used_slope, c1_slope, slope_diag = False, 0., {}
+        if fit_continuum:
+            c0_s, c1_slope, c0_err_s, _, used_slope, slope_diag = estimate_local_continuum_sloped(
+                xtest[wing_idx], full_y[wing_idx], y_err[wing_idx], found_line,
+                min_points=slope_min_points, ref_keep=ref_keep, sig_thresh=slope_sig_thresh,
+                internal_sig_thresh=slope_internal_sig_thresh)
+            cont_offset_slope = norm - (c0_s + c1_slope*(xtest-found_line))
+            y_detrend_slope = y_fit - cont_offset_slope
+            fit_mask_slope = in_line.copy()
+            fit_mask_slope[wing_idx] = np.abs(y_detrend_slope[wing_idx]) < 5*np.median(y_err[wing_idx])
+            if ref_keep is not None:
+                restricted_slope = fit_mask_slope.copy()
+                restricted_slope[wing_idx] &= ref_keep
+                if restricted_slope.sum() >= 5:
+                    fit_mask_slope = restricted_slope
+            bf_slope, pcov_slope, _ = gfit_direct(
+                xtest[fit_mask_slope], y_detrend_slope[fit_mask_slope], y_err[fit_mask_slope],
+                found_line, sigma_guess, 0.)
+            if bf_slope is None:
+                bf_slope = fail_bf
+            ew_slope = abs(gauss_ew(bf_slope[0], bf_slope[2]*2.355))
+            ew_err_slope = np.sqrt(gauss_ew_err(bf_slope[0], bf_slope[2], pcov_slope)**2
+                                    + (EW_K*bf_slope[2]*c0_err_s)**2)
+            if bf_slope[0] == 0 or not (2 < ew_slope < 200):
+                bf_slope = fail_bf
+                ew_slope = 0.
+                ew_err_slope = 0.
+                pcov_slope = None
+            sig_str = 'n/a' if slope_diag.get('significance') is None else f"{slope_diag['significance']:.2f}"
+            isig_b = slope_diag.get('internal_sig_blue')
+            isig_r = slope_diag.get('internal_sig_red')
+            isig_b_str = 'n/a' if isig_b is None else f"{isig_b:.2f}"
+            isig_r_str = 'n/a' if isig_r is None else f"{isig_r:.2f}"
+            print(f'  [slope diagnostic] EW(flat)={ew:.2f}+/-{ew_err:.2f}  '
+                  f'EW(sloped)={ew_slope:.2f}+/-{ew_err_slope:.2f}  used_slope={used_slope}  '
+                  f'c1={c1_slope:.5f}  n_blue={slope_diag.get("n_blue")} n_red={slope_diag.get("n_red")}  '
+                  f'significance={sig_str}  internal_sig(blue/red)={isig_b_str}/{isig_r_str}')
+
         best_bf = bf
         #predicted real flux = norm - (line dip + local continuum offset)
         fit_gauss = norm - (gauss_model(xtest, *best_bf) + cont_offset)
@@ -1209,12 +1262,43 @@ class Spectrum_Data():
                 fit_view.plot(xplot, local_cont_plot, ':', color = '#ff7f00', lw = 2, label = 'estimated local continuum')
             fit_view.legend(loc='best', fontsize=8)
 
-            data_view = fig.add_subplot(122)
-            data_view.grid()
-            data_view.set_xlabel(r'$\rm Wavelength~(\AA)$', size = 14)
-            data_view.scatter(measure_x_array,measure_y_array+ ex_params[0], s = 5, c = 'k', zorder = 2)
-            data_view.errorbar(measure_x_array,measure_y_array + ex_params[0],
-                 yerr=2*temp_err_array/temp_pred_array,capsize=0,fmt='.', color = 'k', zorder = 3, alpha = 0.5)
+            slope_view = fig.add_subplot(122)
+            slope_view.grid()
+            slope_view.set_xlabel(r'$\rm Wavelength~(\AA)$', size = 14)
+            if fit_continuum:
+                #DIAGNOSTIC right panel: the SAME data and Gaussian-fit
+                #machinery as the left panel, but using the conditionally
+                #-sloped local continuum (estimate_local_continuum_sloped())
+                #instead of the flat one -- side-by-side so a real,
+                #both-sides-independently-clean level difference (e.g. Fe I
+                #5522.447) is visually obvious as a tilt here vs. the flat
+                #line in fit_view, while a case where the slope correctly
+                #stayed off (contamination on one side, e.g. Fe I 5587.574)
+                #looks identical in both panels
+                slope_view.set_title(f'slope diagnostic (used_slope={used_slope})', fontsize=10)
+                slope_view.errorbar(measure_x_array,measure_y_array + ex_params[0],
+                     yerr=2*temp_err_array/temp_pred_array,capsize=0,fmt='.', color = 'k', zorder = 2)
+                slope_view.plot([found_line,found_line],[norm,norm*0.95], '-', color='k')
+                slope_view.plot([line_bound[0],line_bound[0]],[norm*1.025,norm*0.95], '--', color = '#e41a1c', alpha = 0.5)
+                slope_view.plot([line_bound[1],line_bound[1]],[norm*1.025,norm*0.95], '--', color = '#e41a1c', alpha = 0.5)
+                if bf_slope is not None:
+                    cont_offset_slope_plot = norm - (c0_s + c1_slope*(xplot-found_line))
+                    fit_gauss_plot_slope = norm - (gauss_model(xplot, *bf_slope) + cont_offset_slope_plot)
+                    slope_view.plot(xplot, fit_gauss_plot_slope, '--', color = '#377eb8', lw= 2, label = 'Gaussian fit')
+                    if pcov_slope is not None:
+                        model_err_plot_slope = gauss_model_err(xplot, bf_slope, pcov_slope)
+                        slope_view.fill_between(xplot, fit_gauss_plot_slope-model_err_plot_slope,
+                                 fit_gauss_plot_slope+model_err_plot_slope,
+                                 color = '#377eb8', alpha = 0.25, zorder = 1, label = r'fit $\pm1\sigma$')
+                    local_cont_plot_slope = norm - cont_offset_slope_plot
+                    slope_view.plot(xplot, local_cont_plot_slope, ':', color = '#ff7f00', lw = 2,
+                             label = 'estimated local continuum (sloped)')
+                slope_view.plot([xtest[0],xtest[-1]],[norm,norm], '--', color = '#4daf4a', label = 'assumed continuum (norm)')
+                slope_view.legend(loc='best', fontsize=8)
+            else:
+                slope_view.scatter(measure_x_array,measure_y_array+ ex_params[0], s = 5, c = 'k', zorder = 2)
+                slope_view.errorbar(measure_x_array,measure_y_array + ex_params[0],
+                     yerr=2*temp_err_array/temp_pred_array,capsize=0,fmt='.', color = 'k', zorder = 3, alpha = 0.5)
             plt.tight_layout()
 
 
@@ -1256,7 +1340,7 @@ class Spectrum_Data():
             self.lines_exp[i] = np.array(ex_params)
             print('extra params:',ex_params)
 
-    def measure_all_ew(self, exclude_lines= [], plot_lines=[], ex_params = {}, window_size = 1.5, save_all = False, fit_continuum = True, auto_widen = True, widen_window_size = 2.5):
+    def measure_all_ew(self, exclude_lines= [], plot_lines=[], ex_params = {}, window_size = 1.5, save_all = False, fit_continuum = True, auto_widen = True, widen_window_size = 2.5, slope_sig_thresh = 3.0, slope_min_points = 5, slope_internal_sig_thresh = 3.0):
         """
         Measure every loaded line's EW.
 
@@ -1276,6 +1360,11 @@ class Spectrum_Data():
         widen_window_size if it comes out of window_size looking
         unreliable -- see measure_ew()'s docstring for exactly what
         triggers a retry. No effect when fit_continuum=False.
+
+        slope_sig_thresh, slope_min_points: DIAGNOSTIC ONLY, passed through
+        to measure_ew()'s parallel flat-vs-sloped local continuum -- see
+        its docstring and estimate_local_continuum_sloped()'s. Does not
+        change the reported EW.
         """
         if save_all:
             make_plots_folder()
@@ -1300,13 +1389,17 @@ class Spectrum_Data():
                         plot = True
                         self.measure_ew(i,order, plot, exp, True, window_size,
                                          show_plot=(self.lines[i] in plot_lines), fit_continuum=fit_continuum,
-                                         auto_widen=auto_widen, widen_window_size=widen_window_size)
+                                         auto_widen=auto_widen, widen_window_size=widen_window_size,
+                                         slope_sig_thresh=slope_sig_thresh, slope_min_points=slope_min_points,
+                                         slope_internal_sig_thresh=slope_internal_sig_thresh)
                     else:
                         self.measure_ew(i,order, plot, exp, False, window_size, fit_continuum=fit_continuum,
-                                         auto_widen=auto_widen, widen_window_size=widen_window_size)
+                                         auto_widen=auto_widen, widen_window_size=widen_window_size,
+                                         slope_sig_thresh=slope_sig_thresh, slope_min_points=slope_min_points,
+                                         slope_internal_sig_thresh=slope_internal_sig_thresh)
         #self.lines_bf_params = np.array(self.lines_bf_params)
 
-    def measure_line_ew(self,line,ex_params=[0,0,0,0], save_line = False, save_plot = False, window_size = 1.5, fit_continuum = True, auto_widen = True, widen_window_size = 2.5):
+    def measure_line_ew(self,line,ex_params=[0,0,0,0], save_line = False, save_plot = False, window_size = 1.5, fit_continuum = True, auto_widen = True, widen_window_size = 2.5, slope_sig_thresh = 3.0, slope_min_points = 5, slope_internal_sig_thresh = 3.0):
         if save_plot:
             make_plots_folder()
         i = np.where(self.lines == line)[0][0]
@@ -1320,7 +1413,9 @@ class Spectrum_Data():
                     self.lines_ew_err[i] = np.nan
                     #self.lines_check_flag[i] = False
                     self.measure_ew(i,order, True, ex_params, save_plot, window_size, fit_continuum=fit_continuum,
-                                    auto_widen=auto_widen, widen_window_size=widen_window_size)
+                                    auto_widen=auto_widen, widen_window_size=widen_window_size,
+                                    slope_sig_thresh=slope_sig_thresh, slope_min_points=slope_min_points,
+                                    slope_internal_sig_thresh=slope_internal_sig_thresh)
                     found = True
                     if save_line:
                         with open('line_'+str(line)+'.txt','w') as f:

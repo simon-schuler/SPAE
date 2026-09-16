@@ -124,7 +124,7 @@ def gfit_direct(x_array, y_array, y_err, mu, sigma, baseline):
         return None, None, p0
 
 
-def estimate_local_continuum(x, y, y_err, min_points=5, clip_sigma=3.0, ref_keep=None):
+def estimate_local_continuum(x, y, y_err, min_points=5, clip_sigma=3.0, ref_keep=None, ref_strict=False):
     """Robust local (flat) continuum level from a set of presumed-
     continuum points -- e.g. a line's wing, outside its own detected
     boundary -- instead of assuming the global normalization already put
@@ -161,6 +161,22 @@ def estimate_local_continuum(x, y, y_err, min_points=5, clip_sigma=3.0, ref_keep
         noise to catch via the median/MAD clip above) ANDed into the clip
         below rather than replacing it. None (default) leaves behavior
         identical to not having a reference atlas at all.
+    ref_strict : if the atlas flags nearly everything in this candidate
+        set as non-continuum (fewer than min_points survive ref_keep
+        alone), ref_strict=True respects that as a real, atlas-driven
+        contamination verdict and lets this call fail outright (0., inf) --
+        appropriate for a caller with its own fallback if this one side
+        fails (e.g. estimate_local_continuum_sloped(), which just
+        disqualifies the slope and uses the flat estimate instead).
+        ref_strict=False (default) instead falls back to the median/MAD-
+        only clip in that situation, since THIS is usually the top-level
+        call with no further fallback of its own -- returning a usable,
+        if imperfect, number beats returning c0_err=inf and breaking the
+        measurement outright (confirmed on Fe I 5587.574 at a 2.5 A
+        window: an unusually densely line-blanketed stretch of solar
+        spectrum left the atlas with fewer than min_points "safe" points
+        in the ENTIRE wing, not just one side, so there was no fallback
+        estimate left to disqualify to).
 
     Returns
     -------
@@ -181,15 +197,29 @@ def estimate_local_continuum(x, y, y_err, min_points=5, clip_sigma=3.0, ref_keep
     clip = max(mad, np.median(y_err))
     keep = y > (med - clip_sigma*clip)
     if ref_keep is not None:
-        #a real reference-atlas exclusion should only ever SHRINK how much
-        #wing survives -- if it shrinks it below min_points, that's a sign
-        #the reference cross-check isn't well-conditioned here (e.g. poor
-        #atlas coverage, a bad resolving-power estimate), not that this
-        #line's continuum can't be estimated at all -- fall back to the
-        #median/MAD-only clip rather than failing outright
-        keep_with_ref = keep & ref_keep
-        if keep_with_ref.sum() >= min_points:
-            keep = keep_with_ref
+        if ref_strict and ref_keep.sum() < min_points:
+            #the atlas itself found fewer than min_points points that look
+            #like continuum ANYWHERE in this candidate set -- a real,
+            #atlas-driven contamination verdict (confirmed on Fe I
+            #6220.776's blue wing: ref_keep was all-False there, correctly
+            #matching a window riddled with absorption almost everywhere),
+            #not noise from a marginal disagreement with the median/MAD
+            #clip below -- respect it rather than silently reverting to
+            #the atlas-unaware clip, which was overriding a unanimous,
+            #correct contamination verdict with contaminated data. Only
+            #for ref_strict callers, which have their own fallback if this
+            #returns a hard failure -- see ref_strict's docstring above.
+            keep = keep & ref_keep
+        else:
+            #the atlas DID find enough usable continuum somewhere in this
+            #candidate set -- a low overlap specifically with THIS clip's
+            #own surviving points is more likely a marginal/edge
+            #disagreement (e.g. poor atlas coverage, a bad resolving-power
+            #estimate) than "no continuum exists here", so fall back to
+            #the median/MAD-only clip rather than failing outright
+            keep_with_ref = keep & ref_keep
+            if keep_with_ref.sum() >= min_points:
+                keep = keep_with_ref
     if keep.sum() < min_points:
         return 0., np.inf, keep
 
@@ -198,6 +228,159 @@ def estimate_local_continuum(x, y, y_err, min_points=5, clip_sigma=3.0, ref_keep
     c0 = np.sum(w*yc) / np.sum(w)
     c0_err = 1./np.sqrt(np.sum(w))
     return c0, c0_err, keep
+
+
+def _weighted_mean_err(y, y_err):
+    ec = np.clip(y_err, 1e-6, None)
+    w = 1./ec**2
+    return np.sum(w*y)/np.sum(w), 1./np.sqrt(np.sum(w))
+
+
+def _internal_trend_significant(xs, ys, errs, x0, thresh):
+    """Near-half vs far-half (relative to x0) comparison within ONE side's
+    own already-clipped points. A real, benign gradient's own side should
+    look flat internally; a still-recovering contamination tail (e.g. Fe I
+    5587.574's truncated neighbor) forms its own smooth trend even among
+    points that individually survived that side's median/MAD + reference-
+    atlas clip -- this is what catches it. Returns (trend_found, sig), with
+    sig=None (trend_found=False) when there aren't enough points on this
+    side to test either way -- too little data to detect a trend isn't
+    evidence there isn't one, but it also shouldn't count against a side
+    already past the caller's own min_points floor.
+    """
+    if len(xs) < 4:
+        return False, None
+    order = np.argsort(np.abs(xs - x0))
+    half = len(xs)//2
+    near_idx, far_idx = order[:half], order[half:]
+    if len(near_idx) < 2 or len(far_idx) < 2:
+        return False, None
+    mean_near, err_near = _weighted_mean_err(ys[near_idx], errs[near_idx])
+    mean_far, err_far = _weighted_mean_err(ys[far_idx], errs[far_idx])
+    combined = np.sqrt(err_near**2 + err_far**2)
+    sig = abs(mean_far - mean_near)/combined if combined > 0 else 0.
+    return sig > thresh, sig
+
+
+def estimate_local_continuum_sloped(x, y, y_err, x0, min_points=5, clip_sigma=3.0,
+                                     ref_keep=None, sig_thresh=3.0, internal_sig_thresh=3.0):
+    """DIAGNOSTIC / under evaluation -- not yet used for the reported EW.
+
+    Conditionally allow a linear (sloped) local continuum instead of
+    estimate_local_continuum()'s flat bias, WITHOUT reopening the original
+    failure mode that got the slope term removed in the first place (see
+    estimate_local_continuum()'s docstring): an unconditional linear fit
+    over the raw wing points lets one-sided contamination masquerade as a
+    trend, since a monotonic decline on just one side is indistinguishable
+    from a real slope to an ordinary least-squares fit.
+
+    Instead of fitting the raw points directly, this runs
+    estimate_local_continuum() -- the SAME robust median/MAD + optional
+    reference-atlas clip, unchanged -- independently on the blue (x < x0)
+    and red (x > x0) halves of the wing. A slope is only used if ALL of
+    these hold:
+      1. each side independently retains at least min_points after its
+         own clip (not the combined total) -- a side starved down to a
+         handful of points by contamination can't anchor a slope endpoint
+      2. NEITHER side shows a significant internal near-vs-far trend of
+         its own (see _internal_trend_significant()) -- condition 1 alone
+         was confirmed INSUFFICIENT on real data: Fe I 5587.574's
+         contaminated side kept 21 points that individually survived the
+         per-side clip (they're mutually consistent with EACH OTHER, just
+         all part of the same still-recovering contamination tail), so it
+         passed condition 1 and even a huge disagreement significance
+         (30.5 sigma) in condition 3 below, producing a visibly wrong,
+         upward-tilting continuum that overshot the real red-wing data.
+         This condition catches exactly that: a benign gradient's own
+         side should look flat internally; a recovering tail won't.
+      3. the two sides' independently-fitted levels disagree by more than
+         sig_thresh times their combined uncertainty -- so the slope only
+         engages when the data actually demands a trend, not whenever
+         ordinary noise happens to differ between the two sides
+    Fe I 5587.574 (truncated neighbor) and Fe I 5579.335 (6-point-starved
+    wing) both fail conditions 1 or 2 and fall back to the flat estimate;
+    Fe I 5522.447 (a genuine ~1-2% real level difference between wings,
+    both independently well-populated, uncontaminated, and internally
+    flat) is the motivating case where all three pass.
+
+    sig_thresh, internal_sig_thresh, and min_points are exposed because
+    there isn't yet a principled a priori choice for any of them -- this
+    function exists to let all three be tuned empirically against real
+    lines (see measure_ew()'s parallel flat-vs-sloped diagnostic output)
+    before anything here becomes a default.
+
+    Returns
+    -------
+    c0, c1 : continuum level (at x0) and slope -- c1 is exactly 0. when
+        the flat fallback was used
+    c0_err : uncertainty on c0 -- from estimate_local_continuum() directly
+        for the flat fallback, or propagated as a linear interpolation
+        between the two independently-fitted side levels otherwise
+    keep : boolean mask into x/y of points used across BOTH sides
+    used_slope : bool, whether the slope was actually engaged
+    diagnostics : dict with n_blue, n_red, c0_blue, c0_blue_err, c0_red,
+        c0_red_err, significance (the disagreement/combined-error ratio
+        actually compared against sig_thresh), and internal_trend_blue/
+        internal_trend_red/internal_sig_blue/internal_sig_red (condition
+        2's per-side result) -- for inspecting near misses, not just
+        yes/no, while tuning thresholds
+    """
+    c0_flat, c0_err_flat, keep_flat = estimate_local_continuum(
+        x, y, y_err, min_points=min_points, clip_sigma=clip_sigma, ref_keep=ref_keep)
+    diagnostics = {'n_blue': 0, 'n_red': 0, 'c0_blue': None, 'c0_blue_err': None,
+                   'c0_red': None, 'c0_red_err': None, 'significance': None,
+                   'internal_trend_blue': None, 'internal_sig_blue': None,
+                   'internal_trend_red': None, 'internal_sig_red': None}
+
+    blue = x < x0
+    red = ~blue
+    if blue.sum() < min_points or red.sum() < min_points:
+        return c0_flat, 0., c0_err_flat, keep_flat, False, diagnostics
+
+    ref_keep_blue = ref_keep[blue] if ref_keep is not None else None
+    ref_keep_red = ref_keep[red] if ref_keep is not None else None
+    c0_b, err_b, keep_b = estimate_local_continuum(
+        x[blue], y[blue], y_err[blue], min_points=min_points, clip_sigma=clip_sigma,
+        ref_keep=ref_keep_blue, ref_strict=True)
+    c0_r, err_r, keep_r = estimate_local_continuum(
+        x[red], y[red], y_err[red], min_points=min_points, clip_sigma=clip_sigma,
+        ref_keep=ref_keep_red, ref_strict=True)
+    diagnostics.update(n_blue=int(keep_b.sum()), n_red=int(keep_r.sum()),
+                        c0_blue=c0_b, c0_blue_err=err_b, c0_red=c0_r, c0_red_err=err_r)
+
+    if keep_b.sum() < min_points or keep_r.sum() < min_points:
+        return c0_flat, 0., c0_err_flat, keep_flat, False, diagnostics
+
+    trend_b, sig_b = _internal_trend_significant(
+        x[blue][keep_b], y[blue][keep_b], y_err[blue][keep_b], x0, internal_sig_thresh)
+    trend_r, sig_r = _internal_trend_significant(
+        x[red][keep_r], y[red][keep_r], y_err[red][keep_r], x0, internal_sig_thresh)
+    diagnostics.update(internal_trend_blue=trend_b, internal_sig_blue=sig_b,
+                        internal_trend_red=trend_r, internal_sig_red=sig_r)
+    if trend_b or trend_r:
+        return c0_flat, 0., c0_err_flat, keep_flat, False, diagnostics
+
+    combined_err = np.sqrt(err_b**2 + err_r**2)
+    significance = abs(c0_r - c0_b)/combined_err if combined_err > 0 else 0.
+    diagnostics['significance'] = significance
+    if significance <= sig_thresh:
+        return c0_flat, 0., c0_err_flat, keep_flat, False, diagnostics
+
+    x_b_mean = np.mean(x[blue][keep_b])
+    x_r_mean = np.mean(x[red][keep_r])
+    c1 = (c0_r - c0_b) / (x_r_mean - x_b_mean)
+    c0 = c0_b + c1*(x0 - x_b_mean)
+
+    #linear-interpolation error propagation between the two independently
+    #-fitted side levels, evaluated at x0
+    w_b = (x_r_mean - x0) / (x_r_mean - x_b_mean)
+    w_r = (x0 - x_b_mean) / (x_r_mean - x_b_mean)
+    c0_err = np.sqrt((w_b*err_b)**2 + (w_r*err_r)**2)
+
+    keep = np.zeros(len(x), dtype=bool)
+    keep[blue] = keep_b
+    keep[red] = keep_r
+    return c0, c1, c0_err, keep, True, diagnostics
 
 
 def gauss_ew(a, fwhm):
