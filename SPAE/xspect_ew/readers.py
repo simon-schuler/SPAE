@@ -286,6 +286,34 @@ def _read_maroonx(store, fiber=_MAROONX_DEFAULT_FIBER,
     return wavelength, flux, None
 
 
+def get_maroonx_bands(filename, fiber=_MAROONX_DEFAULT_FIBER):
+    """
+    Return a list of 'blue'/'red' arm labels, one per order, in the same
+    order _read_maroonx() (and therefore Spectrum_Data's wavelength/flux
+    arrays) produces them -- all spec_blue orders first, then all
+    spec_red orders.
+
+    Needed for response correction specifically: MAROON-X's two arms
+    physically overlap in wavelength near their dichroic split (confirmed
+    against real files: spec_blue independently covers echelle orders
+    91-124 and spec_red covers 67-94 -- both arms cover orders 91-94), so
+    a science order in that overlap can look like a wavelength match for
+    TWO different response chunks (one per arm) that describe different
+    physical light paths. Wavelength overlap alone can't disambiguate
+    them (their wavelength ranges are nearly identical); only knowing
+    which arm the science data and the response chunk each came from can.
+    See response_correction.apply_response_correction()'s band-matching.
+    """
+    import pandas as pd
+    bands = []
+    with pd.HDFStore(filename, 'r') as store:
+        for band in _MAROONX_BANDS:
+            spec = store[band]
+            n = len(spec['wavelengths'].loc[fiber].index)
+            bands.extend([band.replace('spec_', '')] * n)
+    return bands
+
+
 def load_maroonx_response(filename):
     """
     Load a MAROON-X PHOENIX-based instrument response/blaze correction
@@ -294,7 +322,9 @@ def load_maroonx_response(filename):
     (confirmed: the per-exposure 'blaze_blue'/'blaze_red' keys exist but
     are empty in real science files). Returns per-order (wave, response)
     arrays in the same list-of-arrays convention Spectrum_Data itself
-    uses, ready to pass to Spectrum_Data.apply_response_correction().
+    uses, ready to pass to Spectrum_Data.apply_response_correction(),
+    plus a parallel list of 'blue'/'red' arm labels (see get_maroonx_bands()
+    for why matching needs this, not just wavelength overlap).
 
     File structure (confirmed against a real file, not assumed): keys
     'wavelength_blue'/'wavelength_red' and 'response_blue'/'response_red',
@@ -304,10 +334,16 @@ def load_maroonx_response(filename):
     numbers (e.g. 92, 93, ...) -- but they correspond POSITIONALLY
     (wavelength column 0 <-> response column 92, etc.), confirmed by
     checking that the wavelength ranges line up when paired that way.
+
+    Returns
+    -------
+    wave_list, resp_list : as before
+    band_list : 'blue'/'red' per chunk, parallel to wave_list/resp_list
     """
     import pandas as pd
     wave_list = []
     resp_list = []
+    band_list = []
     with pd.HDFStore(filename, 'r') as store:
         for band in ('blue', 'red'):
             wave_df = store[f'wavelength_{band}']
@@ -315,7 +351,8 @@ def load_maroonx_response(filename):
             for wave_col, resp_col in zip(wave_df.columns, resp_df.columns):
                 wave_list.append(np.asarray(wave_df[wave_col], dtype=float) * 10.0)  # nm -> Angstrom
                 resp_list.append(np.asarray(resp_df[resp_col], dtype=float))
-    return wave_list, resp_list
+                band_list.append(band)
+    return wave_list, resp_list, band_list
 
 
 # ---------------------------------------------------------------------------
