@@ -124,8 +124,8 @@ def gfit_direct(x_array, y_array, y_err, mu, sigma, baseline):
         return None, None, p0
 
 
-def estimate_local_continuum(x, y, y_err, x0, min_points=5, clip_sigma=3.0):
-    """Robust local (linear) continuum level from a set of presumed-
+def estimate_local_continuum(x, y, y_err, min_points=5, clip_sigma=3.0, ref_keep=None):
+    """Robust local (flat) continuum level from a set of presumed-
     continuum points -- e.g. a line's wing, outside its own detected
     boundary -- instead of assuming the global normalization already put
     this window's continuum at exactly norm.
@@ -144,41 +144,60 @@ def estimate_local_continuum(x, y, y_err, x0, min_points=5, clip_sigma=3.0):
     noise -- a plain sigma-clip breaks down if that feature occupies a
     large fraction of the wing, so this is a coarse defense, not a
     substitute for the caller excluding an obviously separate line's own
-    core); second, a photon-noise-weighted linear fit (continuum =
-    c0 + c1*(x-x0)) to the surviving points captures a slowly-varying
-    residual from imperfect global normalization, not just a flat offset.
+    core); second, a photon-noise-weighted mean (a pure vertical bias, no
+    slope) of the surviving points. A fitted slope was tried and dropped:
+    it gave a one-sided contamination (a neighboring line's wing entering
+    only one side of the window, not caught by the clip above -- e.g. Fe I
+    5587.574 in the bundled sunr.fits sample) direct leverage to tilt the
+    whole local continuum, visibly biasing it low on the contaminated
+    side. A flat bias can't be tilted that way; it can still be pulled
+    off-level if contamination survives the clip, but not systematically
+    worse on one side of the window than the other.
+
+    ref_keep : optional boolean mask into x/y, e.g. from
+        reference_atlas.reference_continuum_mask() -- an independent,
+        externally-sourced exclusion (a real feature confirmed against a
+        high-S/N reference spectrum, too shallow for THIS spectrum's own
+        noise to catch via the median/MAD clip above) ANDed into the clip
+        below rather than replacing it. None (default) leaves behavior
+        identical to not having a reference atlas at all.
 
     Returns
     -------
-    c0, c1 : fitted local continuum level (at x0) and slope
-    c0_err : standard error on c0 from the fit -- large when few/noisy
-        wing points actually constrain it, so a correction from a poorly-
-        sampled wing doesn't get treated as confidently as one from a
-        clean, well-sampled one (see measure_ew()'s use of this in its EW
-        error budget)
+    c0 : the fitted local continuum level (flat, i.e. no slope)
+    c0_err : standard error on c0 -- large when few/noisy wing points
+        actually constrain it, so a correction from a poorly-sampled wing
+        doesn't get treated as confidently as one from a clean,
+        well-sampled one (see measure_ew()'s use of this in its EW error
+        budget)
     keep : boolean mask into x/y of points actually used (after clipping)
     """
     keep = np.zeros(len(x), dtype=bool)
     if len(x) < min_points:
-        return 0., 0., np.inf, keep
+        return 0., np.inf, keep
 
     med = np.median(y)
     mad = np.median(np.abs(y-med)) * 1.4826
     clip = max(mad, np.median(y_err))
     keep = y > (med - clip_sigma*clip)
+    if ref_keep is not None:
+        #a real reference-atlas exclusion should only ever SHRINK how much
+        #wing survives -- if it shrinks it below min_points, that's a sign
+        #the reference cross-check isn't well-conditioned here (e.g. poor
+        #atlas coverage, a bad resolving-power estimate), not that this
+        #line's continuum can't be estimated at all -- fall back to the
+        #median/MAD-only clip rather than failing outright
+        keep_with_ref = keep & ref_keep
+        if keep_with_ref.sum() >= min_points:
+            keep = keep_with_ref
     if keep.sum() < min_points:
-        return 0., 0., np.inf, keep
+        return 0., np.inf, keep
 
-    xc, yc, ec = x[keep]-x0, y[keep], np.clip(y_err[keep], 1e-6, None)
-    try:
-        coeffs, cov = np.polyfit(xc, yc, 1, w=1./ec, cov=True)
-        c1, c0 = coeffs
-        c0_err = np.sqrt(cov[1, 1])
-    except (np.linalg.LinAlgError, ValueError):
-        # degenerate fit (e.g. all points at the same x) -- fall back to
-        # a flat (no-slope) robust estimate
-        c0, c1, c0_err = float(np.median(yc)), 0., float(np.std(yc)/np.sqrt(len(yc)))
-    return c0, c1, c0_err, keep
+    yc, ec = y[keep], np.clip(y_err[keep], 1e-6, None)
+    w = 1./ec**2
+    c0 = np.sum(w*yc) / np.sum(w)
+    c0_err = 1./np.sqrt(np.sum(w))
+    return c0, c0_err, keep
 
 
 def gauss_ew(a, fwhm):

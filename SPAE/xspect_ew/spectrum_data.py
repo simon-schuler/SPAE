@@ -8,7 +8,6 @@ import pickle
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.interpolate import interp1d
-from scipy.integrate import simpson
 
 from .constants import ELEMENTS
 from .continuum import fit_als_continuum
@@ -22,6 +21,8 @@ from .response_correction import apply_response_correction as _apply_response_co
 from .overlap_check import check_order_overlaps as _check_order_overlaps
 from .overlap_check import flagged_overlap_ranges as _flagged_overlap_ranges
 from .line_identification import identify_lines_in_spectrum as _identify_lines_in_spectrum
+from .reference_atlas import (load_reference_atlas as _load_reference_atlas,
+                               estimate_resolving_power, reference_continuum_mask)
 
 
 class Spectrum_Data():
@@ -73,6 +74,13 @@ class Spectrum_Data():
         self.estimated_shift = np.zeros(len(self.wavelength))
         self.rv = None #km/s
 
+        #reference-atlas cross-check (see reference_atlas.py) -- unset
+        #until load_reference_atlas() is called; measure_ew() falls back
+        #to its existing behavior while these are None
+        self.ref_wave = None
+        self.ref_flux = None
+        self.ref_resolving_power = None
+
         #continuum information
         self.continuum = np.full(len(self.wavelength), None)
         #print('cont array empty', self.continuum)
@@ -116,10 +124,6 @@ class Spectrum_Data():
         self.lines_ew = None
         #line - equivalent width error
         self.lines_ew_err = None
-        #line - equivalent width calculated by simpon's rule integration
-        self.lines_ew_simp = None
-        #line - equivalent width error from integraion
-        self.lines_ew_simp_err = None
         #line - best fit parameters for gaussian fit
         self.lines_bf_params = None
         #line - X squared value for gaussian and data
@@ -157,9 +161,6 @@ class Spectrum_Data():
         #flag_order_overlaps(), consulted by check_for_flags(). Empty
         #(no-op) until flag_order_overlaps() is called.
         self.overlap_flag_ranges = []
-        #used to switch between Adamow ew calculation and simpson's rule integration
-        self.temp_line_ew = None
-        self.temp_line_ew_err = None
 
     def apply_response_correction(self, response_wave, response, min_overlap_fraction=0.5,
                                    min_response_fraction=0.1, response_bands=None, science_bands=None):
@@ -774,8 +775,6 @@ class Spectrum_Data():
         self.lines_exp = np.zeros((len(self.lines),4))
         self.lines_ew = np.zeros(len(self.lines))
         self.lines_ew_err = np.zeros(len(self.lines))
-        self.lines_ew_simp = np.zeros(len(self.lines))
-        self.lines_ew_simp_err = np.zeros(len(self.lines))
         self.lines_bf_params = np.array([None]*len(self.lines))
         self.lines_gauss_Xsquare = np.array([np.nan]*len(self.lines))
         self.lines_found_position = np.array([np.nan]*len(self.lines))
@@ -846,22 +845,6 @@ class Spectrum_Data():
         self.lines_id_run = True
         return results
 
-    # def switch_ew_values(self):
-    #     if self.temp_line_ew == None:
-    #         print("switching from Adamow calculation for EW to Simpson's rule integration")
-    #         self.temp_line_ew = self.lines_ew
-    #         self.temp_line_ew_err = self.lines_ew_err
-
-    #         self.lines_ew = self.lines_ew_simp
-    #         self.lines_ew_err = self.lines_ew_simp_err
-    #     else:
-    #         print("switching from Simpson's rule integration for EW to Adamow calculation for EW")
-    #         self.lines_ew = self.temp_line_ew
-    #         self.lines_ew_err = self.temp_line_ew_err
-
-    #         self.temp_line_ew = self.lines_ew_simp
-    #         self.temp_line_ew_err = self.lines_ew_simp_err
-
     def make_ew_doc(self, name, doc_title='STARNAME, PROJECT, YEAR; ', flagged_name=None):
         """
         Write the measured EWs as a MOOG-format linelist.
@@ -924,6 +907,45 @@ class Spectrum_Data():
         flagged_doc.close()
         return np.array(removed_lines)
 
+    def load_reference_atlas(self, path, resolving_power=None):
+        """Load an independent, high-S/N reference spectrum (e.g. the
+        Kurucz solar flux atlas, fluxspliced.2005) that measure_ew() will
+        cross-check a line's wing against -- see reference_atlas.py's
+        module docstring for why: a real but shallow, gradual blend (not
+        a sharp outlier) can bias estimate_local_continuum()'s median/MAD
+        clip, and an independent high-S/N reference can catch that where
+        this spectrum's own noise can't.
+
+        Only useful when a suitable reference actually exists for this
+        target (so far: the Sun) -- do not load a reference atlas of a
+        different star. Nothing else changes if this is never called;
+        measure_ew() falls back to its current behavior.
+
+        Call load_lines() before this if resolving_power is left as None:
+        the empirical estimate default-samples the already-loaded
+        linelist (see reference_atlas.estimate_resolving_power()).
+
+        resolving_power : R = lambda/FWHM for THIS spectrum (not the
+            atlas). None (default) estimates it empirically from a robust
+            LOW percentile of fitted width across the loaded linelist's
+            weak-to-moderate, unsaturated lines (see
+            reference_atlas.estimate_resolving_power()'s docstring for why
+            a low percentile, not the median) -- pass an explicit value
+            instead if you already know your instrument's R, since that's
+            ordinarily a known setup property rather than something to
+            infer from a handful of noisy fits.
+        """
+        self.ref_wave, self.ref_flux = _load_reference_atlas(path)
+        if resolving_power is not None:
+            self.ref_resolving_power = resolving_power
+        else:
+            self.ref_resolving_power = estimate_resolving_power(self)
+            if self.ref_resolving_power is None:
+                print('load_reference_atlas: could not empirically estimate a resolving '
+                      'power (fewer than 5 usable lines) -- pass resolving_power '
+                      'explicitly instead. Reference atlas NOT loaded.')
+                self.ref_wave, self.ref_flux = None, None
+
     def measure_ew(self, i, order, plot = False, ex_params = [0,0,0,0], save_plot = False, window_size = 1.5, show_plot = True, fit_continuum = True):
         #extra parameters [0] - shift continuum
         #                 [1] - left boundary in Angstroms
@@ -932,11 +954,11 @@ class Spectrum_Data():
         #show_plot: set False to save/build the figure without blocking on
         #plt.show() -- used by measure_all_ew(save_all=True) so a QC plot
         #for every line doesn't pop up (and need closing) one at a time
-        #fit_continuum: estimate a local linear continuum level+slope (c0,
-        #c1) from this line's own wing data (see estimate_local_continuum)
-        #rather than assuming the global normalization already put this
-        #window's continuum exactly at norm -- fixes fits biased by
-        #imperfect normalization. Set False to fall back to the old fixed-
+        #fit_continuum: estimate a local flat continuum level (c0) from
+        #this line's own wing data (see estimate_local_continuum) rather
+        #than assuming the global normalization already put this window's
+        #continuum exactly at norm -- fixes fits biased by imperfect
+        #normalization. Set False to fall back to the old fixed-
         #continuum-at-norm behavior.
         norm = 1.0
         wind, found_line, line_bound,dy = get_line_window(self.lines[i],self.shifted_wavelength[order],self.normalized_flux[order],ex_params[1],ex_params[2],ex_params[3], window_size)
@@ -989,8 +1011,8 @@ class Spectrum_Data():
         #by other_than_line -- confirmed to shift fit results measurably.
         #(only_line used to be built with `|` instead of `&`, which is
         #true for virtually every point regardless of line_bound -- fixed,
-        #since it's what restricts the chi-square/Simpson checks below to
-        #the line itself instead of the whole window.)
+        #since it's what restricts the chi-square check below to the
+        #line itself instead of the whole window.)
         other_than_line = (measure_x_array <= line_bound[0]) | (measure_x_array >= line_bound[1])
         in_line = ~other_than_line
         only_line = np.where(in_line)
@@ -1009,29 +1031,42 @@ class Spectrum_Data():
         y_err = 2*temp_err_array/temp_pred_array
 
         wing_idx = np.where(other_than_line)[0]
-        c0, c1, c0_err = norm, 0., 0.  # "no correction": continuum assumed flat at norm
+        c0, c0_err = norm, 0.  # "no correction": continuum assumed flat at norm
         if fit_continuum:
-            #Estimate the local continuum (level+slope) from the real wing
-            #data -- outside this line's own detected boundary -- robustly
-            #excluding points that look like a different, deeper feature,
-            #rather than assuming this window's continuum is already
-            #exactly at norm. This is a separate ESTIMATION step, not a
-            #parameter fit jointly with the line: letting continuum and
-            #amplitude trade off in one fit, seeded from only the line's
-            #own handful of core points, was confirmed to overfit badly on
-            #weaker lines (see estimate_local_continuum()'s docstring) --
-            #a local continuum should be set by the many nearby continuum
-            #points, not the line's own few. estimate_local_continuum()
-            #works in real-flux space (it clips LOW outliers, i.e.
-            #deeper-absorption contamination) -- c0/c1 here are the real
-            #continuum level/slope, not yet the inverted-space offset the
-            #rest of this function uses.
-            c0, c1, c0_err, _ = estimate_local_continuum(
-                xtest[wing_idx], full_y[wing_idx], y_err[wing_idx], found_line)
+            #Estimate the local continuum (a flat bias, no slope) from the
+            #real wing data -- outside this line's own detected boundary --
+            #robustly excluding points that look like a different, deeper
+            #feature, rather than assuming this window's continuum is
+            #already exactly at norm. This is a separate ESTIMATION step,
+            #not a parameter fit jointly with the line: letting continuum
+            #and amplitude trade off in one fit, seeded from only the
+            #line's own handful of core points, was confirmed to overfit
+            #badly on weaker lines (see estimate_local_continuum()'s
+            #docstring) -- a local continuum should be set by the many
+            #nearby continuum points, not the line's own few. No slope
+            #term: a fitted slope was confirmed to let a one-sided
+            #contaminating neighbor (its wing entering only one side of
+            #the window) tilt the whole local continuum -- a flat bias
+            #can't be tilted that way (see estimate_local_continuum()'s
+            #docstring). estimate_local_continuum() works in real-flux
+            #space (it clips LOW outliers, i.e. deeper-absorption
+            #contamination) -- c0 here is the real continuum level, not
+            #yet the inverted-space offset the rest of this function uses.
+            ref_keep = None
+            if self.ref_wave is not None:
+                #independent cross-check against a high-S/N reference
+                #atlas (see load_reference_atlas()/reference_atlas.py):
+                #catches a real but shallow, gradual blend that the
+                #median/MAD clip above can't tell from ordinary noise
+                ref_keep = reference_continuum_mask(
+                    xtest[wing_idx], y_err[wing_idx], self.ref_wave, self.ref_flux,
+                    self.ref_resolving_power)
+            c0, c0_err, _ = estimate_local_continuum(
+                xtest[wing_idx], full_y[wing_idx], y_err[wing_idx], ref_keep=ref_keep)
 
         #convert to the inverted-space offset (norm - real continuum) that
         #y_fit/gauss_model operate in throughout the rest of this function
-        cont_offset = norm - (c0 + c1*(xtest-found_line))
+        cont_offset = norm - c0
         y_detrend = y_fit - cont_offset
 
         if fit_continuum:
@@ -1042,6 +1077,21 @@ class Spectrum_Data():
             #sits, against a genuinely corrected local continuum
             fit_mask = in_line.copy()
             fit_mask[wing_idx] = np.abs(y_detrend[wing_idx]) < 5*np.median(y_err[wing_idx])
+            if ref_keep is not None:
+                #without this, a reference-atlas-flagged point can still be
+                #included here even though estimate_local_continuum() above
+                #excluded it from c0 -- confirmed on a real case (Fe I
+                #5577.03): a still-declining neighbor-wing tail too close to
+                #c0 to trip the |y_detrend|<5*median(y_err) cut leaked into
+                #the Gaussian fit, pulling its free `baseline` parameter
+                #away from zero and making the plotted fit curve's far-wing
+                #level (c0 - baseline) visibly diverge from c0 itself.
+                #Same fallback spirit as estimate_local_continuum(): don't
+                #let this restriction alone starve the fit of points.
+                restricted_fit_mask = fit_mask.copy()
+                restricted_fit_mask[wing_idx] &= ref_keep
+                if restricted_fit_mask.sum() >= 5:
+                    fit_mask = restricted_fit_mask
             line_hwidth = max((line_bound[1]-line_bound[0])/2.0, 0.01)
             sigma_guess = line_hwidth/1.5
             bf, pcov, p0 = gfit_direct(xtest[fit_mask], y_detrend[fit_mask], y_err[fit_mask],
@@ -1056,7 +1106,6 @@ class Spectrum_Data():
             #hurt convergence/stability here where they're NOT detrended
             fit_y = y_detrend.copy()
             fit_y[other_than_line] = 0.
-            fit_mask = in_line  # only used below to pick the Simpson integration domain
             bf, pcov, p0 = gfit_direct(xtest, fit_y, y_err, found_line, 0.5, 0.)
         fail_bf = np.array([0., found_line, 0., 0.])
         if bf is None:
@@ -1092,24 +1141,8 @@ class Spectrum_Data():
         self.lines_bf_params[i] = best_bf
         self.lines_ew[i] = ew
         self.lines_ew_err[i] = ew_err
-        if ew == 0:
-            self.lines_ew_simp[i] = 0
-            self.lines_ew_simp_err[i] = np.nan
-        else:
-            #Simpson's-rule integration of the continuum-corrected profile,
-            #as a cross-check on the Gaussian EW above -- a point estimate,
-            #not a resampled distribution, so it carries no error of its
-            #own. Integrated over fit_mask (same points the fit itself
-            #used), not just the line's own narrow core (only_line): that
-            #core can be just a handful of points spanning well under the
-            #Gaussian's full area for a line whose auto-detected boundary
-            #undershoots its true width, which was confirmed to make this
-            #cross-check read ~2x low on real lines in the bundled sample
-            #even though the Gaussian fit itself was fine.
-            self.lines_ew_simp[i] = simpson(y_detrend[fit_mask], xtest[fit_mask])*1000
-            self.lines_ew_simp_err[i] = np.nan
         print('line to measure:', ELEMENTS[self.lines_exd[i][0]],self.lines[i], '- Line found:', found_line)
-        print('EW:',np.round(self.lines_ew[i],2),u"±",np.round(self.lines_ew_err[i],2), 'simps-int:', np.round(self.lines_ew_simp[i],2),u"±", np.round(self.lines_ew_simp_err[i],2))
+        print('EW:',np.round(self.lines_ew[i],2),u"±",np.round(self.lines_ew_err[i],2))
 
         #Plotting stuff
         if plot:
@@ -1131,11 +1164,10 @@ class Spectrum_Data():
             #wavelength grid than the actual data -- xtest only has one
             #point per real pixel, which makes a narrow line's Gaussian
             #fit curve look faceted/low-resolution; this is purely
-            #cosmetic (fitting, chi-square and the Simpson cross-check
-            #above all still use the real data grid, unchanged)
+            #cosmetic (fitting and the chi-square check above still use
+            #the real data grid, unchanged)
             xplot = np.linspace(xtest[0], xtest[-1], len(xtest)*5)
-            cont_offset_plot = norm - (c0 + c1*(xplot-found_line))
-            fit_gauss_plot = norm - (gauss_model(xplot, *best_bf) + cont_offset_plot)
+            fit_gauss_plot = norm - (gauss_model(xplot, *best_bf) + cont_offset)
             fit_view.plot(xplot, fit_gauss_plot, '--', color = '#377eb8', lw= 2, label = 'Gaussian fit')
             if pcov is not None:
                 model_err_plot = gauss_model_err(xplot, best_bf, pcov)
@@ -1143,11 +1175,11 @@ class Spectrum_Data():
                          color = '#377eb8', alpha = 0.25, zorder = 1, label = r'fit $\pm1\sigma$')
             fit_view.plot([xtest[0],xtest[-1]],[norm,norm], '--', color = '#4daf4a', label = 'assumed continuum (norm)')
             if fit_continuum:
-                #the estimated LOCAL continuum level (c0, c1), so you can
-                #see directly how far the global normalization was off
-                #here -- this is what fixes a fit biased by imperfect
-                #normalization
-                local_cont_plot = norm - cont_offset_plot
+                #the estimated LOCAL continuum level (c0, flat/no slope),
+                #so you can see directly how far the global normalization
+                #was off here -- this is what fixes a fit biased by
+                #imperfect normalization
+                local_cont_plot = np.full_like(xplot, norm - cont_offset)
                 fit_view.plot(xplot, local_cont_plot, ':', color = '#ff7f00', lw = 2, label = 'estimated local continuum')
             fit_view.legend(loc='best', fontsize=8)
 
@@ -1221,11 +1253,9 @@ class Spectrum_Data():
             for i in range(len(self.lines)):
                 if self.lines[i] in exclude_lines:
                     self.lines_ew[i] = 0.0
-                    self.lines_ew_simp[i] = 0.0
                     self.lines_gauss_Xsquare[i] = np.nan
                     self.lines_bf_params[i] = None
                     self.lines_ew_err[i] = np.nan
-                    self.lines_ew_simp_err[i] = np.nan
                     self.lines_exp[i] = [0,0,0,0]
                     #self.lines_check_flag[i] = False
                 elif self.lines[i] >= self.shifted_wavelength[order][0] and self.lines[i] <= self.shifted_wavelength[order][-1]:
@@ -1252,11 +1282,9 @@ class Spectrum_Data():
             if self.lines[i] >= self.shifted_wavelength[order][0] and self.lines[i] <= self.shifted_wavelength[order][-1]:
                 if not found:
                     self.lines_ew[i] = 0.0
-                    self.lines_ew_simp[i] = 0.0
                     self.lines_gauss_Xsquare[i] = np.nan
                     self.lines_bf_params[i] = None
                     self.lines_ew_err[i] = np.nan
-                    self.lines_ew_simp_err[i] = np.nan
                     #self.lines_check_flag[i] = False
                     self.measure_ew(i,order, True, ex_params, save_plot, window_size, fit_continuum=fit_continuum)
                     found = True
