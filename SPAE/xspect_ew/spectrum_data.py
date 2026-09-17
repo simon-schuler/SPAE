@@ -890,6 +890,14 @@ class Spectrum_Data():
         self.lines_check_flag = np.array([False]*len(self.lines))
         self.lines_flag_reasons = np.array(['']*len(self.lines), dtype=object)
         self.lines_human_keep = np.array([False]*len(self.lines))
+        #line - which order's measurement is the one kept in lines_ew[i]
+        #etc, and how far (Angstroms) that line sat from that order's
+        #nearer edge -- set by measure_all_ew() when the same line falls
+        #in more than one order (echelle order overlap); see its
+        #docstring. None/NaN if the line hasn't been measured yet, or was
+        #only ever seen in one order (no overlap to resolve).
+        self.lines_order = np.array([None]*len(self.lines))
+        self.lines_edge_distance = np.array([np.nan]*len(self.lines))
         #identify_lines() results -- a separate, prior step from EW
         #measurement (see line_identification.py's module docstring);
         #all default to "not run yet", distinct from lines_found_position
@@ -1063,7 +1071,7 @@ class Spectrum_Data():
                       'explicitly instead. Reference atlas NOT loaded.')
                 self.ref_wave, self.ref_flux = None, None
 
-    def measure_ew(self, i, order, plot = False, ex_params = [0,0,0,0], save_plot = False, window_size = 1.5, show_plot = True, fit_continuum = False, auto_widen = True, widen_window_size = 2.5, slope_sig_thresh = 3.0, slope_min_points = 5, slope_internal_sig_thresh = 3.0, plot_window_size = None):
+    def measure_ew(self, i, order, plot = False, ex_params = [0,0,0,0], save_plot = False, window_size = 1.5, show_plot = True, fit_continuum = False, auto_widen = True, widen_window_size = 2.5, slope_sig_thresh = 3.0, slope_min_points = 5, slope_internal_sig_thresh = 3.0, plot_window_size = None, keep_result = True):
         #extra parameters [0] - shift continuum
         #                 [1] - left boundary in Angstroms
         #                 [2] - right boundary in Angstroms
@@ -1106,6 +1114,19 @@ class Spectrum_Data():
         #order). None (default): plot exactly the fit window, unchanged
         #from before this parameter existed. Never affects the fit,
         #EW, or error -- those still only ever see window_size's data.
+        #keep_result: True (default) writes this measurement into
+        #self.lines_*[i] as usual. Set False to still run the full
+        #measurement (fit, print, and -- if requested -- plot/save) but
+        #WITHOUT overwriting self.lines_*[i] -- used by measure_all_ew()
+        #when the same line falls in more than one order (echelle order
+        #overlap): every order it appears in still gets measured and
+        #logged/plotted for inspection, but only the measurement from the
+        #order where the line sits FURTHEST from that order's edge is
+        #kept as the one self.lines_ew[i]/check_for_flags()/make_ew_doc()
+        #actually see -- an edge measurement is the one most exposed to
+        #exactly the kind of order-boundary artifacts investigated this
+        #session (see continuum.py's edge_ignore_aa). See measure_all_ew()
+        #for how the winning order is chosen.
         norm = 1.0
         wind, found_line, line_bound,dy = get_line_window(self.lines[i],self.shifted_wavelength[order],self.normalized_flux[order],ex_params[1],ex_params[2],ex_params[3], window_size)
 
@@ -1142,7 +1163,8 @@ class Spectrum_Data():
         # record the actually-identified line center -- check_for_flags()
         # compares this against the rest wavelength to catch likely
         # misidentification (see its docstring)
-        self.lines_found_position[i] = found_line
+        if keep_result:
+            self.lines_found_position[i] = found_line
 
         #in_line/other_than_line: boolean split of the fit window into the
         #line's own core (between its detected boundaries) and everything
@@ -1308,7 +1330,7 @@ class Spectrum_Data():
                   f'{widen_window_size}')
             self.measure_ew(i, order, plot, ex_params, save_plot, widen_window_size,
                              show_plot, fit_continuum, auto_widen=False,
-                             plot_window_size=plot_window_size)
+                             plot_window_size=plot_window_size, keep_result=keep_result)
             return
 
         #DIAGNOSTIC: a parallel conditionally-sloped local continuum --
@@ -1365,8 +1387,9 @@ class Spectrum_Data():
         isig_r = slope_diag.get('internal_sig_red')
         isig_b_str = 'n/a' if isig_b is None else f"{isig_b:.2f}"
         isig_r_str = 'n/a' if isig_r is None else f"{isig_r:.2f}"
-        self.lines_internal_trend_blue[i] = bool(slope_diag.get('internal_trend_blue'))
-        self.lines_internal_trend_red[i] = bool(slope_diag.get('internal_trend_red'))
+        if keep_result:
+            self.lines_internal_trend_blue[i] = bool(slope_diag.get('internal_trend_blue'))
+            self.lines_internal_trend_red[i] = bool(slope_diag.get('internal_trend_red'))
         print(f'  [slope diagnostic] EW(flat)={ew:.2f}+/-{ew_err:.2f}  '
               f'EW(sloped)={ew_slope:.2f}+/-{ew_err_slope:.2f}  used_slope={used_slope}  '
               f'c1={c1_slope:.5f}  n_blue={slope_diag.get("n_blue")} n_red={slope_diag.get("n_red")}  '
@@ -1413,22 +1436,26 @@ class Spectrum_Data():
         #observed core shape at all.
         fit_gauss_global = norm - (gauss_model(xtest, *bf_global) + 0.)
         diff = (fit_gauss_global[only_line] - full_y[only_line])**2
-        self.lines_gauss_Xsquare[i] = np.sum(diff)
-
         #DEFAULT REPORTED EW: the GLOBAL-continuum fit (bf_global/
         #ew_global), not the local-continuum-corrected one -- see the
         #comment above where bf_global is computed. lines_bf_params
         #follows the same choice so it stays consistent with lines_ew.
         #best_bf/ew/ew_err (the local-continuum-corrected fit) are kept
         #separately in lines_ew_local/lines_ew_err_local for comparison
-        #only.
-        self.lines_bf_params[i] = bf_global
-        self.lines_ew[i] = ew_global
-        self.lines_ew_err[i] = ew_err_global
-        self.lines_ew_local[i] = ew
-        self.lines_ew_err_local[i] = ew_err
+        #only. All gated by keep_result (see its docstring above) -- when
+        #this line was also measured in another, better-placed order
+        #(measure_all_ew()'s order-overlap handling), this order's numbers
+        #are still fit/printed/plotted below for inspection, just not
+        #written into self.lines_*[i].
+        if keep_result:
+            self.lines_gauss_Xsquare[i] = np.sum(diff)
+            self.lines_bf_params[i] = bf_global
+            self.lines_ew[i] = ew_global
+            self.lines_ew_err[i] = ew_err_global
+            self.lines_ew_local[i] = ew
+            self.lines_ew_err_local[i] = ew_err
         print('line to measure:', ELEMENTS[self.lines_exd[i][0]],self.lines[i], '- Line found:', found_line)
-        print('EW:',np.round(self.lines_ew[i],2),u"±",np.round(self.lines_ew_err[i],2))
+        print('EW:',np.round(ew_global,2),u"±",np.round(ew_err_global,2))
 
         #Plotting stuff
         if plot:
@@ -1574,7 +1601,8 @@ class Spectrum_Data():
         if ex_params == [0,0,0,0]:
             pass
         else:
-            self.lines_exp[i] = np.array(ex_params)
+            if keep_result:
+                self.lines_exp[i] = np.array(ex_params)
             print('extra params:',ex_params)
 
     def measure_all_ew(self, exclude_lines= [], plot_lines=[], ex_params = {}, window_size = 1.5, save_all = False, fit_continuum = False, auto_widen = True, widen_window_size = 2.5, slope_sig_thresh = 3.0, slope_min_points = 5, slope_internal_sig_thresh = 3.0, plot_window_size = None):
@@ -1608,9 +1636,30 @@ class Spectrum_Data():
 
         plot_window_size : PLOTTING ONLY, passed through to measure_ew()
             -- see its docstring. Never affects the fit, EW, or error.
+
+        Order overlap: a line near two adjacent orders' shared boundary
+        can fall inside BOTH orders' wavelength ranges, so this loop
+        measures it once per order it appears in -- but only the
+        measurement from the order where the line sits FURTHEST from
+        that order's own edge (in Angstroms) is kept in self.lines_*[i]
+        (via measure_ew()'s keep_result); every other order's measurement
+        of the same line is still fit/printed/plotted (if save_all/
+        plot_lines request it) but discarded, never overwriting the kept
+        one -- and this holds regardless of which order this loop happens
+        to reach first. lines_order[i]/lines_edge_distance[i] record which
+        order won and by how much. An edge measurement is exactly the
+        kind most exposed to real order-boundary artifacts (see
+        continuum.py's edge_ignore_aa and its module docstring for a
+        real confirmed case), so this is a real reliability choice, not
+        just deduplication for its own sake.
         """
         if save_all:
             make_plots_folder()
+
+        #running "best so far" edge-distance per line, for this call only
+        #(not persisted -- self.lines_edge_distance below is the public,
+        #persisted record of the WINNING order's distance)
+        best_edge_dist = np.full(len(self.lines), -np.inf)
 
         for order in range(len(self.wavelength)):
             for i in range(len(self.lines)):
@@ -1628,6 +1677,20 @@ class Spectrum_Data():
                         plot = True
                         if self.lines[i] in ex_params.keys():
                             exp = ex_params[self.lines[i]]
+                    #edge_dist: how far (Angstroms) the line's REST
+                    #wavelength sits from the nearer edge of this order --
+                    #used (not the later-fitted center) so this decision
+                    #is made once, up front, the same way regardless of
+                    #which order the loop reaches first; a difference of
+                    #up to ~0.1 A (typical RV-shift/line-position scatter)
+                    #is negligible against orders that are tens of A wide
+                    edge_dist = min(self.lines[i] - self.shifted_wavelength[order][0],
+                                     self.shifted_wavelength[order][-1] - self.lines[i])
+                    keep_result = edge_dist > best_edge_dist[i]
+                    if keep_result:
+                        best_edge_dist[i] = edge_dist
+                        self.lines_order[i] = order
+                        self.lines_edge_distance[i] = edge_dist
                     if save_all:
                         plot = True
                         self.measure_ew(i,order, plot, exp, True, window_size,
@@ -1635,12 +1698,12 @@ class Spectrum_Data():
                                          auto_widen=auto_widen, widen_window_size=widen_window_size,
                                          slope_sig_thresh=slope_sig_thresh, slope_min_points=slope_min_points,
                                          slope_internal_sig_thresh=slope_internal_sig_thresh,
-                                         plot_window_size=plot_window_size)
+                                         plot_window_size=plot_window_size, keep_result=keep_result)
                     else:
                         self.measure_ew(i,order, plot, exp, False, window_size, fit_continuum=fit_continuum,
                                          auto_widen=auto_widen, widen_window_size=widen_window_size,
                                          slope_sig_thresh=slope_sig_thresh, slope_min_points=slope_min_points,
-                                         slope_internal_sig_thresh=slope_internal_sig_thresh,
+                                         slope_internal_sig_thresh=slope_internal_sig_thresh, keep_result=keep_result,
                                          plot_window_size=plot_window_size)
         #self.lines_bf_params = np.array(self.lines_bf_params)
 
