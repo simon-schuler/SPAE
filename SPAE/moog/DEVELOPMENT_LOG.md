@@ -126,3 +126,18 @@ Full run outputs (samplers, logs, trace plots, final summaries) live in
 `Verification/KepTest/<Star>/` -- not tracked in this repository (see
 `[[feedback-experiment-tracking]]`), this file is the durable record of
 the run configuration and results.
+
+### 1.4 MRT paper-table exports
+
+With all 7 stars validated and finalized (§1.2-1.3), generated a
+per-star CDS/MRT export (`SPAE.analysis.write_mrt()`) for each --
+`Verification/KepTest/<Star>/<star>_1.mrt`, using each star's own
+confirmed `burn_in` (100 for six stars, 200 for Kepler-20). All 7
+round-trip cleanly through astropy's `Table.read(..., format=
+'ascii.cds')` reader. This is the first real multi-star use of
+`write_mrt()` (previously only smoke-tested on a single star, Kepler-22)
+-- since the function is deliberately per-star/per-run with no bulk API
+(different stars can need different `burn_in`), the natural pattern is a
+loop varying `burn_in` per star while reusing each star's already-saved
+sampler pickle (no MCMC re-run needed). This pattern is now documented
+in `SPAE_QUICKSTART.md`'s "Step 8 (optional) -- a multi-star batch".
