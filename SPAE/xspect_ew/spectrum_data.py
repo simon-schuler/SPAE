@@ -92,8 +92,17 @@ class Spectrum_Data():
             false_array = np.full(len(self.wavelength[i]), False)
             #print('false array created', false_array)
             self.continuum[i] = false_array
-            self.pred_all[i] = np.full(len(self.wavelength[i]), 0)
-            self.pred_var_all[i] = np.full(len(self.wavelength[i]), 0)
+            # dtype=float (not the bare-int default from np.full(n, 0)) --
+            # an int array here silently truncates any fractional
+            # continuum value to 0, and wraps a NaN/Inf fit result (e.g.
+            # from a singular AsLS solve, see fit_als_continuum()) to
+            # int64's sentinel min (-9223372036854775808) instead of
+            # propagating it as NaN. Both confirmed on real data: the
+            # bundled suni.fits sample (order 9, a singular-matrix case)
+            # and HD_102071's faintest blue orders (near-zero real
+            # continuum, truncated to exact 0 -> normalized_flux=inf).
+            self.pred_all[i] = np.full(len(self.wavelength[i]), 0, dtype=float)
+            self.pred_var_all[i] = np.full(len(self.wavelength[i]), 0, dtype=float)
             #abs() guards against the occasional slightly-negative pixel
             #from background/bias subtraction (confirmed on the bundled
             #suni.fits sample: 4/4021 pixels in one order, ~-20 counts
@@ -121,13 +130,33 @@ class Spectrum_Data():
         #line - extra data [0] - element, [1] - excitation potential
         #[2] - gf, [3] - rad
         self.lines_exd = None
-        #line - equivalent width
+        #line - equivalent width, from the GLOBAL-continuum fit (bf_global
+        #-- continuum pinned at norm, no local wing-based correction).
+        #This is the REPORTED EW (what make_ew_doc()/check_for_flags()
+        #use) -- see measure_ew()'s comment where bf_global is computed
+        #for why the global fit, not the local-continuum-corrected one,
+        #is the default.
         self.lines_ew = None
-        #line - equivalent width error
+        #line - equivalent width error, GLOBAL-continuum fit
         self.lines_ew_err = None
+        #line - equivalent width from the LOCAL-continuum-corrected fit
+        #(best_bf/cont_offset -- estimate_local_continuum()'s flat,
+        #photon-noise-weighted bias applied), set by measure_ew() whenever
+        #fit_continuum=True (equal to lines_ew when fit_continuum=False,
+        #since best_bf/bf_global are then the same fit). Kept as a
+        #diagnostic/comparison value only -- NOT what's reported in
+        #make_ew_doc()'s linelist or checked by check_for_flags().
+        self.lines_ew_local = None
+        #line - equivalent width error, LOCAL-continuum-corrected fit --
+        #see lines_ew_local
+        self.lines_ew_err_local = None
         #line - best fit parameters for gaussian fit
         self.lines_bf_params = None
-        #line - X squared value for gaussian and data
+        #line - sum-of-squared-residuals between the observed line core
+        #and a Gaussian fit against the GLOBAL continuum (norm, no local
+        #wing-based correction) -- see measure_ew()'s comment where this
+        #is set for why the global fit, not the local-continuum-corrected
+        #one, is what's checked here
         self.lines_gauss_Xsquare = None
         #line - X squared threshold value
         self.X_thresh = 0.003
@@ -136,6 +165,14 @@ class Spectrum_Data():
         #the rest wavelength (self.lines) is how check_for_flags() catches
         #likely misidentification -- see its docstring.
         self.lines_found_position = None
+        #line - per-side (blue/red wing) booleans from
+        #estimate_local_continuum_sloped()'s internal near-vs-far trend
+        #test, always set by measure_ew() regardless of fit_continuum (see
+        #its docstring for why this diagnostic isn't gated by that flag).
+        #check_for_flags() flags a line where BOTH are True -- see its
+        #docstring and measure_ew()'s comment where these are set.
+        self.lines_internal_trend_blue = None
+        self.lines_internal_trend_red = None
         #line - max allowed |lines_found_position - lines| (Angstrom) before
         #check_for_flags() flags a line as a possible misidentification.
         #Note get_line_window()'s own search is bounded to +/-0.1 A around
@@ -303,6 +340,15 @@ class Spectrum_Data():
         detection method and its parameters (stiffen_factor,
         local_window, wide_window, severity_threshold, passed through
         via **als_kwargs).
+
+        Each order's outer `edge_ignore_aa` Angstroms (default 2.0, also
+        passed through via **als_kwargs) are excluded from influencing
+        the fit -- real order edges are where detector/blaze artifacts
+        concentrate (confirmed on a real Keck order), and this default
+        avoids the fit getting dragged by one. A continuum value is still
+        produced there (extrapolated from the trusted interior), so nothing
+        downstream sees a gap. See fit_als_continuum()'s docstring for the
+        real tradeoff this involves and when to lower it toward 0.
 
         See continuum.py's module docstring for the full history of what
         this replaced and why each earlier attempt failed on real data.
@@ -834,9 +880,13 @@ class Spectrum_Data():
         self.lines_exp = np.zeros((len(self.lines),4))
         self.lines_ew = np.zeros(len(self.lines))
         self.lines_ew_err = np.zeros(len(self.lines))
+        self.lines_ew_local = np.zeros(len(self.lines))
+        self.lines_ew_err_local = np.zeros(len(self.lines))
         self.lines_bf_params = np.array([None]*len(self.lines))
         self.lines_gauss_Xsquare = np.array([np.nan]*len(self.lines))
         self.lines_found_position = np.array([np.nan]*len(self.lines))
+        self.lines_internal_trend_blue = np.array([False]*len(self.lines))
+        self.lines_internal_trend_red = np.array([False]*len(self.lines))
         self.lines_check_flag = np.array([False]*len(self.lines))
         self.lines_flag_reasons = np.array(['']*len(self.lines), dtype=object)
         self.lines_human_keep = np.array([False]*len(self.lines))
@@ -1013,7 +1063,7 @@ class Spectrum_Data():
                       'explicitly instead. Reference atlas NOT loaded.')
                 self.ref_wave, self.ref_flux = None, None
 
-    def measure_ew(self, i, order, plot = False, ex_params = [0,0,0,0], save_plot = False, window_size = 1.5, show_plot = True, fit_continuum = True, auto_widen = True, widen_window_size = 2.5, slope_sig_thresh = 3.0, slope_min_points = 5, slope_internal_sig_thresh = 3.0):
+    def measure_ew(self, i, order, plot = False, ex_params = [0,0,0,0], save_plot = False, window_size = 1.5, show_plot = True, fit_continuum = False, auto_widen = True, widen_window_size = 2.5, slope_sig_thresh = 3.0, slope_min_points = 5, slope_internal_sig_thresh = 3.0, plot_window_size = None):
         #extra parameters [0] - shift continuum
         #                 [1] - left boundary in Angstroms
         #                 [2] - right boundary in Angstroms
@@ -1021,23 +1071,41 @@ class Spectrum_Data():
         #show_plot: set False to save/build the figure without blocking on
         #plt.show() -- used by measure_all_ew(save_all=True) so a QC plot
         #for every line doesn't pop up (and need closing) one at a time
-        #fit_continuum: estimate a local flat continuum level (c0) from
-        #this line's own wing data (see estimate_local_continuum) rather
-        #than assuming the global normalization already put this window's
-        #continuum exactly at norm -- fixes fits biased by imperfect
-        #normalization. Set False to fall back to the old fixed-
-        #continuum-at-norm behavior.
-        #slope_sig_thresh, slope_min_points: DIAGNOSTIC ONLY -- passed to
-        #estimate_local_continuum_sloped() (see its docstring), which is
-        #computed and reported/plotted in parallel with the flat local
-        #continuum above but does NOT (yet) drive the reported EW itself.
-        #Exposed here so both can be tuned against real lines before
-        #deciding whether the sloped method should become the default.
+        #fit_continuum: False (DEFAULT): assume the global normalization
+        #already put this window's continuum exactly at norm -- the
+        #reported EW (self.lines_ew) always comes from this GLOBAL-
+        #continuum fit regardless of this flag (see bf_global below); this
+        #flag only controls whether an ADDITIONAL, local-continuum-
+        #corrected comparison fit is also computed. True: additionally
+        #estimate a local flat continuum level (c0) from this line's own
+        #wing data (see estimate_local_continuum()) and fit against that
+        #instead -- stored as lines_ew_local/lines_ew_err_local, a
+        #diagnostic/comparison value only, kept in the codebase but no
+        #longer the default after real-star testing (HD_10383) showed the
+        #GLOBAL-continuum fit was actually the more reliable default for
+        #EW reporting (see check_for_flags()'s global-chi2 check, and
+        #xspect-ew-continuum-flagging session notes) -- letting the local
+        #continuum vary risked absorbing real blending into what should be
+        #a continuum correction. The sloped diagnostic just below (which
+        #feeds check_for_flags()'s "no flat continuum" flag) runs
+        #UNCONDITIONALLY regardless of this setting -- it isn't gated by
+        #fit_continuum any more, precisely so that flag keeps working with
+        #the new global-only default.
+        #slope_sig_thresh, slope_min_points: passed to
+        #estimate_local_continuum_sloped() (see its docstring) -- always
+        #computed (see above), reported/plotted alongside the reported EW,
+        #but still does not itself drive the reported EW.
         #auto_widen: automatically retry once with widen_window_size if
         #this line's fit quality is poor at window_size -- see the retry
         #check below, right after ew/ew_err are finalized, for exactly
-        #what "poor" means and why. Sits on top of fit_continuum=True;
-        #has no effect when fit_continuum=False.
+        #what "poor" means and why. Applies regardless of fit_continuum.
+        #plot_window_size: PLOTTING ONLY -- show this much more
+        #surrounding data/fit-curve extrapolation than the actual fit
+        #window (window_size) used, for visual context (e.g. judging the
+        #global continuum normalization against a wider stretch of the
+        #order). None (default): plot exactly the fit window, unchanged
+        #from before this parameter existed. Never affects the fit,
+        #EW, or error -- those still only ever see window_size's data.
         norm = 1.0
         wind, found_line, line_bound,dy = get_line_window(self.lines[i],self.shifted_wavelength[order],self.normalized_flux[order],ex_params[1],ex_params[2],ex_params[3], window_size)
 
@@ -1110,6 +1178,27 @@ class Spectrum_Data():
 
         wing_idx = np.where(other_than_line)[0]
         c0, c0_err = norm, 0.  # "no correction": continuum assumed flat at norm
+
+        #ref_keep: independent cross-check against a high-S/N reference
+        #atlas (see load_reference_atlas()/reference_atlas.py): catches a
+        #real but shallow, gradual blend that a median/MAD clip can't tell
+        #from ordinary noise. Computed UNCONDITIONALLY (not just under
+        #fit_continuum) -- the always-on sloped diagnostic below (which
+        #sets lines_internal_trend_blue/red, what check_for_flags()'s "no
+        #flat continuum" check reads) needs it regardless of whether
+        #fit_continuum's own local-corrected EW is being computed.
+        ref_keep = None
+        if self.ref_wave is not None:
+            ref_keep = reference_continuum_mask(
+                xtest[wing_idx], y_err[wing_idx], self.ref_wave, self.ref_flux,
+                self.ref_resolving_power)
+
+        #line half-width / Gaussian sigma seed -- also needed
+        #unconditionally now, by both the fit_continuum branch below and
+        #the always-on sloped diagnostic
+        line_hwidth = max((line_bound[1]-line_bound[0])/2.0, 0.01)
+        sigma_guess = line_hwidth/1.5
+
         if fit_continuum:
             #Estimate the local continuum (a flat bias, no slope) from the
             #real wing data -- outside this line's own detected boundary --
@@ -1130,15 +1219,6 @@ class Spectrum_Data():
             #space (it clips LOW outliers, i.e. deeper-absorption
             #contamination) -- c0 here is the real continuum level, not
             #yet the inverted-space offset the rest of this function uses.
-            ref_keep = None
-            if self.ref_wave is not None:
-                #independent cross-check against a high-S/N reference
-                #atlas (see load_reference_atlas()/reference_atlas.py):
-                #catches a real but shallow, gradual blend that the
-                #median/MAD clip above can't tell from ordinary noise
-                ref_keep = reference_continuum_mask(
-                    xtest[wing_idx], y_err[wing_idx], self.ref_wave, self.ref_flux,
-                    self.ref_resolving_power)
             c0, c0_err, _ = estimate_local_continuum(
                 xtest[wing_idx], full_y[wing_idx], y_err[wing_idx], ref_keep=ref_keep)
 
@@ -1170,8 +1250,6 @@ class Spectrum_Data():
                 restricted_fit_mask[wing_idx] &= ref_keep
                 if restricted_fit_mask.sum() >= 5:
                     fit_mask = restricted_fit_mask
-            line_hwidth = max((line_bound[1]-line_bound[0])/2.0, 0.01)
-            sigma_guess = line_hwidth/1.5
             bf, pcov, p0 = gfit_direct(xtest[fit_mask], y_detrend[fit_mask], y_err[fit_mask],
                                         found_line, sigma_guess, 0.)
         else:
@@ -1209,9 +1287,12 @@ class Spectrum_Data():
             pcov = None  # don't shade a fit band for a rejected/failed fit
 
         #Automated quality-triggered retry: an outright failed fit, or a
-        #>10% relative EW error (the same threshold check_for_flags() uses
-        #downstream) usually means this window's wing didn't leave enough
-        #clean, uncontaminated points to trust -- confirmed on Fe I
+        #>10% relative EW error in the LOCAL-continuum fit (checked here
+        #since bf_global isn't computed until after this point; uses the
+        #same 10% threshold check_for_flags() applies downstream to the
+        #reported GLOBAL-continuum EW, just against the other fit) usually
+        #means this window's wing didn't leave enough clean, uncontaminated
+        #points to trust -- confirmed on Fe I
         #5579.335: a strong neighbor ~0.6 A away left only 6 points to
         #constrain a 4-parameter Gaussian, EW error 25 mA on a 10 mA line,
         #and simply widening the window to 2.5 A (bringing in real clean
@@ -1221,150 +1302,240 @@ class Spectrum_Data():
         #auto_widen=False on the recursive call below is what stops this
         #at a single retry rather than an unbounded escalation.
         quality_failed = (ew == 0) or (ew_err >= 0.1*ew)
-        if auto_widen and fit_continuum and quality_failed and window_size < widen_window_size:
+        if auto_widen and quality_failed and window_size < widen_window_size:
             print(f'line {self.lines[i]}: EW {ew:.2f}+/-{ew_err:.2f} at window_size='
                   f'{window_size} looks unreliable -- retrying with window_size='
                   f'{widen_window_size}')
             self.measure_ew(i, order, plot, ex_params, save_plot, widen_window_size,
-                             show_plot, fit_continuum, auto_widen=False)
+                             show_plot, fit_continuum, auto_widen=False,
+                             plot_window_size=plot_window_size)
             return
 
-        #DIAGNOSTIC: a parallel conditionally-sloped local continuum,
-        #computed and reported/plotted alongside the flat one above -- does
-        #NOT (yet) drive the reported EW itself (self.lines_ew below still
-        #comes from the flat fit). See estimate_local_continuum_sloped()'s
-        #docstring: exists to let slope_sig_thresh/slope_min_points be
-        #tuned against real lines before deciding whether this should
-        #become the default.
+        #DIAGNOSTIC: a parallel conditionally-sloped local continuum --
+        #feeds only lines_ew_local (the local-continuum-corrected
+        #comparison value), never self.lines_ew itself (the reported EW,
+        #from the GLOBAL-continuum fit below). See
+        #estimate_local_continuum_sloped()'s docstring: exists to let
+        #slope_sig_thresh/slope_min_points be tuned against real lines.
+        #Computed UNCONDITIONALLY (not gated by fit_continuum) -- unlike
+        #the flat local-corrected EW above, this block's OTHER output,
+        #lines_internal_trend_blue/red (see just below), is what
+        #check_for_flags()'s "no flat continuum" check reads, and that
+        #flag needs to keep working even in the fit_continuum=False
+        #(now-default) global-only path.
         bf_slope, pcov_slope, ew_slope, ew_err_slope, cont_offset_slope = None, None, None, None, None
         used_slope, c1_slope, slope_diag = False, 0., {}
-        if fit_continuum:
-            c0_s, c1_slope, c0_err_s, _, used_slope, slope_diag = estimate_local_continuum_sloped(
-                xtest[wing_idx], full_y[wing_idx], y_err[wing_idx], found_line,
-                min_points=slope_min_points, ref_keep=ref_keep, sig_thresh=slope_sig_thresh,
-                internal_sig_thresh=slope_internal_sig_thresh)
-            cont_offset_slope = norm - (c0_s + c1_slope*(xtest-found_line))
-            y_detrend_slope = y_fit - cont_offset_slope
-            fit_mask_slope = in_line.copy()
-            fit_mask_slope[wing_idx] = np.abs(y_detrend_slope[wing_idx]) < 5*np.median(y_err[wing_idx])
-            if ref_keep is not None:
-                restricted_slope = fit_mask_slope.copy()
-                restricted_slope[wing_idx] &= ref_keep
-                if restricted_slope.sum() >= 5:
-                    fit_mask_slope = restricted_slope
-            bf_slope, pcov_slope, _ = gfit_direct(
-                xtest[fit_mask_slope], y_detrend_slope[fit_mask_slope], y_err[fit_mask_slope],
-                found_line, sigma_guess, 0.)
-            if bf_slope is None:
-                bf_slope = fail_bf
-            ew_slope = abs(gauss_ew(bf_slope[0], bf_slope[2]*2.355))
-            ew_err_slope = np.sqrt(gauss_ew_err(bf_slope[0], bf_slope[2], pcov_slope)**2
-                                    + (EW_K*bf_slope[2]*c0_err_s)**2)
-            if bf_slope[0] == 0 or not (2 < ew_slope < 200):
-                bf_slope = fail_bf
-                ew_slope = 0.
-                ew_err_slope = 0.
-                pcov_slope = None
-            sig_str = 'n/a' if slope_diag.get('significance') is None else f"{slope_diag['significance']:.2f}"
-            isig_b = slope_diag.get('internal_sig_blue')
-            isig_r = slope_diag.get('internal_sig_red')
-            isig_b_str = 'n/a' if isig_b is None else f"{isig_b:.2f}"
-            isig_r_str = 'n/a' if isig_r is None else f"{isig_r:.2f}"
-            print(f'  [slope diagnostic] EW(flat)={ew:.2f}+/-{ew_err:.2f}  '
-                  f'EW(sloped)={ew_slope:.2f}+/-{ew_err_slope:.2f}  used_slope={used_slope}  '
-                  f'c1={c1_slope:.5f}  n_blue={slope_diag.get("n_blue")} n_red={slope_diag.get("n_red")}  '
-                  f'significance={sig_str}  internal_sig(blue/red)={isig_b_str}/{isig_r_str}')
+        #record whether EACH side independently shows a significant
+        #internal near-vs-far trend (estimate_local_continuum_sloped()'s
+        #own condition 2, computed regardless of used_slope) -- both sides
+        #trending at once means neither wing settles into a flat,
+        #trustworthy stretch anywhere in the window, unlike the one-sided
+        #case that condition 2 was originally designed to catch (a
+        #recovering contamination tail on just one side). check_for_flags()
+        #uses BOTH being True as a "no reliable local continuum found"
+        #flag -- see its docstring.
+        c0_s, c1_slope, c0_err_s, _, used_slope, slope_diag = estimate_local_continuum_sloped(
+            xtest[wing_idx], full_y[wing_idx], y_err[wing_idx], found_line,
+            min_points=slope_min_points, ref_keep=ref_keep, sig_thresh=slope_sig_thresh,
+            internal_sig_thresh=slope_internal_sig_thresh)
+        cont_offset_slope = norm - (c0_s + c1_slope*(xtest-found_line))
+        y_detrend_slope = y_fit - cont_offset_slope
+        fit_mask_slope = in_line.copy()
+        fit_mask_slope[wing_idx] = np.abs(y_detrend_slope[wing_idx]) < 5*np.median(y_err[wing_idx])
+        if ref_keep is not None:
+            restricted_slope = fit_mask_slope.copy()
+            restricted_slope[wing_idx] &= ref_keep
+            if restricted_slope.sum() >= 5:
+                fit_mask_slope = restricted_slope
+        bf_slope, pcov_slope, _ = gfit_direct(
+            xtest[fit_mask_slope], y_detrend_slope[fit_mask_slope], y_err[fit_mask_slope],
+            found_line, sigma_guess, 0.)
+        if bf_slope is None:
+            bf_slope = fail_bf
+        ew_slope = abs(gauss_ew(bf_slope[0], bf_slope[2]*2.355))
+        ew_err_slope = np.sqrt(gauss_ew_err(bf_slope[0], bf_slope[2], pcov_slope)**2
+                                + (EW_K*bf_slope[2]*c0_err_s)**2)
+        if bf_slope[0] == 0 or not (2 < ew_slope < 200):
+            bf_slope = fail_bf
+            ew_slope = 0.
+            ew_err_slope = 0.
+            pcov_slope = None
+        sig_str = 'n/a' if slope_diag.get('significance') is None else f"{slope_diag['significance']:.2f}"
+        isig_b = slope_diag.get('internal_sig_blue')
+        isig_r = slope_diag.get('internal_sig_red')
+        isig_b_str = 'n/a' if isig_b is None else f"{isig_b:.2f}"
+        isig_r_str = 'n/a' if isig_r is None else f"{isig_r:.2f}"
+        self.lines_internal_trend_blue[i] = bool(slope_diag.get('internal_trend_blue'))
+        self.lines_internal_trend_red[i] = bool(slope_diag.get('internal_trend_red'))
+        print(f'  [slope diagnostic] EW(flat)={ew:.2f}+/-{ew_err:.2f}  '
+              f'EW(sloped)={ew_slope:.2f}+/-{ew_err_slope:.2f}  used_slope={used_slope}  '
+              f'c1={c1_slope:.5f}  n_blue={slope_diag.get("n_blue")} n_red={slope_diag.get("n_red")}  '
+              f'significance={sig_str}  internal_sig(blue/red)={isig_b_str}/{isig_r_str}')
 
         best_bf = bf
-        #predicted real flux = norm - (line dip + local continuum offset)
-        fit_gauss = norm - (gauss_model(xtest, *best_bf) + cont_offset)
-        #set values for line
 
-        diff = (fit_gauss[only_line] - full_y[only_line])**2
+        #Comparison fit: assumes the GLOBAL continuum normalization is
+        #already exact (continuum pinned at norm, no local wing-based
+        #correction) -- i.e. the same one-window direct fit as the
+        #fit_continuum=False code path above. When fit_continuum=False was
+        #actually requested, `bf`/`ew` above ARE this fit already, so just
+        #reuse them instead of refitting.
+        if fit_continuum:
+            global_line_hwidth = max((line_bound[1]-line_bound[0])/2.0, 0.01)
+            global_sigma_guess = global_line_hwidth/1.5
+            fit_y_global = y_fit.copy()
+            fit_y_global[other_than_line] = 0.
+            bf_global, pcov_global, _ = gfit_direct(xtest, fit_y_global, y_err, found_line,
+                                                     global_sigma_guess, 0.)
+            if bf_global is None:
+                bf_global = fail_bf
+            ew_global = abs(gauss_ew(bf_global[0], bf_global[2]*2.355))
+            ew_err_global = gauss_ew_err(bf_global[0], bf_global[2], pcov_global)
+            if bf_global[0] == 0 or not (2 < ew_global < 200):
+                bf_global = fail_bf
+                ew_global = 0.
+                ew_err_global = 0.
+                pcov_global = None
+        else:
+            bf_global, pcov_global, ew_global, ew_err_global = best_bf, pcov, ew, ew_err
+
+        #lines_gauss_Xsquare (check_for_flags()'s fit-quality check) is
+        #deliberately evaluated against the GLOBAL-continuum fit
+        #(bf_global, offset 0), NOT the local-continuum-corrected one
+        #(best_bf/cont_offset) -- the local correction can make an
+        #otherwise-biased fit (e.g. amplitude pulled by nearby blending
+        #leaking past the wing exclusion) look artificially clean by
+        #construction, since it's fit on the same detrended data this
+        #residual would be measured against. Checking against the raw,
+        #uncorrected global assumption instead asks a more basic
+        #question: does a single clean Gaussian, sitting on the
+        #spectrum's plain normalization, actually match this line's
+        #observed core shape at all.
+        fit_gauss_global = norm - (gauss_model(xtest, *bf_global) + 0.)
+        diff = (fit_gauss_global[only_line] - full_y[only_line])**2
         self.lines_gauss_Xsquare[i] = np.sum(diff)
 
-        self.lines_bf_params[i] = best_bf
-        self.lines_ew[i] = ew
-        self.lines_ew_err[i] = ew_err
+        #DEFAULT REPORTED EW: the GLOBAL-continuum fit (bf_global/
+        #ew_global), not the local-continuum-corrected one -- see the
+        #comment above where bf_global is computed. lines_bf_params
+        #follows the same choice so it stays consistent with lines_ew.
+        #best_bf/ew/ew_err (the local-continuum-corrected fit) are kept
+        #separately in lines_ew_local/lines_ew_err_local for comparison
+        #only.
+        self.lines_bf_params[i] = bf_global
+        self.lines_ew[i] = ew_global
+        self.lines_ew_err[i] = ew_err_global
+        self.lines_ew_local[i] = ew
+        self.lines_ew_err_local[i] = ew_err
         print('line to measure:', ELEMENTS[self.lines_exd[i][0]],self.lines[i], '- Line found:', found_line)
         print('EW:',np.round(self.lines_ew[i],2),u"±",np.round(self.lines_ew_err[i],2))
 
         #Plotting stuff
         if plot:
+            #plot_window_size widens the DISPLAYED data/fit-curve range
+            #beyond the actual fit window (xtest/measure_x_array above,
+            #untouched) -- re-fetched fresh from this order's full arrays,
+            #centered on found_line, purely for visual context
+            if plot_window_size is not None and plot_window_size > window_size:
+                plot_sel = np.abs(self.shifted_wavelength[order] - found_line) <= plot_window_size/2.0
+                plot_x_array = self.shifted_wavelength[order][plot_sel]
+                plot_y_array = self.normalized_flux[order][plot_sel]
+                plot_err_array = self.obs_err[order][plot_sel]
+                plot_pred_array = self.pred_all[order][plot_sel]
+            else:
+                plot_x_array = measure_x_array
+                plot_y_array = measure_y_array
+                plot_err_array = temp_err_array
+                plot_pred_array = temp_pred_array
+            plot_upper_cont_bounds = plot_y_array + ex_params[0] + 2*plot_err_array/plot_pred_array
+            plot_lower_cont_bounds = plot_y_array + ex_params[0] - 2*plot_err_array/plot_pred_array
+            plot_points_within_norm = np.where((norm > plot_lower_cont_bounds) & (norm < plot_upper_cont_bounds))
+
+            #bf_global/pcov_global/ew_global/ew_err_global -- the GLOBAL-
+            #continuum comparison fit -- are already computed above (also
+            #now the basis for lines_gauss_Xsquare's fit-quality check, not
+            #just this plot's left panel).
+
             fig = plt.figure(figsize=(12,5))
-            fig.suptitle("Order: " + str(order) + " " + "(" + str(np.round(self.shifted_wavelength[order].min(),3)) + "-" + str(np.round(self.shifted_wavelength[order].max(),3)) + ")")
-            fit_view = fig.add_subplot(121)
-            fit_view.grid()
-            fit_view.set_xlabel(r'$\rm Wavelength~(\AA)$', size = 14)
-            fit_view.set_ylabel('Normalized Flux', size = 14)
-            fit_view.errorbar(measure_x_array,measure_y_array + ex_params[0],
-                 yerr=2*temp_err_array/temp_pred_array,capsize=0,fmt='.', color = 'k', label = 'cont', zorder = 2)
-            fit_view.scatter(measure_x_array[points_within_norm],measure_y_array[points_within_norm] + ex_params[0], s = 10, c='#4daf4a', zorder = 3, alpha = 0.8)
-            fit_view.plot([self.lines[i],self.lines[i]],[norm,norm*0.95], '--', color = 'k', alpha = 0.75)
-            fit_view.plot([found_line,found_line],[norm,norm*0.95], '-', color='k')
-            fit_view.plot([line_bound[0],line_bound[0]],[norm*1.025,norm*0.95], '--', color = '#e41a1c', alpha = 0.5)
-            fit_view.plot([line_bound[1],line_bound[1]],[norm*1.025,norm*0.95], '--', color = '#e41a1c', alpha = 0.5)
-            fit_view.annotate(str(self.lines[i]), xy = [self.lines[i], norm*1.025])
+            title = ("Order: " + str(order) + " " + "(" + str(np.round(self.shifted_wavelength[order].min(),3))
+                      + "-" + str(np.round(self.shifted_wavelength[order].max(),3)) + ")")
+            #lines_check_flag/lines_flag_reasons only reflect the truth as
+            #of the LAST check_for_flags() call -- for a plot generated
+            #before that's been (re)run on this measurement, this is
+            #whatever it was left at previously (default: unflagged/'')
+            if self.lines_check_flag[i]:
+                title += "\nFLAGGED: " + str(self.lines_flag_reasons[i])
+                fig.suptitle(title, color='#e41a1c', fontsize=10)
+            else:
+                fig.suptitle(title)
+
             #plot the fit/band/local-continuum curves on a 5x denser
             #wavelength grid than the actual data -- xtest only has one
             #point per real pixel, which makes a narrow line's Gaussian
             #fit curve look faceted/low-resolution; this is purely
             #cosmetic (fitting and the chi-square check above still use
-            #the real data grid, unchanged)
-            xplot = np.linspace(xtest[0], xtest[-1], len(xtest)*5)
-            fit_gauss_plot = norm - (gauss_model(xplot, *best_bf) + cont_offset)
-            fit_view.plot(xplot, fit_gauss_plot, '--', color = '#377eb8', lw= 2, label = 'Gaussian fit')
-            if pcov is not None:
-                model_err_plot = gauss_model_err(xplot, best_bf, pcov)
-                fit_view.fill_between(xplot, fit_gauss_plot-model_err_plot, fit_gauss_plot+model_err_plot,
+            #the real data grid, unchanged). Spans plot_x_array's (possibly
+            #widened) range, not just xtest's -- so the fit curve/local-
+            #continuum line visually extrapolate across the wider view too.
+            xplot = np.linspace(plot_x_array[0], plot_x_array[-1], len(plot_x_array)*5)
+
+            def _draw_window(ax):
+                #shared data/window-markers drawing for both panels below --
+                #only the overlaid fit curve differs between them
+                ax.grid()
+                ax.set_xlabel(r'$\rm Wavelength~(\AA)$', size = 14)
+                ax.errorbar(plot_x_array,plot_y_array + ex_params[0],
+                     yerr=2*plot_err_array/plot_pred_array,capsize=0,fmt='.', color = 'k', label = 'cont', zorder = 2)
+                ax.scatter(plot_x_array[plot_points_within_norm],plot_y_array[plot_points_within_norm] + ex_params[0], s = 10, c='#4daf4a', zorder = 3, alpha = 0.8)
+                ax.plot([self.lines[i],self.lines[i]],[norm,norm*0.95], '--', color = 'k', alpha = 0.75)
+                ax.plot([found_line,found_line],[norm,norm*0.95], '-', color='k')
+                ax.plot([line_bound[0],line_bound[0]],[norm*1.025,norm*0.95], '--', color = '#e41a1c', alpha = 0.5)
+                ax.plot([line_bound[1],line_bound[1]],[norm*1.025,norm*0.95], '--', color = '#e41a1c', alpha = 0.5)
+                ax.annotate(str(self.lines[i]), xy = [self.lines[i], norm*1.025])
+                ax.plot([plot_x_array[0],plot_x_array[-1]],[norm,norm], '--', color = '#4daf4a', label = 'assumed continuum (norm)')
+
+            #Left panel: fit assuming the global continuum normalization is
+            #already exact (no local wing-based correction)
+            fit_view = fig.add_subplot(121)
+            _draw_window(fit_view)
+            fit_view.set_ylabel('Normalized Flux', size = 14)
+            fit_view.set_title(f'Global continuum (REPORTED) -- EW={ew_global:.2f}±{ew_err_global:.2f} mÅ', fontsize=10)
+            fit_gauss_plot_global = norm - (gauss_model(xplot, *bf_global) + 0.)
+            fit_view.plot(xplot, fit_gauss_plot_global, '--', color = '#377eb8', lw= 2, label = 'Gaussian fit')
+            if pcov_global is not None:
+                model_err_plot_global = gauss_model_err(xplot, bf_global, pcov_global)
+                fit_view.fill_between(xplot, fit_gauss_plot_global-model_err_plot_global, fit_gauss_plot_global+model_err_plot_global,
                          color = '#377eb8', alpha = 0.25, zorder = 1, label = r'fit $\pm1\sigma$')
-            fit_view.plot([xtest[0],xtest[-1]],[norm,norm], '--', color = '#4daf4a', label = 'assumed continuum (norm)')
-            if fit_continuum:
-                #the estimated LOCAL continuum level (c0, flat/no slope),
-                #so you can see directly how far the global normalization
-                #was off here -- this is what fixes a fit biased by
-                #imperfect normalization
-                local_cont_plot = np.full_like(xplot, norm - cont_offset)
-                fit_view.plot(xplot, local_cont_plot, ':', color = '#ff7f00', lw = 2, label = 'estimated local continuum')
             fit_view.legend(loc='best', fontsize=8)
 
-            slope_view = fig.add_subplot(122)
-            slope_view.grid()
-            slope_view.set_xlabel(r'$\rm Wavelength~(\AA)$', size = 14)
+            #Right panel: fit against the per-line estimated LOCAL continuum
+            #(see estimate_local_continuum()) -- this is the LOCAL-
+            #continuum-corrected comparison fit (lines_ew_local), shown
+            #only when fit_continuum=True was explicitly requested; it
+            #never drives self.lines_ew itself (always the GLOBAL-
+            #continuum fit, bf_global, regardless of fit_continuum -- see
+            #where self.lines_ew is set below). When fit_continuum=False
+            #(the default) no local estimate was made, so there's nothing
+            #distinct to show here
+            local_view = fig.add_subplot(122)
+            _draw_window(local_view)
             if fit_continuum:
-                #DIAGNOSTIC right panel: the SAME data and Gaussian-fit
-                #machinery as the left panel, but using the conditionally
-                #-sloped local continuum (estimate_local_continuum_sloped())
-                #instead of the flat one -- side-by-side so a real,
-                #both-sides-independently-clean level difference (e.g. Fe I
-                #5522.447) is visually obvious as a tilt here vs. the flat
-                #line in fit_view, while a case where the slope correctly
-                #stayed off (contamination on one side, e.g. Fe I 5587.574)
-                #looks identical in both panels
-                slope_view.set_title(f'slope diagnostic (used_slope={used_slope})', fontsize=10)
-                slope_view.errorbar(measure_x_array,measure_y_array + ex_params[0],
-                     yerr=2*temp_err_array/temp_pred_array,capsize=0,fmt='.', color = 'k', zorder = 2)
-                slope_view.plot([found_line,found_line],[norm,norm*0.95], '-', color='k')
-                slope_view.plot([line_bound[0],line_bound[0]],[norm*1.025,norm*0.95], '--', color = '#e41a1c', alpha = 0.5)
-                slope_view.plot([line_bound[1],line_bound[1]],[norm*1.025,norm*0.95], '--', color = '#e41a1c', alpha = 0.5)
-                if bf_slope is not None:
-                    cont_offset_slope_plot = norm - (c0_s + c1_slope*(xplot-found_line))
-                    fit_gauss_plot_slope = norm - (gauss_model(xplot, *bf_slope) + cont_offset_slope_plot)
-                    slope_view.plot(xplot, fit_gauss_plot_slope, '--', color = '#377eb8', lw= 2, label = 'Gaussian fit')
-                    if pcov_slope is not None:
-                        model_err_plot_slope = gauss_model_err(xplot, bf_slope, pcov_slope)
-                        slope_view.fill_between(xplot, fit_gauss_plot_slope-model_err_plot_slope,
-                                 fit_gauss_plot_slope+model_err_plot_slope,
-                                 color = '#377eb8', alpha = 0.25, zorder = 1, label = r'fit $\pm1\sigma$')
-                    local_cont_plot_slope = norm - cont_offset_slope_plot
-                    slope_view.plot(xplot, local_cont_plot_slope, ':', color = '#ff7f00', lw = 2,
-                             label = 'estimated local continuum (sloped)')
-                slope_view.plot([xtest[0],xtest[-1]],[norm,norm], '--', color = '#4daf4a', label = 'assumed continuum (norm)')
-                slope_view.legend(loc='best', fontsize=8)
+                local_view.set_title(f'Local continuum (diagnostic only) -- EW={ew:.2f}±{ew_err:.2f} mÅ', fontsize=10)
+                fit_gauss_plot_local = norm - (gauss_model(xplot, *best_bf) + cont_offset)
+                local_view.plot(xplot, fit_gauss_plot_local, '--', color = '#377eb8', lw= 2, label = 'Gaussian fit')
+                if pcov is not None:
+                    model_err_plot_local = gauss_model_err(xplot, best_bf, pcov)
+                    local_view.fill_between(xplot, fit_gauss_plot_local-model_err_plot_local, fit_gauss_plot_local+model_err_plot_local,
+                             color = '#377eb8', alpha = 0.25, zorder = 1, label = r'fit $\pm1\sigma$')
+                #the estimated LOCAL continuum level (c0, flat/no slope), so
+                #you can see directly how far the global normalization was
+                #off here -- this is what fixes a fit biased by imperfect
+                #normalization
+                local_cont_plot = np.full_like(xplot, norm - cont_offset)
+                local_view.plot(xplot, local_cont_plot, ':', color = '#ff7f00', lw = 2, label = 'estimated local continuum')
+                local_view.legend(loc='best', fontsize=8)
             else:
-                slope_view.scatter(measure_x_array,measure_y_array+ ex_params[0], s = 5, c = 'k', zorder = 2)
-                slope_view.errorbar(measure_x_array,measure_y_array + ex_params[0],
-                     yerr=2*temp_err_array/temp_pred_array,capsize=0,fmt='.', color = 'k', zorder = 3, alpha = 0.5)
+                local_view.set_title('Local continuum not estimated (fit_continuum=False)', fontsize=10)
             plt.tight_layout()
 
 
@@ -1406,7 +1577,7 @@ class Spectrum_Data():
             self.lines_exp[i] = np.array(ex_params)
             print('extra params:',ex_params)
 
-    def measure_all_ew(self, exclude_lines= [], plot_lines=[], ex_params = {}, window_size = 1.5, save_all = False, fit_continuum = True, auto_widen = True, widen_window_size = 2.5, slope_sig_thresh = 3.0, slope_min_points = 5, slope_internal_sig_thresh = 3.0):
+    def measure_all_ew(self, exclude_lines= [], plot_lines=[], ex_params = {}, window_size = 1.5, save_all = False, fit_continuum = False, auto_widen = True, widen_window_size = 2.5, slope_sig_thresh = 3.0, slope_min_points = 5, slope_internal_sig_thresh = 3.0, plot_window_size = None):
         """
         Measure every loaded line's EW.
 
@@ -1419,18 +1590,24 @@ class Spectrum_Data():
         plot_lines as well if you also want those shown live as they're
         measured.
 
-        fit_continuum=True (default) corrects for imperfect global
-        continuum normalization per-line -- see measure_ew()'s docstring.
+        fit_continuum=False (default) reports every EW from the GLOBAL-
+        continuum fit (continuum normalization assumed exact) -- set True
+        to ALSO compute a local-continuum-corrected comparison fit per
+        line (lines_ew_local); still never changes the reported lines_ew
+        itself. See measure_ew()'s docstring for the full rationale.
 
         auto_widen=True (default) automatically retries a line once at
         widen_window_size if it comes out of window_size looking
         unreliable -- see measure_ew()'s docstring for exactly what
-        triggers a retry. No effect when fit_continuum=False.
+        triggers a retry. Applies regardless of fit_continuum.
 
         slope_sig_thresh, slope_min_points: DIAGNOSTIC ONLY, passed through
         to measure_ew()'s parallel flat-vs-sloped local continuum -- see
         its docstring and estimate_local_continuum_sloped()'s. Does not
         change the reported EW.
+
+        plot_window_size : PLOTTING ONLY, passed through to measure_ew()
+            -- see its docstring. Never affects the fit, EW, or error.
         """
         if save_all:
             make_plots_folder()
@@ -1457,15 +1634,17 @@ class Spectrum_Data():
                                          show_plot=(self.lines[i] in plot_lines), fit_continuum=fit_continuum,
                                          auto_widen=auto_widen, widen_window_size=widen_window_size,
                                          slope_sig_thresh=slope_sig_thresh, slope_min_points=slope_min_points,
-                                         slope_internal_sig_thresh=slope_internal_sig_thresh)
+                                         slope_internal_sig_thresh=slope_internal_sig_thresh,
+                                         plot_window_size=plot_window_size)
                     else:
                         self.measure_ew(i,order, plot, exp, False, window_size, fit_continuum=fit_continuum,
                                          auto_widen=auto_widen, widen_window_size=widen_window_size,
                                          slope_sig_thresh=slope_sig_thresh, slope_min_points=slope_min_points,
-                                         slope_internal_sig_thresh=slope_internal_sig_thresh)
+                                         slope_internal_sig_thresh=slope_internal_sig_thresh,
+                                         plot_window_size=plot_window_size)
         #self.lines_bf_params = np.array(self.lines_bf_params)
 
-    def measure_line_ew(self,line,ex_params=[0,0,0,0], save_line = False, save_plot = False, window_size = 1.5, fit_continuum = True, auto_widen = True, widen_window_size = 2.5, slope_sig_thresh = 3.0, slope_min_points = 5, slope_internal_sig_thresh = 3.0):
+    def measure_line_ew(self,line,ex_params=[0,0,0,0], save_line = False, save_plot = False, window_size = 1.5, fit_continuum = False, auto_widen = True, widen_window_size = 2.5, slope_sig_thresh = 3.0, slope_min_points = 5, slope_internal_sig_thresh = 3.0, plot_window_size = None):
         if save_plot:
             make_plots_folder()
         i = np.where(self.lines == line)[0][0]
@@ -1481,7 +1660,8 @@ class Spectrum_Data():
                     self.measure_ew(i,order, True, ex_params, save_plot, window_size, fit_continuum=fit_continuum,
                                     auto_widen=auto_widen, widen_window_size=widen_window_size,
                                     slope_sig_thresh=slope_sig_thresh, slope_min_points=slope_min_points,
-                                    slope_internal_sig_thresh=slope_internal_sig_thresh)
+                                    slope_internal_sig_thresh=slope_internal_sig_thresh,
+                                    plot_window_size=plot_window_size)
                     found = True
                     if save_line:
                         with open('line_'+str(line)+'.txt','w') as f:
@@ -1492,7 +1672,13 @@ class Spectrum_Data():
     def check_for_flags(self):
         """
         Flag lines whose measurement looks untrustworthy: high EW error
-        fraction, too shallow to trust, a poor Gaussian fit, or -- the
+        fraction, too shallow to trust, a poor Gaussian fit, both wings
+        showing no flat continuum stretch at all (see the no-flat-
+        continuum check below -- distinct from the EW-error check: this
+        can trip even when the resulting EW error looks small, because a
+        handful of mutually-consistent survivors after clipping can still
+        give a deceptively tight formal error despite most of the wing
+        having been pervasively contaminated), or -- the
         check that matters most for avoiding a silently WRONG EW rather
         than just an imprecise one -- a found line center
         (lines_found_position, set by measure_ew()) that lands more than
@@ -1549,6 +1735,35 @@ class Spectrum_Data():
                     reasons.append(f'position off by {np.round(position_offset*1000,1)} mA (possible misidentification)')
                     print(self.lines[i], 'found position is', np.round(position_offset*1000,1),
                           'mA from rest wavelength -- possible misidentification, inspect before trusting this EW')
+            #no-flat-continuum check - BOTH wings independently show a
+            #significant internal near-vs-far trend (see
+            #estimate_local_continuum_sloped()'s condition 2 and the
+            #comment where measure_ew() records these). A single side
+            #tripping this already disables the sloped diagnostic, but
+            #says nothing about whether the window has a trustworthy
+            #continuum stretch anywhere at all -- a real, isolated
+            #recovering tail on just one side still leaves the other side
+            #flat and able to anchor a decent flat continuum. Both sides
+            #tripping it at once means neither wing ever settles into a
+            #flat, trustworthy stretch anywhere in the window -- confirmed
+            #on a real case (HD_10383's Fe I 5054.643: min(internal_sig_
+            #blue, internal_sig_red) of ~4-5 in both its order
+            #measurements, clearly above the flagship clean case Fe I
+            #5522.447's ~3.7, and well below confirmed-bad cases like
+            #5587.574/5546.5/5234.625 at ~12-21) -- i.e. pervasive
+            #weak-line blending throughout the window rather than one
+            #identifiable contaminating neighbor. A window like that is
+            #suspect for EITHER continuum assumption (local or global),
+            #not just the local one -- this is a pure visibility flag: it
+            #does not itself change lines_ew/lines_ew_err (the GLOBAL-
+            #continuum fit, see measure_ew()).
+            if self.lines_internal_trend_blue[i] and self.lines_internal_trend_red[i]:
+                self.lines_check_flag[i] = True
+                reasons.append('no flat continuum found in either wing (both sides show a '
+                                'significant internal trend) -- likely pervasive weak-line blending')
+                print(self.lines[i], 'both wings show a significant internal trend -- '
+                      'no flat continuum stretch found anywhere in the window, local '
+                      'continuum estimate may be unreliable')
             #order-overlap check - line sits in a wavelength range where
             #two orders' normalized flux disagreed badly enough to
             #distrust either one there (see flag_order_overlaps())
