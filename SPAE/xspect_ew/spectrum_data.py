@@ -3,6 +3,7 @@ continuum, wave-shifting against a reference, and measuring line EWs."""
 
 import copy
 import glob
+import os
 import pickle
 
 import numpy as np
@@ -15,7 +16,7 @@ from .constants import ELEMENTS
 from .continuum import fit_als_continuum
 from .line_profile import get_line_window, gauss_model, gfit_simple, gauss_ew
 from .gp_utils import SEKernel, Pred_GP
-from .combine import make_line, parabolic_refine
+from .combine import make_line, parabolic_refine, measure_order_alignment
 from .plotting import make_plots_folder
 from .readers import read_spectrum
 from .radial_velocity import measure_effective_rv, measure_rv_from_linelist, C_KMS
@@ -23,6 +24,8 @@ from .response_correction import apply_response_correction as _apply_response_co
 from .overlap_check import check_order_overlaps as _check_order_overlaps
 from .overlap_check import flagged_overlap_ranges as _flagged_overlap_ranges
 from .outlier_check import check_bad_orders as _check_bad_orders
+from .outlier_check import detect_spikes as _detect_spikes
+from .outlier_check import check_cross_exposure_spikes as _check_cross_exposure_spikes
 from .line_identification import identify_lines_in_spectrum as _identify_lines_in_spectrum
 
 
@@ -163,6 +166,15 @@ class Spectrum_Data():
         #-- set by flag_bad_orders(), consulted by check_for_flags().
         #Empty (no-op) until flag_bad_orders() is called.
         self.bad_order_ranges = []
+        #wavelengths of individual pixels CORRECTED for an extreme,
+        #non-astrophysical spike (cosmic ray/sky-emission contamination/
+        #bad pixel) -- set by correct_spikes() and, when a second
+        #exposure is available, combine_spectra()'s cross-exposure check.
+        #Consulted by check_for_flags(): a line whose measurement window
+        #contains a corrected pixel is excluded, since its measurement
+        #reflects a corrected (not originally observed) value. Empty
+        #(no-op) until correct_spikes()/combine_spectra() is called.
+        self.corrected_pixel_wavelengths = []
         #used to switch between Adamow ew calculation and simpson's rule integration
         self.temp_line_ew = None
         self.temp_line_ew_err = None
@@ -275,6 +287,59 @@ class Spectrum_Data():
         """
         self.bad_order_ranges = _check_bad_orders(self, outlier_factor=outlier_factor)
         return self.bad_order_ranges
+
+    def correct_spikes(self, window=5, factor=5.0, skip_orders=None):
+        """
+        Detect and CORRECT individual extreme, non-astrophysical spikes
+        (cosmic rays, hot pixels, uncorrected sky-emission-line
+        contamination) in this spectrum's own raw flux -- works on a
+        single spectrum with no second exposure needed, unlike
+        combine_spectra()'s more sensitive two-exposure comparison. See
+        outlier_check.detect_spikes()'s docstring for why this uses a
+        factor-based (not sigma-based) local test, and why it only
+        catches EXTREME, unambiguous cases by design -- a moderate,
+        possibly-real excursion is deliberately left alone here.
+
+        Unlike flag_bad_orders() (which flags a WHOLE order and changes
+        no data), this actually REPLACES each affected point's flux with
+        its local median (and recomputes obs_err there to match), and
+        records the wavelength in self.corrected_pixel_wavelengths --
+        consulted by check_for_flags() to EXCLUDE any line whose
+        measurement window contains a corrected pixel entirely, since
+        its measurement would reflect a corrected, not originally
+        observed, value. Run this BEFORE normalize_all(), same as
+        flag_bad_orders().
+
+        Parameters
+        ----------
+        window, factor : passed to outlier_check.detect_spikes().
+        skip_orders : iterable of order indices to skip (e.g. orders
+            already flagged by flag_bad_orders() -- correcting a handful
+            of points in a whole-order defect isn't meaningful; call
+            flag_bad_orders() first and pass its flagged order indices
+            here if you're using both).
+
+        Returns
+        -------
+        list of wavelengths corrected (also appended to
+        self.corrected_pixel_wavelengths, not overwritten -- safe to
+        call this alongside combine_spectra()'s own corrections).
+        """
+        skip_orders = set(skip_orders or [])
+        corrected = []
+        for i in range(len(self.flux)):
+            if i in skip_orders:
+                continue
+            flux = np.asarray(self.flux[i], dtype=float)
+            bad, local_median = _detect_spikes(flux, window=window, factor=factor)
+            if not bad.any():
+                continue
+            flux[bad] = local_median[bad]
+            self.flux[i] = flux
+            self.obs_err[i] = np.sqrt(np.abs(flux))
+            corrected.extend(self.wavelength[i][bad].tolist())
+        self.corrected_pixel_wavelengths.extend(corrected)
+        return corrected
 
     def normalize_all(self, lam = 2e3, p = 0.01, n_iter = 15, adaptive = True, **als_kwargs):
         #loop through orders
@@ -418,71 +483,240 @@ class Spectrum_Data():
         self.shifted_wavelength[order] = self.wavelength[order] + shift
         self.estimated_shift[order] = shift
 
-    def combine_spectra(self, spectB, resolution = 1000, shift=True):
-        print('Use self.update_combined() when you are happy with the combined flux to override self.flux')
-        #find corresponding orders that match self in spectB
-        med_A = [np.median(self.shifted_wavelength[i]) for i in range(len(self.shifted_wavelength))]
-        med_B = [np.median(spectB.shifted_wavelength[i]) for i in range(len(spectB.shifted_wavelength))]
-        b_order = []
-        #find corresponding B order
-        for k in range(len(med_A)):
-            diff = abs(med_A[k] - med_B)
-            loc = np.where(diff == diff.min())
-            b_order.append(loc)
+    def combine_spectra(self, spectB, rv_A=None, rv_B=None, rv_shift=True,
+                        min_overlap_fraction=0.5, align=True, align_search_radius=0.1,
+                        align_warn_threshold=0.05, cross_exposure_check=True,
+                        cross_exposure_significance=8.0, plot=False, plot_dir='.', verbose=False):
+        """
+        Co-add this spectrum with a second exposure of the SAME star
+        (spectB), to reach a single, higher-S/N combined spectrum.
+        normalize_all() (and, if desired, flag_bad_orders()) must already
+        have been run on BOTH spectra -- apply_rv_shift() below needs
+        normalized_flux to measure each spectrum's own RV.
 
-        combined_flux_orders = np.zeros_like(self.flux)
-        if shift:
-            #first shift A to match B with higher accuracy (higher resolution)
-            #may have to include a try statement for errors
-            self.estimate_shift([spectB], shift_spacing=resolution)
-            self.clean_shift()
+        Redesigned from an earlier version (see DEVELOPMENT_LOG.md) that
+        cross-correlated A directly against B via estimate_shift() (built
+        for star-vs-solar-atlas matching, not two exposures of the SAME
+        star) and combined flux via a fixed +/-5-INDEX nearest-neighbor
+        window -- silently assuming A and B shared an identical pixel
+        grid/length per order, fragile for two independently-reduced
+        exposures. This version:
 
-        #loop through orders
+        1. Independently rest-frames BOTH spectra via apply_rv_shift()
+           (each spectrum's own robust RV measurement) instead of cross-
+           correlating them against each other -- reuses this package's
+           already-validated, more robust RV machinery (named-line +
+           linelist cross-check, no reference-coverage-gap failure mode)
+           rather than estimate_shift()/clean_shift(). Set rv_shift=False
+           to skip this (e.g. both spectra are already correctly rest-
+           framed); pass rv_A/rv_B to apply a known RV directly instead
+           of remeasuring it.
+        2. Matches each of A's orders to whichever of B's orders has the
+           MOST real wavelength-range overlap (requiring at least
+           min_overlap_fraction of A's own range), not nearest-median --
+           an order with no genuine match is left as A alone rather than
+           silently paired with something unrelated.
+        3. Properly interpolates B's flux/error onto A's rest-frame
+           wavelength grid (scipy.interpolate.interp1d) over the real
+           overlapping range only.
+        4. Propagates error as a quadrature sum of each spectrum's own
+           obs_err (interpolated), rather than re-deriving purely from
+           sqrt(combined counts).
+        5. Skips combining any order flagged by flag_bad_orders() in
+           EITHER spectrum (self.bad_order_ranges/spectB.bad_order_ranges,
+           silent no-op if never called, same convention as every other
+           flag_*() method) -- combining a good order with a known-
+           corrupted one would spread the corruption, not average it out;
+           left as that spectrum's own order alone instead.
+        6. Plotting is opt-in (plot=True) and non-blocking (saved as one
+           PNG per combined order under plot_dir, not a blocking
+           plt.show() per order).
+        7. Per-order FINE alignment (align=True, default): independent
+           RV correction alone leaves a real, measurable residual
+           mismatch between A and B (confirmed on real data: 5-29 mA
+           across different orders, from ordinary per-line RV
+           measurement noise in each spectrum's own independent RV) --
+           enough to measurably smear a naively-co-added spectrum. Before
+           combining each order pair, directly cross-correlates A and B's
+           own overlapping normalized flux (combine.measure_order_
+           alignment()) and applies the measured residual to B's
+           wavelength query before interpolating -- a much more precise,
+           data-driven correction than trusting either spectrum's
+           independent RV alone. Warns if the measured residual exceeds
+           align_warn_threshold (default 0.05 A, well above every normal
+           residual confirmed on real data).
+        8. Cross-exposure spike detection (cross_exposure_check=True,
+           default): at each aligned point, checks whether EITHER
+           spectrum shows a significant EXCESS above continuum
+           (outlier_check.check_cross_exposure_spikes()) -- catches real
+           contamination (cosmic rays, uncorrected sky-emission lines --
+           confirmed on real data: the classic 5577 A and 6300 A [OI]
+           auroral lines) too modest for detect_spikes()'s single-
+           spectrum-only test to safely catch alone, without confusing
+           it for ordinary real line-core noise (tested and rejected: a
+           plain two-spectrum DIFFERENCE test alone misidentifies dozens
+           of real, ordinary line-core measurement differences as
+           contamination -- see check_cross_exposure_spikes()'s
+           docstring for why comparing each side's own excess above
+           continuum, not the difference between them, is what actually
+           works). A flagged point uses ONLY the LESS-contaminated
+           side's raw flux/error (whichever has the lower excess
+           significance, not necessarily zero -- a real sky line
+           present in both exposures at different strength is still
+           flagged at its most-contaminated point, not just its weaker
+           edges) rather than the sum, and is recorded in
+           self.corrected_pixel_wavelengths -- consulted by
+           check_for_flags() to exclude any line measured there.
+
+        Parameters
+        ----------
+        spectB : Spectrum_Data -- the second exposure of the same star.
+        rv_A, rv_B : float, km/s, optional -- see point 1 above.
+        rv_shift : bool -- see point 1 above.
+        min_overlap_fraction : minimum fraction of A's order wavelength
+            range a candidate B order must cover to be paired with it.
+        align, align_search_radius, align_warn_threshold : see point 7.
+        cross_exposure_check, cross_exposure_significance : see point 8;
+            the latter passed to check_cross_exposure_spikes() as
+            `significance`.
+        plot, plot_dir : see point 6 above.
+        verbose : passed through to apply_rv_shift(); also prints each
+            order's match/skip decision, measured alignment residual, and
+            any cross-exposure corrections here.
+
+        Returns
+        -------
+        n_combined : int -- number of orders actually combined (out of
+            len(self.flux); the rest are that order's A data unchanged).
+            Call update_combined() once satisfied, to make this the
+            spectrum's own self.flux/self.obs_err (self.combined_flux/
+            self.combined_err hold the result until then).
+        """
+        if rv_shift:
+            self.apply_rv_shift(rv=rv_A, verbose=verbose)
+            spectB.apply_rv_shift(rv=rv_B, verbose=verbose)
+
+        bad_A = {r['order'] for r in (self.bad_order_ranges or [])}
+        bad_B = {r['order'] for r in (spectB.bad_order_ranges or [])}
+
+        combined_flux = np.empty(len(self.flux), dtype=object)
+        combined_err = np.empty(len(self.flux), dtype=object)
+        n_combined = 0
+        n_cross_corrected = 0
+
+        if plot:
+            os.makedirs(plot_dir, exist_ok=True)
+
         for i in range(len(self.shifted_wavelength)):
+            wave_A, flux_A, err_A = self.shifted_wavelength[i], self.flux[i], self.obs_err[i]
 
-            #combining flux values for each wavelength value
-            combined_flux = np.zeros(len(self.shifted_wavelength[i]))
+            if i in bad_A:
+                combined_flux[i], combined_err[i] = flux_A, err_A
+                if verbose:
+                    print(f"order {i}: flagged bad in A -- using A alone, not combined")
+                continue
 
-            print('A order', i, 'B order', b_order[i][0][0])
+            a_lo, a_hi = wave_A.min(), wave_A.max()
+            a_span = a_hi - a_lo
+            best_j, best_overlap = None, 0.0
+            for j in range(len(spectB.shifted_wavelength)):
+                if j in bad_B:
+                    continue
+                wave_B = spectB.shifted_wavelength[j]
+                overlap = max(0.0, min(a_hi, wave_B.max()) - max(a_lo, wave_B.min()))
+                frac = overlap / a_span if a_span > 0 else 0.0
+                if frac > best_overlap:
+                    best_overlap, best_j = frac, j
 
-            #loop through each shifted wavelength value
-            for j in range(len(self.shifted_wavelength[i])):
-                #difference between one shifted wavelength value and all B wavelength values
-                #element closest to zero is location of closest wavelength values
-                ed = 5
-                if j < ed:
-                    le = 0
-                    re = j + ed
-                elif j > len(self.shifted_wavelength[i])-ed:
-                    le = j - ed
-                    re = len(self.shifted_wavelength[i]) + 1
-                else:
-                    le = j - ed
-                    re = j + ed
-                near_point = spectB.wavelength[b_order[i][0][0]][le:re]
-                diff_array = abs(self.shifted_wavelength[i][j] - near_point)
-                loc = np.where(diff_array == diff_array.min())
-                #add A flux with B flux at location where diff = 0
-                combined_flux[j] = self.flux[i][j] + spectB.flux[b_order[i][0][0]][le:re][loc]
-            #print(combined_flux)
-            #collect flux values for each order
-            combined_flux_orders[i] = combined_flux
-            self.obs_err[i] = np.sqrt(combined_flux)
+            if best_j is None or best_overlap < min_overlap_fraction:
+                combined_flux[i], combined_err[i] = flux_A, err_A
+                if verbose:
+                    print(f"order {i}: no usable B order overlap "
+                          f"(best {best_overlap:.2f}) -- using A alone")
+                continue
 
-            plt.plot(self.shifted_wavelength[i], self.flux[i], label = 'A')
-            plt.plot(spectB.wavelength[b_order[i][0][0]], spectB.flux[b_order[i][0][0]], label = 'B')
-            plt.plot(self.shifted_wavelength[i], combined_flux, label = 'A+B')
-            plt.xlim([np.median(self.shifted_wavelength[i]-(self.shifted_wavelength[i].max() - self.shifted_wavelength[i].min())/10),
-                np.median(self.shifted_wavelength[i]+(self.shifted_wavelength[i].max() - self.shifted_wavelength[i].min())/10)])
-            plt.grid()
-            plt.legend()
-            plt.show()
-            print('#-----------------------#')
-        #replace original flux for A with combined flux
-        self.combined_flux = combined_flux_orders
+            wave_B, flux_B, err_B = (spectB.shifted_wavelength[best_j],
+                                      spectB.flux[best_j], spectB.obs_err[best_j])
+
+            residual = 0.0
+            if align:
+                measured = measure_order_alignment(
+                    wave_A, self.normalized_flux[i], wave_B, spectB.normalized_flux[best_j],
+                    search_radius=align_search_radius)
+                if measured is not None:
+                    residual = measured
+                    if verbose:
+                        print(f"order {i}: measured alignment residual = {residual*1000:.2f} mA")
+                    if abs(residual) > align_warn_threshold:
+                        print(f"WARNING: order {i}/{best_j} alignment residual "
+                              f"({residual*1000:.1f} mA) exceeds align_warn_threshold "
+                              f"({align_warn_threshold*1000:.1f} mA) -- larger than any "
+                              f"residual confirmed normal on real data; inspect this order "
+                              f"pair before trusting the combined result.")
+
+            in_range = (wave_A >= wave_B.min() + abs(residual)) & (wave_A <= wave_B.max() - abs(residual))
+            query = wave_A[in_range] + residual
+            flux_B_interp = interp1d(wave_B, flux_B, kind='linear')(query)
+            err_B_interp = interp1d(wave_B, err_B, kind='linear')(query)
+
+            cflux, cerr = flux_A.copy(), err_A.copy()
+            cflux[in_range] = flux_A[in_range] + flux_B_interp
+            cerr[in_range] = np.sqrt(err_A[in_range]**2 + err_B_interp**2)
+
+            if cross_exposure_check:
+                cx_in_range, cx_bad, cx_a_higher = _check_cross_exposure_spikes(
+                    wave_A, self.normalized_flux[i], self.pred_all[i], self.obs_err[i],
+                    wave_B, spectB.normalized_flux[best_j], spectB.pred_all[best_j],
+                    spectB.obs_err[best_j], residual=residual, significance=cross_exposure_significance)
+                # cx_in_range uses the identical formula (same residual) as
+                # this method's own in_range above, so they're the same
+                # mask -- cx_bad/cx_a_higher already align positionally
+                # with flux_B_interp/err_B_interp (both built from wave_A[in_range]).
+                if cx_bad.any():
+                    combo_idx = np.where(in_range)[0]
+                    for pos in np.where(cx_bad)[0]:
+                        idx = combo_idx[pos]
+                        # use whichever side has the LOWER excess significance
+                        # (the less-contaminated one), not the sum of both
+                        if cx_a_higher[pos]:
+                            cflux[idx], cerr[idx] = flux_B_interp[pos], err_B_interp[pos]
+                        else:
+                            cflux[idx], cerr[idx] = flux_A[idx], err_A[idx]
+                        self.corrected_pixel_wavelengths.append(float(wave_A[idx]))
+                        n_cross_corrected += 1
+                    if verbose:
+                        print(f"order {i}: {cx_bad.sum()} point(s) cross-exposure-corrected "
+                              f"(significant excess above continuum in at least one spectrum)")
+
+            combined_flux[i], combined_err[i] = cflux, cerr
+            n_combined += 1
+            if verbose:
+                print(f"order {i}: combined with B order {best_j} (overlap={best_overlap:.2f})")
+
+            if plot:
+                fig, ax = plt.subplots(figsize=(10, 4))
+                ax.plot(wave_A, flux_A, label='A', lw=0.7)
+                ax.plot(wave_A[in_range], flux_B_interp, label='B (interp)', lw=0.7)
+                ax.plot(wave_A, cflux, label='A+B', lw=0.7, color='k')
+                ax.set_title(f'order {i} (A) <-> order {best_j} (B), overlap={best_overlap:.2f}')
+                ax.legend()
+                ax.grid()
+                plt.tight_layout()
+                fig.savefig(os.path.join(plot_dir, f'combine_order_{i:02d}.png'), dpi=100)
+                plt.close(fig)
+
+        self.combined_flux = combined_flux
+        self.combined_err = combined_err
+        print(f"combine_spectra(): combined {n_combined}/{len(self.flux)} orders "
+              f"({len(bad_A)} flagged bad in A, {len(bad_B)} flagged bad in B, "
+              f"{n_cross_corrected} point(s) cross-exposure-corrected)")
+        print('Use self.update_combined() when you are happy with the combined flux/error '
+              'to override self.flux/self.obs_err.')
+        return n_combined
 
     def update_combined(self):
         self.flux = self.combined_flux
+        self.obs_err = self.combined_err
 
     def estimate_shift(self, sun_spectra, shift_max = 5, shift_min = -5, shift_spacing = 100, verbose = False):
         """
@@ -497,7 +731,10 @@ class Spectrum_Data():
         true line position noticeably more precisely (RMS ~37 mA vs ~67 mA
         on a real test) where the two methods could be directly compared.
         estimate_shift() remains the right tool for reference-spectrum
-        cross-correlation itself, e.g. combine_spectra()'s internal use.
+        cross-correlation against a genuinely different spectrum (e.g. a
+        solar atlas). combine_spectra() (co-adding two exposures of the
+        SAME star) now uses apply_rv_shift() on each spectrum
+        independently instead -- see its own docstring for why.
         """
         #setup num orders, place holder for chi min, shifts array
         orders = len(self.wavelength)
@@ -1207,7 +1444,12 @@ class Spectrum_Data():
         line landing inside a whole order flagged by flag_bad_orders()
         (self.bad_order_ranges -- see outlier_check.py's module
         docstring), an extreme raw-flux outlier (cosmic ray/detector
-        defect) confirmed to corrupt an entire order's continuum fit. If
+        defect) confirmed to corrupt an entire order's continuum fit.
+        Also EXCLUDES a line whose measurement window contains a pixel
+        corrected by correct_spikes()/combine_spectra() (self.
+        corrected_pixel_wavelengths) -- its measurement reflects a
+        corrected, not originally observed, value, so it's excluded
+        outright rather than just flagged on an uncorrected one. If
         identify_lines() was called first (self.lines_id_run -- see
         line_identification.py's module docstring), also flags: (a) a
         line identify_lines() never found a significant absorption
@@ -1269,6 +1511,19 @@ class Spectrum_Data():
                                     f"({rng['outlier_factor']:.0f}x robust scale)")
                     print(self.lines[i], f"sits in order {rng['order']}, flagged for an extreme "
                           f"raw-flux outlier ({rng['outlier_factor']:.0f}x robust scale)")
+            #corrected-pixel check - a spike (cosmic ray/sky-emission
+            #contamination/bad pixel) was detected and CORRECTED within
+            #this line's own measurement window (same +/-0.1 A default
+            #search radius as get_line_window()) -- excluded outright
+            #rather than just flagged, since the measurement there
+            #reflects a corrected, not originally observed, value (see
+            #correct_spikes()/combine_spectra())
+            for cw in (self.corrected_pixel_wavelengths or []):
+                if abs(cw - self.lines[i]) <= 0.1:
+                    self.lines_check_flag[i] = True
+                    reasons.append(f'corrected pixel within measurement window ({cw:.3f} A)')
+                    print(self.lines[i], f'has a corrected pixel within its measurement window '
+                          f'({cw:.3f} A) -- excluded, not just flagged on an uncorrected value')
             #identification checks - only meaningful once identify_lines()
             #has actually run (lines_id_detected defaults to False either
             #way, so this must be gated on lines_id_run to avoid flagging
