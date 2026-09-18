@@ -97,6 +97,11 @@ def apply_response_correction(spectrum, response_wave, response, min_overlap_fra
         flux = spectrum.flux[i]
         order_mean = w.mean()
 
+        if spectrum.continuum[i].any():
+            print(f'order {i}: normalize() already ran on this order -- its continuum fit and '
+                  f'obs_err were computed from the PRE-correction flux and are now stale. '
+                  f're-run normalize() for this order after response correction.')
+
         # find the response chunk(s) whose range contains this order's mean
         # wavelength (same "mean falls inside" matching principle used
         # elsewhere in this package, e.g. estimate_shift()), then narrow to

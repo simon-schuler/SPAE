@@ -25,6 +25,7 @@ import numpy as np
 
 from .line_profile import gauss_model, gfit_simple
 from .line_identification import identify_lines_in_spectrum
+from .combine import parabolic_refine
 
 C_KMS = 299792.458  # speed of light, km/s (exact by definition)
 
@@ -287,3 +288,118 @@ def measure_rv_from_linelist(lines, wavelength, flux, err, pred, search_radius=1
     rv = rv0 + float(np.mean(fine_v))
     rv_err = float(fine_v.std() / np.sqrt(len(fine_v))) if len(fine_v) > 1 else 0.0
     return rv, rv_err, len(fine_v)
+
+
+def measure_rv_ccf(lines, wavelength, flux, v_min=-250.0, v_max=250.0, v_step=0.5,
+                    background_exclude_kms=20.0):
+    """
+    Multi-line-complex cross-correlation RV: searches a wide, continuous
+    velocity grid for the single shift that best aligns ALL of `lines`
+    (typically dozens, the whole loaded science linelist -- not just a
+    handful of named references) with real absorption in the spectrum,
+    rather than fitting each line's position individually.
+
+    This fixes two real failure modes found in measure_effective_rv() and
+    measure_rv_from_linelist() on a real large-RV star (HD_10383, true RV
+    confirmed independently at ~+107 km/s from H-alpha and Mg b1 agreeing
+    to ~2 km/s):
+      1. A single line's per-line search window (measure_effective_rv())
+         can contain more than one comparably strong absorption feature in
+         a densely-blended spectral region -- an unweighted single-
+         Gaussian fit then locks onto whichever is deeper/more compelling,
+         not necessarily the intended line. Confirmed to fail in BOTH
+         directions: widening the window from the current default to
+         +/-3 A didn't fix this -- for two lines (Mg b2, H-alpha) it
+         flipped a correct measurement into a confidently WRONG one of the
+         opposite sign, because the wider net now also enclosed a second
+         strong competing feature.
+      2. measure_rv_from_linelist()'s per-line search radius (default
+         +/-1.0 A coarse) has a hard velocity ceiling (~60-75 km/s across
+         this range) -- structurally incapable of ever finding a real
+         shift beyond that, at ANY wavelength. It doesn't fail loudly;
+         it silently locks onto whatever coincidentally-nearby unrelated
+         feature happens to sit within that too-small radius, producing a
+         confident-looking but meaningless answer (confirmed: 15-19
+         "detections" agreeing at ~0.8 km/s, nowhere near the true ~107).
+
+    Cross-correlating over ALL lines at once sidesteps both: a single
+    line's local confusion barely dents an aggregate signal from dozens of
+    others, and the search grid's range (v_min/v_max) is set directly in
+    velocity, not translated through a small per-line Angstrom radius, so
+    it has no analogous hidden ceiling.
+
+    Confirmed on real data: HD_10383 (true RV ~+107 km/s) recovers
+    +105.4 km/s from the Sun_fe_sample.txt linelist alone, no target-
+    specific tuning; the Sun (small, already-known shift from named-line
+    fits, ~-2.6 km/s) recovers -3.76 km/s -- the ~1 km/s difference from
+    the named-line estimate is consistent with convective blueshift
+    varying by line strength/depth (well-documented solar physics: this
+    method averages over dozens of Fe lines of varying depth, the named-
+    line estimate over 4 strong lines only), not a bug.
+
+    Deliberately a simple, un-weighted proxy for a real cross-correlation
+    (sum of (1 - flux) at each line's trial-velocity-shifted position,
+    not a matched filter against real line profiles) -- good enough to
+    find the right peak cleanly and by a wide margin on both real test
+    cases above; a profile-weighted version could sharpen the peak
+    further if precision beyond ~1 km/s is ever needed.
+
+    Parameters
+    ----------
+    lines : array of rest wavelengths (e.g. Spectrum_Data.lines).
+    wavelength, flux : lists of per-order arrays, UNSHIFTED (e.g.
+        Spectrum_Data.wavelength/normalized_flux -- this measures the
+        shift that hasn't been applied yet).
+    v_min, v_max, v_step : km/s -- the trial velocity grid. Default
+        +/-250 km/s comfortably covers everything from a normal disk
+        star's small shift to a genuinely high-velocity halo/thick-disk
+        star like HD_10383; narrow this for a faster search once you
+        already have a rough idea of the shift.
+    background_exclude_kms : half-width (km/s) around the peak excluded
+        when estimating the background level/scatter for `significance`
+        below -- must be wide enough that it doesn't itself eat into the
+        peak (default 20 km/s comfortably clears both real test cases'
+        peak widths).
+
+    Returns
+    -------
+    rv : float, km/s -- parabolically-refined peak location (via
+        combine.parabolic_refine(), reused as-is by negating the score
+        so the existing minimum-refinement math applies to this maximum)
+    significance : float -- peak height above the background level, in
+        units of the background's own scatter (a rough SNR-like
+        diagnostic, not a formal statistical error -- how much to trust
+        this measurement, similar in spirit to identify_line()'s own
+        min_significance elsewhere in this package)
+    v_grid, scores : the full CCF curve (both un-refined), for plotting/
+        diagnosing a run rather than trusting the single number blind
+    """
+    v_grid = np.arange(v_min, v_max + v_step/2, v_step)
+    scores = np.empty_like(v_grid)
+    n_used = np.empty_like(v_grid)
+
+    for i, v in enumerate(v_grid):
+        trial_wave = lines * (1.0 + v / C_KMS)
+        total, n = 0.0, 0
+        for order in range(len(wavelength)):
+            w = wavelength[order]
+            sel = (trial_wave >= w.min()) & (trial_wave <= w.max())
+            if sel.sum() == 0:
+                continue
+            f_at_line = np.interp(trial_wave[sel], w, flux[order])
+            total += np.sum(1.0 - f_at_line)
+            n += sel.sum()
+        scores[i], n_used[i] = total, n
+
+    #normalize by how many lines actually fell in range at each trial v --
+    #this varies slightly as trial_wave sweeps across order-coverage gaps
+    scores = scores / np.maximum(n_used, 1)
+
+    k_max = int(np.argmax(scores))
+    rv = parabolic_refine(v_grid, -scores, k_max)
+
+    background_mask = np.abs(v_grid - v_grid[k_max]) > background_exclude_kms
+    bg_level, bg_scatter = np.median(scores[background_mask]), np.std(scores[background_mask])
+    significance = (scores[k_max] - bg_level) / bg_scatter if bg_scatter > 0 else 0.0
+
+    return rv, significance, v_grid, scores

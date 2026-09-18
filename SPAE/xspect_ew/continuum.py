@@ -191,7 +191,30 @@ would be a wildly different amount of correction depending on
 brightness) -- applied as a POST-HOC shift of the already-converged
 mean-tracking fit, not folded into the iteration itself, so none of the
 above convergence/stability behavior changes; only the final reported
-level does."""
+level does.
+
+A fifth issue is specific to real order EDGES, not interior structure:
+an echelle order's outermost pixels are where detector/blaze-rolloff
+artifacts concentrate (a spurious upward spike immediately followed by a
+cliff-like drop, etc.) -- confirmed on a real Keck order (HD_10383,
+~4977-4982 A): a spike-then-drop right at the boundary dragged the fit up
+across the whole nearby region (curving from ~52000 to ~53500 toward the
+edge) even though the rest of the order's true local peaks sat flat
+around ~49700-50000. `edge_ignore_aa` (default 2.0) excludes the outer
+this-many-Angstroms at EACH end from influencing the fit (zero data-
+weight there, same mechanism as `p`'s below-fit decay, just permanent and
+unconditional for that stretch) while still returning a continuum value
+at every point, including the excluded edges -- the smoothness penalty
+extrapolates the curve into them from the trusted interior, rather than
+leaving them unfit. This is NOT free: a real, physically genuine blaze
+decline that's only captured by data in the last couple of Angstroms
+(confirmed on a real solar order, sunb.fits order 8: true continuum
+keeps falling all the way to the edge) gets extrapolated instead of
+tracked, overshooting there by >100%. There's no universally-correct
+choice -- 2 A is a compromise default, small enough to rarely eat into
+genuine order-edge curvature on typically-wide (tens of A) orders, large
+enough to exclude the kind of narrow edge artifact seen on HD_10383.
+Set to 0 to disable and fit every point as before."""
 
 import numpy as np
 from scipy import sparse
@@ -203,7 +226,7 @@ from scipy.stats import norm
 def fit_als_continuum(wave, flux, err, lam=2e3, p=0.01, n_iter=15, adaptive=True,
                        stiffen_factor=15.0, local_window=3.0, wide_window=25.0,
                        severity_threshold=0.02, severity_scale=0.06, low_reject_sigma=2.5,
-                       p_reduction_factor=30.0, target_percentile=80.0):
+                       p_reduction_factor=30.0, target_percentile=80.0, edge_ignore_aa=2.0):
     """
     Fit the continuum as the (noise-aware) upper envelope of flux via
     Asymmetric Least Squares (AsLS) smoothing: iteratively solve the
@@ -309,6 +332,13 @@ def fit_als_continuum(wave, flux, err, lam=2e3, p=0.01, n_iter=15, adaptive=True
         `return`) -- real extracted spectra don't always match `err`'s
         theoretical Poisson scaling (confirmed on MAROON-X), and this
         keeps the offset's actual SIZE correct even when they don't.
+    edge_ignore_aa : Angstroms of each order's outer edge (both ends) to
+        exclude from influencing the fit -- see module docstring for the
+        real-data motivation (a boundary artifact vs. genuine edge
+        curvature) and the tradeoff. 0 disables this (every point fits as
+        before). A continuum value is still returned at every point,
+        including excluded edges -- the smoothness penalty extrapolates
+        into them from the trusted interior.
 
     Returns
     -------
@@ -329,6 +359,19 @@ def fit_als_continuum(wave, flux, err, lam=2e3, p=0.01, n_iter=15, adaptive=True
     L = len(flux)
     d2 = sparse.diags([1.0, -2.0, 1.0], [0, 1, 2], shape=(L - 2, L))
     base_weight = 1.0 / err**2
+
+    # edge_ignore_aa: zero the data-weight within this many Angstroms of
+    # EACH end -- see module docstring ("A fifth issue...") for why.
+    # trusted/edge_ignore_mask are reused below (typical_weight's median,
+    # the below-fit reweighting each iteration, and the target_percentile
+    # calibration all need to exclude these points the same way).
+    edge_ignore_mask = np.zeros(L, dtype=bool)
+    if edge_ignore_aa > 0 and L > 2:
+        edge_ignore_mask = ((wave - wave[0] < edge_ignore_aa) |
+                             (wave[-1] - wave < edge_ignore_aa))
+        base_weight = base_weight.copy()
+        base_weight[edge_ignore_mask] = 0.0
+    trusted = ~edge_ignore_mask
 
     # lam/p are absolute numbers, calibrated (via this module's synthetic
     # ground-truth test, test_normalize.py: Poisson noise on a ~50,000-
@@ -354,7 +397,7 @@ def fit_als_continuum(wave, flux, err, lam=2e3, p=0.01, n_iter=15, adaptive=True
     # absolute units flux/err happen to be in -- a no-op for Keck/GRACES-
     # scale data (where this ratio is already ~1).
     _CALIBRATION_WEIGHT = 1.0 / 224.0**2
-    typical_weight = np.median(base_weight)
+    typical_weight = np.median(base_weight[trusted]) if trusted.any() else np.median(base_weight)
     if typical_weight > 0:
         lam = lam * typical_weight / _CALIBRATION_WEIGHT
 
@@ -406,6 +449,7 @@ def fit_als_continuum(wave, flux, err, lam=2e3, p=0.01, n_iter=15, adaptive=True
         below_decay = np.exp(-0.5 * (z / low_reject_sigma)**2)
         w = np.where(z >= 0, base_weight * (1.0 - p_vec),
                      base_weight * (p_vec + (1.0 - 2.0 * p_vec) * below_decay))
+        w[edge_ignore_mask] = 0.0  # keep excluded edges at zero trust every iteration
 
     resid = flux - pred
 
@@ -436,7 +480,7 @@ def fit_als_continuum(wave, flux, err, lam=2e3, p=0.01, n_iter=15, adaptive=True
         # and rescale err_at_continuum by that ratio before applying the
         # offset. A no-op when err already matches reality (Keck/GRACES);
         # self-corrects when it doesn't, without needing to know why.
-        above = resid > 0
+        above = (resid > 0) & trusted  # exclude edge_ignore_aa's edges from this too
         calib = 1.0
         if above.sum() > 10:
             empirical = np.median(resid[above])
@@ -447,5 +491,5 @@ def fit_als_continuum(wave, flux, err, lam=2e3, p=0.01, n_iter=15, adaptive=True
         pred = pred + sigma_offset * calib * err_at_continuum
         resid = flux - pred
 
-    pred_var = np.full_like(wave, np.var(resid))
+    pred_var = np.full_like(wave, np.var(resid[trusted]) if trusted.any() else np.var(resid))
     return pred, pred_var
