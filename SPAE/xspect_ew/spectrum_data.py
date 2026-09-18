@@ -1012,9 +1012,15 @@ class Spectrum_Data():
                 ep = str(self.lines_exd[i][1])
                 gf = str(self.lines_exd[i][2])
                 rad = str(self.lines_exd[i][3])
+                d0 = '0.0'
                 ew = str(np.round(self.lines_ew[i],3))
                 err = str(np.round(self.lines_ew_err[i],3))
-                current_line = "{0:14s}{1:11s}{2:8s}{3:15s}{4:17s}{5:10s}{6:5s}\n".format(wave,elmnt,ep,gf,rad,ew,err)
+                # 8 fixed 10-char columns: wave1,atom1,e,gf,dampnum,d0,width,width_err
+                # (the first 7 match MOOG's native 7e10.3 linelist format; the
+                # trailing err column is a pymoog-only extension read by
+                # moog/inlines.py -- real MOOG ignores anything past column 70)
+                current_line = "{0:10s}{1:10s}{2:10s}{3:10s}{4:10s}{5:10s}{6:10s}{7:10s}\n".format(
+                    wave, elmnt, ep, gf, rad, d0, ew, err)
                 if self.lines_check_flag[i]:
                     flagged_doc.write(current_line.rstrip('\n') + '   # ' + self.lines_flag_reasons[i] + '\n')
                 elif self.lines_human_keep[i] and self.lines_flag_reasons[i]:

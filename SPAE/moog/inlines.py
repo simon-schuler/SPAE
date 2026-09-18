@@ -34,28 +34,34 @@ def _sunder(amol: float):
 
 def _read_fixed(line: str) -> list:
     """
-    Parse one line in Fortran 7e10.3 format (7 × 10-char E fields).
+    Parse one line in Fortran 7e10.3 format (7 × 10-char E fields), plus an
+    optional 8th 10-char field holding an EW uncertainty -- a pymoog-only
+    extension written by xspect_ew.make_ew_doc(); real MOOG linelists don't
+    have it and it defaults to 0.0 when absent.
     Blank fields yield 0.0; handles Fortran D/d exponent notation.
     """
     line = line.rstrip('\n')
     vals = []
-    for start in range(0, 70, 10):
+    for start in range(0, 80, 10):
         field = line[start:start + 10] if start < len(line) else ''
         field = field.replace('d', 'e').replace('D', 'E').strip()
         try:
             vals.append(float(field) if field else 0.0)
         except ValueError:
             vals.append(0.0)
-    while len(vals) < 7:
+    while len(vals) < 8:
         vals.append(0.0)
     return vals
 
 
 def _read_free(line: str) -> list:
-    """Parse one free-format line into up to 7 floats (missing → 0.0)."""
+    """Parse one free-format line into up to 8 floats (missing → 0.0).
+
+    The 8th token, if present, is an EW uncertainty (see _read_fixed).
+    """
     toks = line.split()
-    vals = [float(t) for t in toks[:7]]
-    while len(vals) < 7:
+    vals = [float(t) for t in toks[:8]]
+    while len(vals) < 8:
         vals.append(0.0)
     return vals
 
@@ -100,6 +106,7 @@ def inlines(state, num: int = 1) -> None:
     # ------------------------------------------------------------------ #
     swave1   = []; satom1  = []; se      = []; sgf      = []
     sdampnum = []; sd0     = []; swidth  = []; scharge  = []
+    swidth_err = []
 
     if state.dostrong > 0:
         with open(state.fslines) as sf:
@@ -119,6 +126,7 @@ def inlines(state, num: int = 1) -> None:
                 se.append(vals[2]);       sgf.append(vals[3])
                 sdampnum.append(vals[4]); sd0.append(vals[5])
                 swidth.append(vals[6]);   scharge.append(chg)
+                swidth_err.append(vals[7])
         if len(swave1) > 40:
             raise ValueError("Strong line list has more than 40 lines.")
 
@@ -129,6 +137,7 @@ def inlines(state, num: int = 1) -> None:
     # ------------------------------------------------------------------ #
     wave1_l = []; atom1_l = []; e_l   = []; gf_l   = []
     damp_l  = []; d0_l    = []; wid_l = []; chg_l  = []
+    wid_err_l = []
 
     with open(state.flines) as fh:
         # Title line (num==6 skips it; COG mode doesn't rewind and re-read)
@@ -159,6 +168,7 @@ def inlines(state, num: int = 1) -> None:
             e_l.append(vals[2]);     gf_l.append(vals[3])
             damp_l.append(vals[4]); d0_l.append(vals[5])
             wid_l.append(vals[6]);   chg_l.append(chg)
+            wid_err_l.append(vals[7])
 
     nlines = len(wave1_l)
     total  = nlines + nstrong
@@ -175,6 +185,7 @@ def inlines(state, num: int = 1) -> None:
     all_d0      = d0_l    + sd0
     all_width   = wid_l   + swidth
     all_charge  = chg_l   + scharge
+    all_width_err = wid_err_l + swidth_err
 
     for j in range(total):
         state.wave1[j]   = all_wave1[j]
@@ -185,6 +196,7 @@ def inlines(state, num: int = 1) -> None:
         state.d0[j]      = all_d0[j]
         state.width[j]   = all_width[j]
         state.charge[j]  = all_charge[j]
+        state.width_err[j] = all_width_err[j]
 
     # ------------------------------------------------------------------ #
     # 3. Post-processing                                                   #
@@ -206,6 +218,7 @@ def _snapshot_lines(state) -> dict:
         'dampnum': state.dampnum[:total].copy(),
         'd0':      state.d0[:total].copy(),
         'width':   state.width[:total].copy(),
+        'width_err': state.width_err[:total].copy(),
         'charge':  state.charge[:total].copy(),
         'group':   state.group[:total].copy(),
         'amass':   state.amass[:total].copy(),
@@ -227,6 +240,7 @@ def apply_parsed_lines(state, parsed: dict) -> None:
     state.dampnum[:total] = parsed['dampnum']
     state.d0[:total]      = parsed['d0']
     state.width[:total]   = parsed['width']
+    state.width_err[:total] = parsed['width_err']
     state.charge[:total]  = parsed['charge']
     state.group[:total]   = parsed['group']
     state.amass[:total]   = parsed['amass']
@@ -274,6 +288,7 @@ def _postprocess(state, total: int) -> None:
             state.wave1[j] = abs(state.wave1[j])
             if j > 0:
                 state.width[j] = state.width[j - 1]
+                state.width_err[j] = state.width_err[j - 1]
         else:
             state.group[j] = 0
 
@@ -295,8 +310,11 @@ def _postprocess(state, total: int) -> None:
     for j in range(total):
         if state.width[j] < 0.0:
             state.width[j] = (10.0 ** state.width[j]) * state.wave1[j]
+            # log-RW encoding has no separate uncertainty column
+            state.width_err[j] = 0.0
         else:
             state.width[j] /= 1000.0
+            state.width_err[j] /= 1000.0
 
     # ---- derived quantities per line ----
     for j in range(total):

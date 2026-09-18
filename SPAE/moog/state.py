@@ -151,6 +151,7 @@ class State:
     dampnum:  np.ndarray = _zeros(NLINES_MAX)  # input damping constant
     gf1:      np.ndarray = _zeros(NLINES_MAX)  # working gf (adjusted during fit)
     width:    np.ndarray = _zeros(NLINES_MAX)  # observed equivalent width [Å]
+    width_err: np.ndarray = _zeros(NLINES_MAX) # observed EW uncertainty [Å] (0 if unknown)
     abundout: np.ndarray = _zeros(NLINES_MAX)  # derived abundance per line
     widout:   np.ndarray = _zeros(NLINES_MAX)  # computed equivalent width
     strength: np.ndarray = _zeros(NLINES_MAX)  # line strength at jtau5
