@@ -1363,7 +1363,7 @@ class Spectrum_Data():
                       'explicitly instead. Reference atlas NOT loaded.')
                 self.ref_wave, self.ref_flux = None, None
 
-    def measure_ew(self, i, order, plot = False, ex_params = [0,0,0,0], save_plot = False, window_size = 1.5, show_plot = True, fit_continuum = False, auto_widen = True, widen_window_size = 2.5, slope_sig_thresh = 3.0, slope_min_points = 5, slope_internal_sig_thresh = 3.0, plot_window_size = None, keep_result = True):
+    def measure_ew(self, i, order, plot = False, ex_params = [0,0,0,0], save_plot = False, window_size = 1.5, show_plot = True, fit_continuum = False, auto_widen = True, widen_window_size = 2.5, slope_sig_thresh = 3.0, slope_min_points = 5, slope_internal_sig_thresh = 3.0, plot_window_size = None, keep_result = True, axes = None):
         #extra parameters [0] - shift continuum
         #                 [1] - left boundary in Angstroms
         #                 [2] - right boundary in Angstroms
@@ -1419,6 +1419,12 @@ class Spectrum_Data():
         #exactly the kind of order-boundary artifacts investigated this
         #session (see continuum.py's edge_ignore_aa). See measure_all_ew()
         #for how the winning order is chosen.
+        #axes: (fit_view, local_view) existing Axes to draw into instead of
+        #a new figure -- lets a caller (e.g. interactive.EWWidget) own its
+        #own persistent figure/redraw loop. Forces plotting on even if
+        #plot=False was passed (there'd be nothing to draw into the caller's
+        #axes otherwise); save_plot/show_plot still independently gate
+        #saving to disk / blocking on plt.show(), same as always.
         norm = 1.0
         wind, found_line, line_bound,dy = get_line_window(self.lines[i],self.shifted_wavelength[order],self.normalized_flux[order],ex_params[1],ex_params[2],ex_params[3], window_size)
 
@@ -1622,7 +1628,8 @@ class Spectrum_Data():
                   f'{widen_window_size}')
             self.measure_ew(i, order, plot, ex_params, save_plot, widen_window_size,
                              show_plot, fit_continuum, auto_widen=False,
-                             plot_window_size=plot_window_size, keep_result=keep_result)
+                             plot_window_size=plot_window_size, keep_result=keep_result,
+                             axes=axes)
             return
 
         #DIAGNOSTIC: a parallel conditionally-sloped local continuum --
@@ -1750,7 +1757,7 @@ class Spectrum_Data():
         print('EW:',np.round(ew_global,2),u"±",np.round(ew_err_global,2))
 
         #Plotting stuff
-        if plot:
+        if plot or axes is not None:
             #plot_window_size widens the DISPLAYED data/fit-curve range
             #beyond the actual fit window (xtest/measure_x_array above,
             #untouched) -- re-fetched fresh from this order's full arrays,
@@ -1775,117 +1782,31 @@ class Spectrum_Data():
             #now the basis for lines_gauss_Xsquare's fit-quality check, not
             #just this plot's left panel).
 
-            fig = plt.figure(figsize=(12,5))
-            title = ("Order: " + str(order) + " " + "(" + str(np.round(self.shifted_wavelength[order].min(),3))
-                      + "-" + str(np.round(self.shifted_wavelength[order].max(),3)) + ")")
             #lines_check_flag/lines_flag_reasons only reflect the truth as
             #of the LAST check_for_flags() call -- for a plot generated
             #before that's been (re)run on this measurement, this is
             #whatever it was left at previously (default: unflagged/'')
-            if self.lines_check_flag[i]:
-                title += "\nFLAGGED: " + str(self.lines_flag_reasons[i])
-                fig.suptitle(title, color='#e41a1c', fontsize=10)
-            else:
-                fig.suptitle(title)
+            fig, (fit_view, local_view) = plot_ew_fit(
+                order, self.shifted_wavelength[order].min(), self.shifted_wavelength[order].max(),
+                self.lines[i], found_line, line_bound,
+                plot_x_array, plot_y_array, plot_err_array, plot_pred_array,
+                plot_points_within_norm, ex_params, norm,
+                bf_global, pcov_global, ew_global, ew_err_global,
+                fit_continuum, best_bf, pcov, cont_offset, ew, ew_err,
+                flagged=self.lines_check_flag[i], flag_reasons=self.lines_flag_reasons[i],
+                axes=axes)
 
-            #plot the fit/band/local-continuum curves on a 5x denser
-            #wavelength grid than the actual data -- xtest only has one
-            #point per real pixel, which makes a narrow line's Gaussian
-            #fit curve look faceted/low-resolution; this is purely
-            #cosmetic (fitting and the chi-square check above still use
-            #the real data grid, unchanged). Spans plot_x_array's (possibly
-            #widened) range, not just xtest's -- so the fit curve/local-
-            #continuum line visually extrapolate across the wider view too.
-            xplot = np.linspace(plot_x_array[0], plot_x_array[-1], len(plot_x_array)*5)
-
-            def _draw_window(ax):
-                #shared data/window-markers drawing for both panels below --
-                #only the overlaid fit curve differs between them
-                ax.grid()
-                ax.set_xlabel(r'$\rm Wavelength~(\AA)$', size = 14)
-                ax.errorbar(plot_x_array,plot_y_array + ex_params[0],
-                     yerr=2*plot_err_array/plot_pred_array,capsize=0,fmt='.', color = 'k', label = 'cont', zorder = 2)
-                ax.scatter(plot_x_array[plot_points_within_norm],plot_y_array[plot_points_within_norm] + ex_params[0], s = 10, c='#4daf4a', zorder = 3, alpha = 0.8)
-                ax.plot([self.lines[i],self.lines[i]],[norm,norm*0.95], '--', color = 'k', alpha = 0.75)
-                ax.plot([found_line,found_line],[norm,norm*0.95], '-', color='k')
-                ax.plot([line_bound[0],line_bound[0]],[norm*1.025,norm*0.95], '--', color = '#e41a1c', alpha = 0.5)
-                ax.plot([line_bound[1],line_bound[1]],[norm*1.025,norm*0.95], '--', color = '#e41a1c', alpha = 0.5)
-                ax.annotate(str(self.lines[i]), xy = [self.lines[i], norm*1.025])
-                ax.plot([plot_x_array[0],plot_x_array[-1]],[norm,norm], '--', color = '#4daf4a', label = 'assumed continuum (norm)')
-
-            #Left panel: fit assuming the global continuum normalization is
-            #already exact (no local wing-based correction)
-            fit_view = fig.add_subplot(121)
-            _draw_window(fit_view)
-            fit_view.set_ylabel('Normalized Flux', size = 14)
-            fit_view.set_title(f'Global continuum (REPORTED) -- EW={ew_global:.2f}±{ew_err_global:.2f} mÅ', fontsize=10)
-            fit_gauss_plot_global = norm - (gauss_model(xplot, *bf_global) + 0.)
-            fit_view.plot(xplot, fit_gauss_plot_global, '--', color = '#377eb8', lw= 2, label = 'Gaussian fit')
-            if pcov_global is not None:
-                model_err_plot_global = gauss_model_err(xplot, bf_global, pcov_global)
-                fit_view.fill_between(xplot, fit_gauss_plot_global-model_err_plot_global, fit_gauss_plot_global+model_err_plot_global,
-                         color = '#377eb8', alpha = 0.25, zorder = 1, label = r'fit $\pm1\sigma$')
-            fit_view.legend(loc='best', fontsize=8)
-
-            #Right panel: fit against the per-line estimated LOCAL continuum
-            #(see estimate_local_continuum()) -- this is the LOCAL-
-            #continuum-corrected comparison fit (lines_ew_local), shown
-            #only when fit_continuum=True was explicitly requested; it
-            #never drives self.lines_ew itself (always the GLOBAL-
-            #continuum fit, bf_global, regardless of fit_continuum -- see
-            #where self.lines_ew is set below). When fit_continuum=False
-            #(the default) no local estimate was made, so there's nothing
-            #distinct to show here
-            local_view = fig.add_subplot(122)
-            _draw_window(local_view)
-            if fit_continuum:
-                local_view.set_title(f'Local continuum (diagnostic only) -- EW={ew:.2f}±{ew_err:.2f} mÅ', fontsize=10)
-                fit_gauss_plot_local = norm - (gauss_model(xplot, *best_bf) + cont_offset)
-                local_view.plot(xplot, fit_gauss_plot_local, '--', color = '#377eb8', lw= 2, label = 'Gaussian fit')
-                if pcov is not None:
-                    model_err_plot_local = gauss_model_err(xplot, best_bf, pcov)
-                    local_view.fill_between(xplot, fit_gauss_plot_local-model_err_plot_local, fit_gauss_plot_local+model_err_plot_local,
-                             color = '#377eb8', alpha = 0.25, zorder = 1, label = r'fit $\pm1\sigma$')
-                #the estimated LOCAL continuum level (c0, flat/no slope), so
-                #you can see directly how far the global normalization was
-                #off here -- this is what fixes a fit biased by imperfect
-                #normalization
-                local_cont_plot = np.full_like(xplot, norm - cont_offset)
-                local_view.plot(xplot, local_cont_plot, ':', color = '#ff7f00', lw = 2, label = 'estimated local continuum')
-                local_view.legend(loc='best', fontsize=8)
-            else:
-                local_view.set_title('Local continuum not estimated (fit_continuum=False)', fontsize=10)
-            plt.tight_layout()
-
-
-            # fig1, coarse_view = plt.subplots()
-            # coarse_view.set_title("Order: " + str(order) + " " + "(" + str(np.round(self.shifted_wavelength[order].min(),3)) + "-" + str(np.round(self.shifted_wavelength[order].max(),3)) + ")")
-            # coarse_view.grid()
-            # coarse_view.set_xlabel(r'$\rm Wavelength~(\AA)$', size = 14)
-            # coarse_view.set_ylabel('Normalized Flux', size = 14)
-            #coarse_view.plot(xtest,m_plot, 'k--', alpha = 0.75)
-            # coarse_view.errorbar(self.shifted_wavelength[order][wind],self.normalized_flux[order][wind] + ex_params[0],
-            #      yerr=2*self.obs_err[order][wind]/self.pred_all[order][wind],capsize=0,fmt='.', color = 'k', label = 'cont', zorder = 2)
-            # coarse_view.scatter(self.shifted_wavelength[order][wind][points_within_norm],self.normalized_flux[order][wind][points_within_norm] + ex_params[0], s = 10, c='#4daf4a', zorder = 3, alpha = 0.8)
-            # coarse_view.fill_between(xtest,m_plot+2*np.sqrt(np.diag(C)),
-            #          m_plot-2*np.sqrt(np.diag(C)),color='#999999',alpha=0.5)
-            #coarse_view.plot(xtest,samples.T,alpha=0.1, color='#cccccc')
-            # coarse_view.plot([self.lines[i],self.lines[i]],[norm,norm*0.95], '--', color = 'k', alpha = 0.75)
-            # coarse_view.plot([found_line,found_line],[norm,norm*0.95], '-', color='k')
-            # coarse_view.plot([line_bound[0],line_bound[0]],[norm*1.025,norm*0.95], '--', color = '#e41a1c', alpha = 0.5)
-            # coarse_view.plot([line_bound[1],line_bound[1]],[norm*1.025,norm*0.95], '--', color = '#e41a1c', alpha = 0.5)
-            # coarse_view.annotate(str(self.lines[i]), xy = [self.lines[i], norm*1.025])
-            #coarse_view.plot(xtest,dy+norm, '--', color = '#e41a1c', lw = 2) #view gradient
-            # if plot_gaussian:
-            #     coarse_view.plot(xtest, fit_gauss, '--', color = '#377eb8', lw= 2)
-            # coarse_view.plot([xtest[0],xtest[-1]],[norm,norm], '--', color = '#4daf4a')
             if save_plot:
                 fig_title = ELEMENTS[self.lines_exd[i][0]] + '_' + str(self.lines[i]) + '_' + str(order) + '.pdf'
-                plt.savefig('line_plots/'+fig_title)
-            if show_plot:
-                plt.show()
-            else:
-                plt.close(fig)
+                fig.savefig('line_plots/'+fig_title)
+            if axes is None:
+                # caller-supplied axes (e.g. interactive.EWWidget) owns its
+                # own figure/redraw -- only show/block or close here in the
+                # original, non-interactive plot=True usage.
+                if show_plot:
+                    plt.show()
+                else:
+                    plt.close(fig)
 
             print('#-----------------------#')
 
