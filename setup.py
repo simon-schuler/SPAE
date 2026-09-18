@@ -29,7 +29,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name="spae",
-    version="0.0.1",
+    version="0.3.1",
     author="Simon Schuler",
     author_email="sschuler@ut.edu",
     description="SPAE: Stellar Parameters, Abundances, and Errors",
@@ -37,6 +37,11 @@ setuptools.setup(
     long_description_content_type="text/markdown",
     url="https://github.com/simon-schuler/SPAE",
     packages=setuptools.find_packages(),
+    entry_points={
+        'console_scripts': [
+            'pymoog = SPAE.moog.cli:main',
+        ],
+    },
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",

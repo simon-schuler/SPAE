@@ -1,5 +1,4 @@
 import numpy as np
-import matplotlib.pyplot as plt
 from pathlib import Path
 from scipy.interpolate import RegularGridInterpolator
 import pickle
@@ -19,7 +18,7 @@ def load_data():
     """Load up the pickled interpolator."""
     global atmosphere_interpolator
 
-    filename = "Kurucz_grid_interpolator.pickle"
+    filename = "Kurucz_grid_interpolator_scipy1.15.pickle"
     atmosphere_interpolator = pickle.load(pkg_resources.open_binary(data,
                                                                     filename))
 
