@@ -537,10 +537,16 @@ def main():
             balance = result.median_balance
             fe1, fe2 = balance.fe1, balance.fe2
             ep_fig, ep_ax = plt.subplots(figsize=(9, 6))
-            ep_ax.scatter(fe1['EP'], fe1['abund'], marker='o', color='#377eb8',
-                          label=f'Fe I (n={len(fe1)})')
-            ep_ax.scatter(fe2['EP'], fe2['abund'], marker='^', color='#e41a1c',
-                          label=f'Fe II (n={len(fe2)})')
+            #y-error bars: each line's own abundance uncertainty, propagated
+            #from its measured EW error (SPAE.moog.lineabund.line_abund_err(),
+            #via the abund_err field in abunds._RESULT_DTYPE) -- not the
+            #line-to-line scatter, which is a separate, already-plotted trend
+            ep_ax.errorbar(fe1['EP'], fe1['abund'], yerr=fe1['abund_err'], fmt='o',
+                           color='#377eb8', ecolor='#377eb8', elinewidth=1, capsize=3,
+                           markersize=5, label=f'Fe I (n={len(fe1)})')
+            ep_ax.errorbar(fe2['EP'], fe2['abund'], yerr=fe2['abund_err'], fmt='^',
+                           color='#e41a1c', ecolor='#e41a1c', elinewidth=1, capsize=3,
+                           markersize=6, label=f'Fe II (n={len(fe2)})')
             ep_line_x = np.array([fe1['EP'].min(), fe1['EP'].max()])
             ep_ax.plot(ep_line_x, balance.ep.intercept + balance.ep.slope * ep_line_x, 'k--',
                        label=f"Fe I fit: slope={balance.ep.slope:+.4f} "
