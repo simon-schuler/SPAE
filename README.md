@@ -54,6 +54,24 @@ spec.make_ew_doc('linelist_with_ew.txt')                   # MOOG-format output
 
 `apply_rv_shift()` is the recommended way to align a spectrum before EW measurement — it measures one effective RV from a handful of strong, well-identified lines (`SPAE.xspect_ew.radial_velocity.RV_REFERENCE_LINES`) and applies it as a proper multiplicative (1+v/c) shift to every order. The older `estimate_shift()`/`clean_shift()` (per-order cross-correlation against a reference spectrum, e.g. a solar atlas) remains available and is still the right tool when you specifically need reference-spectrum registration (e.g. `combine_spectra()`), but its extrapolation for orders with no reference-spectrum overlap was measured to be substantially less reliable (RMS ~67 mA vs ~37 mA position error on a real test, worst case 119 mA) — unreliable enough to risk misidentifying a line during EW measurement. `clean_shift()` now warns when it's extrapolating outside its actual reference coverage.
 
+`measure_ew()`/`measure_all_ew()` fit each line twice: a **global-continuum fit** (assumes the existing per-order normalization already puts the continuum at 1.0 — this is what gets reported in `lines_ew`/the output linelist) and, when `fit_continuum=True`, an additional **local-continuum diagnostic fit** (estimates a flat local continuum from the line's own wing data and refits against that — kept only as a comparison value in `lines_ew_local`, never the reported EW). Passing a high-S/N `load_reference_atlas()` spectrum (e.g. the Kurucz solar flux atlas, for solar-type targets) lets the fit additionally cross-check a line's wing against that reference to catch shallow blends a simple sigma-clip would miss.
+
+Multiple exposures of the same star/order coverage can be combined before measurement: `combine_spectra()` aligns and co-adds two `Spectrum_Data` instances order-by-order, with cosmic-ray/bad-pixel rejection across the pair.
+
+### Interactive widget
+
+`ew_interactive()` launches a step-by-step widget (Load → Normalize → RV Shift → Measure EW) for visually walking through the whole measurement process instead of calling each stage from a script — inspect/tune the continuum fit per order, review or override the RV shift, and step through lines adjusting `measure_ew()`'s `ex_params` live while watching the fit update. Works standalone or embedded in Jupyter, same as the `pymoog` synthesis widget below.
+
+```python
+from SPAE.xspect_ew import ew_interactive
+
+w = ew_interactive('star_blue.fits')                        # single exposure
+# or, for multiple exposures of the same star:
+w = ew_interactive(spectra=['star_blue_1.fits', 'star_blue_2.fits'])
+```
+
+**From a Jupyter notebook**, run `%matplotlib widget` in its own cell first, then call `ew_interactive()` as above — keep the returned widget assigned to a variable (`w = ...`) to prevent it from being garbage-collected and disconnecting its callbacks.
+
 Sample data (`SPAE/xspect_ew/data/`) — a solar HIRES spectrum and Fe linelist — is included for testing.
 
 Minimum Python version: **3.6**
@@ -496,3 +514,29 @@ w = SynthWidget('batch.par')
 # Access w._wave, w._flux_smooth, w._obs_wave, w._obs_flux, etc.
 plt.show()
 ```
+
+
+---
+
+## End-to-end pipeline: spectrum in, stellar parameters out (`SPAE.pipeline`)
+
+`SPAE.pipeline` chains `SPAE.xspect_ew` (EW measurement) and `SPAE.spae`/`SPAE.analysis` (MCMC stellar-parameter fitting) into a single call, so a raw spectrum plus a linelist can go straight to a posterior on Teff/logg/[Fe/H]/micro without hand-wiring the two packages together.
+
+```python
+from SPAE.pipeline import run_full_pipeline
+
+out = run_full_pipeline('star_blue.fits', 'linelist.txt', output_dir='run_star')
+print(out['summary'])
+```
+
+The two stages are also available separately — `measure_star_ew()` (EW measurement only, writing a MOOG-format linelist) and `fit_stellar_params()` (MCMC fit from an already-measured linelist) — useful when you want to inspect or hand-edit the EW linelist between stages, or re-fit the same measurements with different `run_spae()` settings. `measure_star_ew(review=True)` pauses after measurement to show each flagged line's QC plot and let a reviewer keep it anyway (`review=False`, the default, is fully unattended). `solar_reference()` is a convenience wrapper that runs the same EW-measurement stage for the Sun and returns `sun_el, sun_abs` — the differential-abundance reference point `run_spae()`/`fit_stellar_params()` expect.
+
+### `run_pipeline_cli.py` — differential (relative-to-solar) abundances for one star
+
+A ready-to-edit command-line script that measures a target star and one or more solar reference exposures, filters both linelists down to their common lines (avoiding the array-position misalignment `SPAE.abunds.rel_abunds()` is otherwise exposed to when the two linelists disagree on which lines exist), and runs the MCMC fit differentially against the Sun:
+
+```bash
+python run_pipeline_cli.py /path/to/target.fits [/path/to/solar_dir_or_file]
+```
+
+Omitting the solar argument uses the bundled solar sample spectra (`SPAE/xspect_ew/data/spectra_sample/Solar/`). Edit the `CONFIG` block at the top of the script first — in particular `LINELIST_PATH`. Outputs (QC plots, EW linelists, MCMC diagnostics, trace/corner plots) are written inside the target spectrum's own directory; see the script's module docstring for the full file list. Uses multiprocessing via `run_spae()`, so run it as a script (`python run_pipeline_cli.py ...`) rather than importing and calling its internals directly.
