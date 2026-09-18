@@ -1599,6 +1599,23 @@ backend) in all three combinations (`axes=None`/flagged,
 `axes=(ax1,ax2)`/`fit_continuum=False` placeholder panel,
 `axes=(ax1,ax2)`/flagged) -- all draw without error.
 
+**Full widget regression, `test_ew_widget_sunb.py` (`/tmp`, not under
+version control)**: end-to-end drive of `EWWidget` against the bundled
+`sunb.fits` + `Sun_fe_sample.txt` (`Agg` backend, no real display) --
+Stage 1's `normalize_all()`/per-order refit/Apply-to-ALL, Stage 2's
+`apply_rv_shift()` (correctly preferred the cross-correlation RV over
+the disagreeing named-line RV here) and manual override, and Stage 3
+stepping through all 78 linelist lines (75 fall outside this
+spectrum's 3643-4795 A coverage, exercising the "no order covers this
+line" path; the 3 in-range lines -- Fe I 4779.439/4788.757, Fe II
+4620.521 -- measured real EWs of 40.4/66.6/54.3 mA) plus slider-driven
+`ex_params` changes, all run with zero exceptions. Rendered Stage 4 to
+PNG and visually confirmed both the default (`fit_continuum=False`,
+widget's own path) and `fit_continuum=True` (called directly, since
+the widget itself doesn't expose that flag) panel layouts populate
+correctly, including the local-continuum estimate line on the right
+panel.
+
 ## 20. Commit reference
 
 | Commit | Summary |
