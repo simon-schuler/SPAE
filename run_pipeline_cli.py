@@ -1,13 +1,16 @@
 #!/usr/bin/env python
 """General CLI driver: full SPAE.xspect_ew EW-measurement + SPAE.spae
-stellar-parameter MCMC pipeline, for any one FITS spectrum, using
-DIFFERENTIAL (relative-to-solar) abundances.
+stellar-parameter MCMC pipeline, for one target star, using DIFFERENTIAL
+(relative-to-solar) abundances.
 
 Usage
 -----
-    python run_pipeline_cli.py /path/to/target.fits [/path/to/solar]
+    python run_pipeline_cli.py /path/to/target.fits [target2.fits ...] [--solar /path/to/solar]
 
-`target.fits` is the star to fit. `solar` is optional and may be:
+One or more `target.fits` files are given -- all of them the SAME star
+(e.g. several exposures/epochs, or several bands/orders that together
+cover more of the linelist than any one alone does; see "Why multiple
+files at once" below). `--solar` is optional and may be:
   - omitted entirely: defaults to the bundled solar sample directory,
     SPAE/xspect_ew/data/spectra_sample/Solar/ (three FITS files covering
     different, mostly non-overlapping wavelength ranges/orders -- see
@@ -15,17 +18,20 @@ Usage
   - a single FITS file: one solar spectrum
   - a directory: every *.fits file directly inside it is used
 
-Why multiple solar files at once: a single echelle exposure only covers
-part of the optical range, so a linelist spanning the whole range (like
-the bundled Sun_fe_sample.txt) needs several solar exposures to have
-every line measured somewhere. Each solar file is measured independently
-(same linelist, same routine as any other star), then their individual
-EW linelists are merged into one combined solar reference by wavelength
--- safe because each file's own `measure_star_ew()` output already only
-contains lines that fell inside ITS wavelength coverage and were
-successfully measured, so the three pieces contribute disjoint (or, at
+Why multiple files at once (both target and solar): a single echelle
+exposure only covers part of the optical range, so a linelist spanning
+the whole range (like the bundled Sun_fe_sample.txt) needs several
+exposures to have every line measured somewhere. Each file is measured
+independently (same linelist, same routine as any other star), then the
+individual EW linelists are merged into one combined linelist by
+wavelength -- safe because each file's own `measure_star_ew()` output
+already only contains lines that fell inside ITS wavelength coverage and
+were successfully measured, so the pieces contribute disjoint (or, at
 worst, redundant-but-consistent) sets of lines, never conflicting values
-for the same line.
+for the same line. (This assumes every file given really is the same
+star -- picking that out from a directory that might also hold OTHER
+stars' spectra is the calling script's job, e.g. run_batch_pipeline.py's
+header-name matching, not this script's.)
 
 Only lines measured in BOTH the target star and the (combined) solar
 reference are used for the MCMC fit: SPAE.abunds.rel_abunds() matches
@@ -42,16 +48,28 @@ single MCMC trial can still transiently drop a line MOOG itself finds
 unphysical at that specific trial point -- a separate, deeper issue in
 rel_abunds() itself, not fixed by this filtering).
 
-Writes, inside the TARGET spectrum's own directory:
+Writes, inside the TARGET spectrum's own directory (if more than one
+target file is given, all must live in the SAME directory -- that
+directory is where every output below lands):
 
-    line_plots/                     -- one QC plot per measured line
+    line_plots/                     -- one QC plot per measured line (only
+                                        target file case; see below for
+                                        the multi-file layout)
     linelist_with_ew.txt            -- main MOOG-format EW linelist (ALL
                                         lines measured in the target,
-                                        unfiltered)
+                                        unfiltered; the by-wavelength
+                                        merge of every target file's own
+                                        linelist_with_ew.txt if more than
+                                        one was given)
     linelist_with_ew_common.txt     -- the subset of the above also
                                         measured in the solar reference --
                                         what the MCMC fit actually uses
-    linelist_with_ew_flagged.txt    -- untrustworthy lines, for manual review
+    linelist_with_ew_flagged.txt    -- untrustworthy lines, for manual
+                                        review (only target file case;
+                                        with multiple target files, each
+                                        one's own flagged file stays in
+                                        its own subdirectory, unmerged --
+                                        see below)
     ew_measurement.log              -- Stage 2 diagnostics (per-line fit
                                         prints, slope diagnostics, flags)
     mcmc_fit.log                    -- Stage 4 diagnostics + final summary
@@ -77,6 +95,13 @@ Writes, inside the TARGET spectrum's own directory:
                                         uses -- only for the common-lines
                                         subset actually fit (see Stage 3
                                         below)
+
+If more than one target file was given, each one is measured into its
+own subdirectory of the target directory first (named after that file's
+own basename, minus extension), exactly like the solar files below --
+each with its own line_plots/, linelist_with_ew.txt,
+linelist_with_ew_flagged.txt -- and only the merged linelist_with_ew.txt
+described above is written at the top level.
 
 ...and, inside a solar_reference/ subdirectory of that same directory
 (kept separate from the target's own outputs, and never written into any
@@ -124,18 +149,29 @@ import numpy as np
 # ============================== CONFIG ==============================
 # Edit these for your target before running.
 
+# Repository root, resolved from this file's own location -- NOT the
+# process's current working directory, so every default path below stays
+# correct no matter where this script is invoked from (e.g. a relative
+# `python run_pipeline_cli.py ...` from inside a star's own data
+# directory, or a subprocess launched by run_batch_pipeline.py without an
+# explicit `cwd=`). Plain os.path.dirname(__file__) is NOT enough for
+# this: if the script was invoked with a relative path (the common case),
+# __file__ itself is relative, and joining it with anything still
+# resolves against the CWD, not the repo -- os.path.abspath() first is
+# what actually pins it down.
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
 # MOOG-format linelist of lines to measure (wave, species, EP, loggf, ...)
 # -- used for BOTH the target and every solar measurement (see module
 # docstring for why they must match)
 LINELIST_PATH = os.path.join(
-    os.path.dirname(__file__),
-    'SPAE/xspect_ew/data/Line_list_sample/Sun_fe_sample.txt')
+    REPO_ROOT, 'SPAE/xspect_ew/data/Line_list_sample/Sun_fe_sample.txt')
 
 # Default solar reference when no solar argument is given on the command
 # line -- see module docstring for why all three bundled files get used
 # together.
 DEFAULT_SOLAR_DIR = os.path.join(
-    os.path.dirname(__file__), 'SPAE/xspect_ew/data/spectra_sample/Solar')
+    REPO_ROOT, 'SPAE/xspect_ew/data/spectra_sample/Solar')
 
 # Reference atlas for cross-checking a line's wing against an independent
 # high-S/N spectrum (see SPAE/xspect_ew/reference_atlas.py) -- only valid
@@ -144,7 +180,7 @@ DEFAULT_SOLAR_DIR = os.path.join(
 # SOLAR_REFERENCE_ATLAS_PATH instead, since it IS a valid match there.
 REFERENCE_ATLAS_PATH = None
 SOLAR_REFERENCE_ATLAS_PATH = os.path.join(
-    os.path.dirname(__file__), 'data/kurucz_solar_atlas/fluxspliced.2005')
+    REPO_ROOT, 'data/kurucz_solar_atlas/fluxspliced.2005')
 RESOLVING_POWER = None  # None: estimate empirically from the linelist
 
 WINDOW_SIZE = 1.5
@@ -242,30 +278,38 @@ def _write_ew_lines(path, header, wave_to_line, waves):
             f.write(wave_to_line[wave])
 
 
-def measure_solar_reference(solar_paths, output_dir):
-    """Measure EWs for every solar_paths file (each in its own
-    subdirectory of output_dir, via the same measure_star_ew() any other
-    star uses), then merge them by wavelength into one combined solar EW
-    linelist. See module docstring for why this merge is safe.
+def measure_and_merge(paths, output_dir, reference_atlas_path, review, doc_title_fn,
+                       merged_filename, label):
+    """Measure EWs for every one of `paths` (each in its own subdirectory
+    of output_dir, via the same measure_star_ew() any single-file target
+    or solar spectrum uses), then merge them by wavelength into one
+    combined EW linelist. See module docstring for why this merge is
+    safe -- ONLY when every path really is the same star (this function
+    has no way to check that itself).
+
+    doc_title_fn : str (piece basename, no extension) -> str, the
+        doc_title passed to measure_star_ew() for that piece.
+    label : str -- used only in progress prints (e.g. 'solar file',
+        'target file').
 
     Returns
     -------
-    merged_path : str -- output_dir/linelist_with_ew_merged.txt
+    merged_path : str -- output_dir/<merged_filename>
     """
     from SPAE.pipeline import measure_star_ew
 
     merged = {}
     header = None
-    for path in solar_paths:
+    for path in paths:
         name = os.path.splitext(os.path.basename(path))[0]
         piece_dir = os.path.join(output_dir, name)
-        print(f'--- solar file: {path} ---')
+        print(f'--- {label}: {path} ---')
         ew_path, flagged_path, _ = measure_star_ew(
             path, LINELIST_PATH, piece_dir,
-            reference_atlas_path=SOLAR_REFERENCE_ATLAS_PATH,
+            reference_atlas_path=reference_atlas_path,
             resolving_power=RESOLVING_POWER, window_size=WINDOW_SIZE,
-            review=False, save_plots=SAVE_PLOTS,
-            doc_title=f'Solar reference ({name}); ')
+            review=review, save_plots=SAVE_PLOTS,
+            doc_title=doc_title_fn(name))
         piece_lines = _read_ew_lines(ew_path)
         print(f'    {len(piece_lines)} line(s) measured')
         if header is None:
@@ -279,13 +323,54 @@ def measure_solar_reference(solar_paths, output_dir):
             #same line measured independently, not a real conflict to
             #resolve carefully
             print(f'    {len(overlap)} line(s) already covered by an earlier '
-                  f'solar file -- keeping the first measurement')
+                  f'{label} -- keeping the first measurement')
         merged.update({k: v for k, v in piece_lines.items() if k not in merged})
 
-    merged_path = os.path.join(output_dir, 'linelist_with_ew_merged.txt')
+    merged_path = os.path.join(output_dir, merged_filename)
     _write_ew_lines(merged_path, header, merged, merged.keys())
-    print(f'merged solar linelist: {merged_path} ({len(merged)} line(s) total)')
+    print(f'merged {label} linelist: {merged_path} ({len(merged)} line(s) total)')
     return merged_path
+
+
+def measure_solar_reference(solar_paths, output_dir):
+    """Thin measure_and_merge() wrapper for the solar reference -- see
+    that function and the module docstring for details.
+
+    Returns
+    -------
+    merged_path : str -- output_dir/linelist_with_ew_merged.txt
+    """
+    return measure_and_merge(
+        solar_paths, output_dir, reference_atlas_path=SOLAR_REFERENCE_ATLAS_PATH,
+        review=False, doc_title_fn=lambda name: f'Solar reference ({name}); ',
+        merged_filename='linelist_with_ew_merged.txt', label='solar file')
+
+
+def measure_target(target_paths, output_dir):
+    """Measure EWs for the target star, from one or more FITS files that
+    are all the SAME star -- see measure_and_merge() and the module
+    docstring for the multi-file merge behavior.
+
+    Returns
+    -------
+    ew_path, flagged_path : str -- flagged_path is None when
+        target_paths has more than one entry (each piece's own flagged
+        file stays in its own subdirectory, unmerged; see module
+        docstring)
+    """
+    if len(target_paths) == 1:
+        from SPAE.pipeline import measure_star_ew
+        ew_path, flagged_path, _ = measure_star_ew(
+            target_paths[0], LINELIST_PATH, output_dir,
+            reference_atlas_path=REFERENCE_ATLAS_PATH, resolving_power=RESOLVING_POWER,
+            window_size=WINDOW_SIZE, review=REVIEW, save_plots=SAVE_PLOTS)
+        return ew_path, flagged_path
+
+    ew_path = measure_and_merge(
+        target_paths, output_dir, reference_atlas_path=REFERENCE_ATLAS_PATH,
+        review=REVIEW, doc_title_fn=lambda name: f'{name}; ',
+        merged_filename='linelist_with_ew.txt', label='target file')
+    return ew_path, None
 
 
 def restrict_to_common_lines(target_ew_path, solar_ew_path, target_common_path,
@@ -312,20 +397,29 @@ def restrict_to_common_lines(target_ew_path, solar_ew_path, target_common_path,
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('spectrum', help='Target star FITS spectrum file')
-    parser.add_argument('solar_spectrum', nargs='?', default=None,
+    parser.add_argument('spectrum', nargs='+',
+                         help='Target star FITS spectrum file(s) -- all the SAME star '
+                              '(e.g. several exposures/bands); see module docstring for the '
+                              'multi-file merge behavior. All must live in the same directory.')
+    parser.add_argument('--solar', dest='solar_spectrum', default=None,
                          help='Observed solar FITS spectrum file or directory of FITS files, '
                               'for the differential abundance reference. Defaults to the '
                               'bundled SPAE/xspect_ew/data/spectra_sample/Solar/ (all three '
                               'files) if omitted.')
     args = parser.parse_args()
 
-    spectrum_path = os.path.abspath(args.spectrum)
+    target_paths = [os.path.abspath(p) for p in args.spectrum]
+    directories = {os.path.dirname(p) for p in target_paths}
+    if len(directories) > 1:
+        parser.error(f'all target spectrum files must live in the same directory, got: '
+                      f'{sorted(directories)}')
+    directory = directories.pop()
     solar_paths = _resolve_solar_paths(args.solar_spectrum)
-    directory = os.path.dirname(spectrum_path)
     solar_directory = os.path.join(directory, 'solar_reference')
     os.makedirs(directory, exist_ok=True)
-    print(f'Target spectrum: {spectrum_path}')
+    print(f'Target spectra ({len(target_paths)}):')
+    for p in target_paths:
+        print(f'  {p}')
     print(f'Solar spectra ({len(solar_paths)}):')
     for p in solar_paths:
         print(f'  {p}')
@@ -347,23 +441,18 @@ def main():
     print(f'Solar measurement log: {solar_log_path}')
 
     # ---------------- Stage 2: target EW measurement ----------------
-    from SPAE.pipeline import measure_star_ew
-
     ew_log_path = os.path.join(directory, 'ew_measurement.log')
     with open(ew_log_path, 'w') as ew_log:
         sys.stdout = Tee(stdout_orig, ew_log)
         sys.stderr = Tee(stderr_orig, ew_log)
         try:
-            print(f'=== EW measurement: {spectrum_path} ===')
+            print(f'=== EW measurement: {target_paths} ===')
             t0 = time.time()
-            ew_path, flagged_path, spec = measure_star_ew(
-                spectrum_path, LINELIST_PATH, directory,
-                reference_atlas_path=REFERENCE_ATLAS_PATH,
-                resolving_power=RESOLVING_POWER,
-                window_size=WINDOW_SIZE, review=REVIEW, save_plots=SAVE_PLOTS)
+            ew_path, flagged_path = measure_target(target_paths, directory)
             print(f'EW measurement time: {time.time()-t0:.2f} s')
             print(f'main linelist:    {ew_path}')
-            print(f'flagged linelist: {flagged_path}')
+            print(f'flagged linelist: {flagged_path}' if flagged_path is not None else
+                  'flagged linelist: none merged -- see each target file\'s own subdirectory')
             if SAVE_PLOTS:
                 print(f'line plots:       {os.path.join(directory, "line_plots")}')
         finally:
@@ -464,7 +553,7 @@ def main():
             #average of this plot's points
             ep_ax.set_ylabel('[Fe/H] (per line)', fontsize=12)
             ep_ax.set_title(
-                f'{os.path.basename(spectrum_path)} -- Fe abundance vs. excitation potential '
+                f'{os.path.basename(directory)} -- Fe abundance vs. excitation potential '
                 f'(MCMC median, common lines only)\nTeff={result.median.teff.median:.0f} K, '
                 f'logg={result.median.logg.median:.2f}, [Fe/H]={result.median.feh.median:.2f}, '
                 f'micro={result.median.micro.median:.2f} km/s')
