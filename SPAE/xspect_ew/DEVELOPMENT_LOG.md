@@ -1549,7 +1549,57 @@ no-op, `plot=True` original standalone-figure behavior, `axes=(...)`
 embedded behavior) against that same Fe I 4779.439/order 22/`sunb.fits`
 case -- all three agree on EW within GP-sampling noise.
 
-## 19. Commit reference
+## 19. Merging `fix_ew_fitting`: new global/local-continuum `measure_ew()`
+
+Merged a colleague's parallel branch (`fix_ew_fitting`) into
+`pymoog-conversion` after committing the interactive-widget work above.
+Their rewrite replaced the old GP-based (`SEKernel`/`Pred_GP`) EW fit
+entirely with a direct weighted Gaussian fit (`gfit_direct`) plus an
+independent reference-atlas cross-check (`reference_atlas.py`,
+`load_reference_atlas()`), and introduced two parallel continuum
+treatments per line: a **global-continuum fit** (assumes the existing
+normalization already puts this window's continuum at 1.0 -- this is
+what `self.lines_ew` actually reports) and an optional **local-continuum
+diagnostic fit** (`fit_continuum=True`: estimate a flat local continuum
+from the line's own wing data and refit against that instead, kept only
+as a comparison value in `lines_ew_local`). `measure_ew()`'s plotting
+changed to match: two side-by-side panels, "Global continuum
+(REPORTED)" and "Local continuum (diagnostic only)".
+
+`spectrum_data.py` had 7 conflicting blocks against the interactive
+widget's own recent changes (imports, `obs_err`/`pred_all` init,
+`combine_spectra()`'s redesigned body, `measure_ew()`'s signature and
+its plotting tail). Resolved by taking main's side for the EW-fitting
+rewrite itself (imports, init bugfixes, `measure_ew()`, the new
+`load_reference_atlas()` method) while keeping this branch's
+`combine_spectra()` redesign (§16-17) and `bad_order_ranges`/
+`corrected_pixel_wavelengths` state intact -- confirmed via `grep` that
+main's own `combine_spectra()` on that side was the pre-redesign
+nearest-neighbor version this branch had already superseded, not a
+competing rewrite.
+
+**`axes=` re-integration**: the merge dropped `measure_ew()`'s `axes=`
+parameter (and `plotting.py`'s `plot_ew_fit()` helper) that
+`interactive.EWWidget`'s EW stage (§18) depends on to draw into its own
+persistent figure rather than popping up a new one every remeasurement.
+Rather than resolve this inside the merge itself, took main's plotting
+code as-is first to get a clean, working `measure_ew()`, then reapplied
+the same black-box wrapper strategy as §18 as a separate follow-up:
+`plot_ew_fit()` was rewritten to draw the new Global/Local two-panel
+layout, still either into a new figure (`axes=None`, unchanged
+`plot=True` behavior) or into a caller-supplied `(fit_view, local_view)`
+pair (cleared first) -- folding the order/flagged title into the left
+panel when embedded, since an embedded figure has no `fig.suptitle` of
+its own to use. `measure_ew()` regained `axes=None`, forwarded through
+the `auto_widen` retry call; plotting now runs whenever `plot=True` OR
+`axes is not None`, and `show_plot`/`plt.show()`/`plt.close()` are
+skipped whenever `axes` is supplied, matching §18's original contract.
+Smoke-tested `plot_ew_fit()` directly (synthetic line profile, `Agg`
+backend) in all three combinations (`axes=None`/flagged,
+`axes=(ax1,ax2)`/`fit_continuum=False` placeholder panel,
+`axes=(ax1,ax2)`/flagged) -- all draw without error.
+
+## 20. Commit reference
 
 | Commit | Summary |
 |---|---|
@@ -1566,3 +1616,6 @@ case -- all three agree on EW within GP-sampling noise.
 | `0a08008` | Recalibrate `lam`; add density-severity signal; empirical noise calibration |
 | `e6d016d` | Cross-order overlap check; EW-flagging integration |
 | `0dd202c` | Line identification (§12); RV linelist cross-check and wavelength-shift sign fix (§13) |
+| `802cf66` | Add interactive `EWWidget` (§18) |
+| `5905744` | Merge `fix_ew_fitting` (new global/local-continuum `measure_ew()`) (§19) |
+| `a00c5d5` | Re-integrate `axes=` support into the merged `measure_ew()`/`plot_ew_fit()` (§19) |
