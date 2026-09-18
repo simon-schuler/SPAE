@@ -1488,7 +1488,68 @@ that point reflects a corrected, not originally observed, value.
   within 0.1 A of a real corrected pixel is excluded with the correct
   reason string; a clean line elsewhere is untouched.
 
-## 18. Commit reference
+## 18. Interactive widget (`interactive.py`)
+
+Prior to this work, running xspect-ew meant driving `Spectrum_Data`
+directly from a Jupyter notebook -- no way to visually confirm each
+pipeline stage before moving to the next. Added `EWWidget`
+(`interactive.py`), a 4-stage step wizard -- Load, Normalize, RV Shift,
+Measure EW -- built entirely from `matplotlib.widgets`
+(Slider/Button/TextBox), mirroring the architecture already established
+in `SPAE/moog/interactive.py`'s `SynthWidget`: manual `fig.add_axes()`
+figure-fraction layout, no separate GUI framework, so the identical code
+opens as a standalone window from a terminal script or embeds in a
+Jupyter cell via `%matplotlib widget`. Launch via `ew_interactive(...)`.
+
+Every stage calls the same `Spectrum_Data` methods an automated script
+would call -- `normalize()`/`normalize_all()`, `apply_rv_shift()`,
+`measure_ew()` -- so the widget is a thin, optional layer on the one
+shared pipeline API, not a second code path:
+
+- **Load**: confirms order count, wavelength coverage, and linelist size;
+  plots every order's raw flux for a first visual sanity check.
+- **Normalize**: per-order continuum overlay (raw flux + AsLS fit) with
+  live `lam`/`p` sliders (`normalize()` re-fits just the current order on
+  each change) and an "Apply to ALL orders" button (`normalize_all()`).
+- **RV Shift**: runs `apply_rv_shift()` on first entry, displays the
+  measured RV (with its named-line/linelist-cross-check warning text, if
+  any -- see §13), and lets the user toggle the current order's display
+  between observed and rest-frame wavelength, remeasure, or type in a
+  manual RV override.
+- **Measure EW**: pages through loaded lines; for each, locates the
+  covering order and calls `measure_ew(..., axes=(fit_view, data_view))`
+  to draw directly into the widget's persistent axes. Sliders expose
+  `measure_ew()`'s own `ex_params` (continuum shift, left/right bound,
+  center) for live manual adjustment.
+
+**Refactor required first**: `measure_ew()`'s ~50-line inline plotting
+block was extracted into a new pure-drawing function, `plot_ew_fit()`
+(`plotting.py`), which either creates a new figure (`axes=None`,
+preserving `measure_ew()`'s original `plot=True` behavior exactly) or
+clears and redraws into a caller-supplied `(fit_view, data_view)` axes
+pair (the new capability the widget needs). This was done deliberately
+as a black-box wrapper -- the widget's EW stage does not depend on any
+of `measure_ew()`'s internal fitting logic, only on the `axes=` parameter
+and the array shapes it already produces, since that fitting logic is
+expected to keep changing on the colleague's own branch.
+
+**Degenerate-fit guard**: some `ex_params` slider combinations (e.g. a
+center/bound shift narrow enough to leave too few points in the fit
+window) make `get_line_window()`'s downstream `np.gradient()` call raise
+outright (`ValueError: Shape of array too small...`), confirmed by
+smoke-testing every stage against `sunb.fits`. Since a slider drag must
+never crash the whole session, `_remeasure_ew()` catches any exception
+from `measure_ew()` and reports it in-place in the fit axes instead;
+resetting the sliders recovers cleanly (verified: EW measurement for Fe I
+4779.439/order 22 returns to ~40.3 +/- 0.5 mA, matching the established
+regression value, both before triggering the guard and after).
+
+Regression-tested all three `measure_ew()` call paths (`plot=False`
+no-op, `plot=True` original standalone-figure behavior, `axes=(...)`
+embedded behavior) against that same Fe I 4779.439/order 22/`sunb.fits`
+case -- all three agree on EW within GP-sampling noise.
+
+## 19. Commit reference
 
 | Commit | Summary |
 |---|---|

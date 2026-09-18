@@ -17,7 +17,7 @@ from .continuum import fit_als_continuum
 from .line_profile import get_line_window, gauss_model, gfit_simple, gauss_ew
 from .gp_utils import SEKernel, Pred_GP
 from .combine import make_line, parabolic_refine, measure_order_alignment
-from .plotting import make_plots_folder
+from .plotting import make_plots_folder, plot_ew_fit
 from .readers import read_spectrum
 from .radial_velocity import measure_effective_rv, measure_rv_from_linelist, C_KMS
 from .response_correction import apply_response_correction as _apply_response_correction
@@ -591,6 +591,12 @@ class Spectrum_Data():
             Call update_combined() once satisfied, to make this the
             spectrum's own self.flux/self.obs_err (self.combined_flux/
             self.combined_err hold the result until then).
+
+        Also sets self.combine_debug: one dict per order (order/
+        other_order/wave/flux_A/flux_B_aligned/combined) -- the aligned-
+        but-not-yet-summed inputs behind each combined order, for
+        inspection before deciding whether to update_combined() (see the
+        interactive widget's "Aligned" Load-stage view).
         """
         if rv_shift:
             self.apply_rv_shift(rv=rv_A, verbose=verbose)
@@ -604,6 +610,17 @@ class Spectrum_Data():
         n_combined = 0
         n_cross_corrected = 0
 
+        # Per-order record of the aligned-but-not-yet-summed inputs behind
+        # each combined order -- exists purely for inspection (e.g. the
+        # interactive widget's "Aligned" Load-stage view, letting the user
+        # see the two exposures' rest-frame/fine-aligned wavelength
+        # solutions and the spike-corrected result BEFORE committing to
+        # update_combined()), not used by the combination itself. Reset
+        # each call; for a chain of >2 exposures only the LAST pairwise
+        # combine's detail survives, same simplification as elsewhere in
+        # this method's own N>2 chaining.
+        self.combine_debug = []
+
         if plot:
             os.makedirs(plot_dir, exist_ok=True)
 
@@ -612,6 +629,9 @@ class Spectrum_Data():
 
             if i in bad_A:
                 combined_flux[i], combined_err[i] = flux_A, err_A
+                self.combine_debug.append({'order': i, 'other_order': None, 'wave': wave_A,
+                                            'flux_A': flux_A, 'flux_B_aligned': None,
+                                            'combined': flux_A})
                 if verbose:
                     print(f"order {i}: flagged bad in A -- using A alone, not combined")
                 continue
@@ -630,6 +650,9 @@ class Spectrum_Data():
 
             if best_j is None or best_overlap < min_overlap_fraction:
                 combined_flux[i], combined_err[i] = flux_A, err_A
+                self.combine_debug.append({'order': i, 'other_order': None, 'wave': wave_A,
+                                            'flux_A': flux_A, 'flux_B_aligned': None,
+                                            'combined': flux_A})
                 if verbose:
                     print(f"order {i}: no usable B order overlap "
                           f"(best {best_overlap:.2f}) -- using A alone")
@@ -692,6 +715,12 @@ class Spectrum_Data():
             n_combined += 1
             if verbose:
                 print(f"order {i}: combined with B order {best_j} (overlap={best_overlap:.2f})")
+
+            flux_B_on_A_grid = np.full_like(wave_A, np.nan, dtype=float)
+            flux_B_on_A_grid[in_range] = flux_B_interp
+            self.combine_debug.append({'order': i, 'other_order': best_j, 'wave': wave_A,
+                                        'flux_A': flux_A, 'flux_B_aligned': flux_B_on_A_grid,
+                                        'combined': cflux})
 
             if plot:
                 fig, ax = plt.subplots(figsize=(10, 4))
@@ -1185,7 +1214,8 @@ class Spectrum_Data():
         flagged_doc.close()
         return np.array(removed_lines)
 
-    def measure_ew(self, i, order, plot = False, ex_params = [0,0,0,0], save_plot = False, window_size = 1.5):
+    def measure_ew(self, i, order, plot = False, ex_params = [0,0,0,0], save_plot = False,
+                   window_size = 1.5, axes=None):
         #extra parameters [0] - shift continuum
         #                 [1] - left boundary in Angstroms
         #                 [2] - right boundary in Angstroms
@@ -1306,60 +1336,22 @@ class Spectrum_Data():
         print('EW:',np.round(self.lines_ew[i],2),u"±",np.round(self.lines_ew_err[i],2), 'simps-int:', np.round(self.lines_ew_simp[i],2),u"±", np.round(self.lines_ew_simp_err[i],2))
 
         #Plotting stuff
-        if plot:
-            fig = plt.figure(figsize=(12,5))
-            fig.suptitle("Order: " + str(order) + " " + "(" + str(np.round(self.shifted_wavelength[order].min(),3)) + "-" + str(np.round(self.shifted_wavelength[order].max(),3)) + ")")
-            fit_view = fig.add_subplot(121)
-            fit_view.grid()
-            fit_view.set_xlabel(r'$\rm Wavelength~(\AA)$', size = 14)
-            fit_view.set_ylabel('Normalized Flux', size = 14)
-            fit_view.errorbar(measure_x_array,measure_y_array + ex_params[0],
-                 yerr=2*temp_err_array/temp_pred_array,capsize=0,fmt='.', color = 'k', label = 'cont', zorder = 2)
-            fit_view.scatter(measure_x_array[points_within_norm],measure_y_array[points_within_norm] + ex_params[0], s = 10, c='#4daf4a', zorder = 3, alpha = 0.8)
-            fit_view.fill_between(xtest,m_plot+2*np.sqrt(np.diag(C)),
-                     m_plot-2*np.sqrt(np.diag(C)),color='#999999',alpha=0.5)
-            fit_view.plot([self.lines[i],self.lines[i]],[norm,norm*0.95], '--', color = 'k', alpha = 0.75)
-            fit_view.plot([found_line,found_line],[norm,norm*0.95], '-', color='k')
-            fit_view.plot([line_bound[0],line_bound[0]],[norm*1.025,norm*0.95], '--', color = '#e41a1c', alpha = 0.5)
-            fit_view.plot([line_bound[1],line_bound[1]],[norm*1.025,norm*0.95], '--', color = '#e41a1c', alpha = 0.5)
-            fit_view.annotate(str(self.lines[i]), xy = [self.lines[i], norm*1.025])
-            fit_view.plot(xtest, fit_gauss, '--', color = '#377eb8', lw= 2)
-            fit_view.plot([xtest[0],xtest[-1]],[norm,norm], '--', color = '#4daf4a')
+        if plot or axes is not None:
+            fig, (fit_view, data_view) = plot_ew_fit(
+                order, self.shifted_wavelength[order].min(), self.shifted_wavelength[order].max(),
+                self.lines[i], found_line, line_bound,
+                measure_x_array, measure_y_array, temp_err_array, temp_pred_array,
+                points_within_norm, xtest, m_plot, C, fit_gauss, ex_params, norm=norm,
+                axes=axes)
 
-            data_view = fig.add_subplot(122)
-            data_view.grid()
-            data_view.set_xlabel(r'$\rm Wavelength~(\AA)$', size = 14)
-            data_view.scatter(measure_x_array,measure_y_array+ ex_params[0], s = 5, c = 'k', zorder = 2)
-            data_view.errorbar(measure_x_array,measure_y_array + ex_params[0],
-                 yerr=2*temp_err_array/temp_pred_array,capsize=0,fmt='.', color = 'k', zorder = 3, alpha = 0.5)
-            plt.tight_layout()
-
-
-            # fig1, coarse_view = plt.subplots()
-            # coarse_view.set_title("Order: " + str(order) + " " + "(" + str(np.round(self.shifted_wavelength[order].min(),3)) + "-" + str(np.round(self.shifted_wavelength[order].max(),3)) + ")")
-            # coarse_view.grid()
-            # coarse_view.set_xlabel(r'$\rm Wavelength~(\AA)$', size = 14)
-            # coarse_view.set_ylabel('Normalized Flux', size = 14)
-            #coarse_view.plot(xtest,m_plot, 'k--', alpha = 0.75)
-            # coarse_view.errorbar(self.shifted_wavelength[order][wind],self.normalized_flux[order][wind] + ex_params[0],
-            #      yerr=2*self.obs_err[order][wind]/self.pred_all[order][wind],capsize=0,fmt='.', color = 'k', label = 'cont', zorder = 2)
-            # coarse_view.scatter(self.shifted_wavelength[order][wind][points_within_norm],self.normalized_flux[order][wind][points_within_norm] + ex_params[0], s = 10, c='#4daf4a', zorder = 3, alpha = 0.8)
-            # coarse_view.fill_between(xtest,m_plot+2*np.sqrt(np.diag(C)),
-            #          m_plot-2*np.sqrt(np.diag(C)),color='#999999',alpha=0.5)
-            #coarse_view.plot(xtest,samples.T,alpha=0.1, color='#cccccc')
-            # coarse_view.plot([self.lines[i],self.lines[i]],[norm,norm*0.95], '--', color = 'k', alpha = 0.75)
-            # coarse_view.plot([found_line,found_line],[norm,norm*0.95], '-', color='k')
-            # coarse_view.plot([line_bound[0],line_bound[0]],[norm*1.025,norm*0.95], '--', color = '#e41a1c', alpha = 0.5)
-            # coarse_view.plot([line_bound[1],line_bound[1]],[norm*1.025,norm*0.95], '--', color = '#e41a1c', alpha = 0.5)
-            # coarse_view.annotate(str(self.lines[i]), xy = [self.lines[i], norm*1.025])
-            #coarse_view.plot(xtest,dy+norm, '--', color = '#e41a1c', lw = 2) #view gradient
-            # if plot_gaussian:
-            #     coarse_view.plot(xtest, fit_gauss, '--', color = '#377eb8', lw= 2)
-            # coarse_view.plot([xtest[0],xtest[-1]],[norm,norm], '--', color = '#4daf4a')
             if save_plot:
                 fig_title = ELEMENTS[self.lines_exd[i][0]] + '_' + str(self.lines[i]) + '_' + str(order) + '.pdf'
-                plt.savefig('line_plots/'+fig_title)
-            plt.show()
+                fig.savefig('line_plots/'+fig_title)
+            if axes is None:
+                # caller-supplied axes (e.g. interactive.EWWidget) owns its
+                # own figure/redraw -- only show/block here in the original,
+                # non-interactive plot=True usage.
+                plt.show()
 
             print('#-----------------------#')
 
