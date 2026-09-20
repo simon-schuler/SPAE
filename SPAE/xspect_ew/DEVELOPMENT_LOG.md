@@ -1616,7 +1616,89 @@ the widget itself doesn't expose that flag) panel layouts populate
 correctly, including the local-continuum estimate line on the right
 panel.
 
-## 20. Commit reference
+## 20. Live widget review: Spectrum Shift stage, EW-fit sliders, and a
+per-line Accept/Reject decision
+
+A real-time, screenshot-driven review session against the merged
+`measure_ew()`/widget (§18-19), running live on the GRACES Theia456
+exposures. Numerous small layout fixes throughout (button/label
+positions, alignment, precision, colors) aren't itemized individually
+below; the substantive changes were:
+
+**"RV Shift" renamed "Spectrum Shift" everywhere** (`_STAGES`, button
+labels, log/print text) -- what this stage actually does is put the
+spectrum on the laboratory wavelength scale so linelist lines can be
+identified, not measure the star's true radial velocity, and "RV Shift"
+invited exactly that confusion. The stage's plot title gained a bold,
+precisely-positioned (measured via `get_window_extent()`, not guessed) inline
+caveat -- "* EFFECTIVE RV ONLY -- not the star's true RV" -- right next
+to the value itself.
+
+**A direct wavelength-shift control, replacing the old km/s RV-override
+box**: "Order Shift (Å)" (an absolute entry, converted to an equivalent
+effective RV at the CURRENT order's own mean wavelength -- see
+`_on_wshift_submit()`) plus a "Nudge (Å)" slider (a SMALL +/-0.5 A
+adjustment relative to whatever's currently committed, re-baselined to 0
+on every order change/manual submit/Reset -- see `_on_wshift_nudge()`
+and `_wshift_baseline`). Both still funnel through the one existing
+`apply_rv_shift(rv=...)` call, not a second/parallel shifting mechanism.
+A Reset button restores the session's original auto-measured
+`(rv, rv_err)` (cached once at `_rv_applied` time, since
+`apply_rv_shift(rv=...)` always reports back a bare `(rv, 0.0)`).
+
+**EW-fit sliders (Stage 4)**: the "center (Å)" slider was REMOVED --
+`gfit_direct()`'s Gaussian fit has an unconstrained center parameter, so
+nudging just its initial guess essentially never changed the converged
+result on a normal line (confirmed directly: a synthetic blended-line
+test had the auto-picked and a manually-overridden center converge to
+the identical fitted `mu`). Rescuing a misidentified line is the bound
+sliders' job -- THEY directly control which data enters the fit. Also
+fixed a real bug in the remaining two (left bound/right bound) and the
+since-removed center slider: `get_line_window()` expects ABSOLUTE
+wavelengths for these, with `0.0` as a sentinel for "auto-detect", not
+plain deltas -- the widget was passing its small +/-0.3 A slider values
+straight through, landing nowhere near the line's real, thousands-of-A
+wavelength (the reported "fit disappears"/error-spilling bugs). Fixed in
+`_remeasure_ew()` by converting `rest_wavelength + delta` before calling
+`measure_ew()`, not by changing `get_line_window()`'s own long-
+established convention.
+
+**Right (Local continuum) panel**: dropped its error bars (kept on the
+left/REPORTED panel), and added a Points/Connected toggle (top-right,
+clear of that panel's own title) that flips its data between bare points
+and a connected line by directly toggling the already-drawn Line2D's
+own `linestyle` after every redraw -- not a new parameter threaded
+through `measure_ew()`/`plot_ew_fit()`, keeping with this widget's
+existing "measure_ew() is a black box" design (see interactive.py's
+module docstring).
+
+**Per-line Accept/Reject** (`spectrum_data.py`): a new
+`self.lines_human_reject` array (the mirror image of the existing
+`lines_human_keep`) plus an Accept/Reject toggle button (labeled
+"Accepted"/"Rejected", with a caption underneath stating what a click
+will actually do -- e.g. "(click to reject)" -- since the state-labeled
+button alone didn't make the click affordance obvious). Lives on
+`Spectrum_Data` itself, not just the widget, so it's the same value
+`make_ew_doc()` reads and persists correctly across `_step_line()`.
+
+**`make_ew_doc()` now writes THREE files**, not two: the main linelist,
+`check_for_flags()`' own FLAGGED file (unchanged), and a new REJECTED
+file for lines a human explicitly rejected -- kept separate from
+FLAGGED (every rejected line has the same, single reason, unlike
+flagged lines' varying per-line reasons) and checked FIRST, so an
+explicit human rejection always wins regardless of `check_for_flags()`'
+own verdict on that line. The per-line formatting itself was extracted
+into a new module, `ew_output.py`'s `format_moog_ew_line()` (the
+existing fixed-width MOOG format, unchanged), and `make_ew_doc()` gained
+a `line_formatter=` parameter (defaulting to it) -- so a different
+output format can be used for all three files without editing
+`make_ew_doc()` itself. Verified end to end headlessly: rejecting a
+line correctly excludes it from the main file and routes it to the new
+rejected file (with a `# human-reviewed, rejected`-equivalent file-level
+header, not a per-line comment); a custom CSV `line_formatter=` produced
+correctly-substituted output on the same three files.
+
+## 21. Commit reference
 
 | Commit | Summary |
 |---|---|

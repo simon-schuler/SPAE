@@ -28,6 +28,7 @@ from .outlier_check import check_cross_exposure_spikes as _check_cross_exposure_
 from .line_identification import identify_lines_in_spectrum as _identify_lines_in_spectrum
 from .reference_atlas import (load_reference_atlas as _load_reference_atlas,
                                estimate_resolving_power, reference_continuum_mask)
+from .ew_output import format_moog_ew_line
 
 
 class Spectrum_Data():
@@ -207,6 +208,13 @@ class Spectrum_Data():
         #so a review decision actually survives to the final output
         #instead of being silently recomputed away.
         self.lines_human_keep = None
+        #line - True if a human reviewer explicitly decided to REJECT this
+        #line even though check_for_flags() didn't flag it (see
+        #interactive.EWWidget's Accept/Reject toggle) -- the opposite of
+        #lines_human_keep; make_ew_doc() checks this FIRST, ahead of
+        #lines_check_flag, so it always routes to the flagged-lines file
+        #regardless of that line's own automated verdict.
+        self.lines_human_reject = None
         #wavelength ranges where two orders' overlap disagreed badly
         #enough to distrust either one there -- set by
         #flag_order_overlaps(), consulted by check_for_flags(). Empty
@@ -1182,6 +1190,15 @@ class Spectrum_Data():
         self.lines_check_flag = np.array([False]*len(self.lines))
         self.lines_flag_reasons = np.array(['']*len(self.lines), dtype=object)
         self.lines_human_keep = np.array([False]*len(self.lines))
+        #explicit "throw this one out regardless of check_for_flags()'
+        #own verdict" -- the opposite of lines_human_keep, for a line that
+        #LOOKS clean by every automated criterion but the user reviewing
+        #it (e.g. interactive.EWWidget's Accept/Reject toggle) doesn't
+        #trust anyway (a bad fit that happened to still land in-bounds, a
+        #subtle blend the automated checks don't catch, etc.). Checked
+        #FIRST in make_ew_doc(), ahead of lines_check_flag, so it always
+        #wins regardless of what check_for_flags() itself would have said.
+        self.lines_human_reject = np.array([False]*len(self.lines))
         #line - which order's measurement is the one kept in lines_ew[i]
         #etc, and how far (Angstroms) that line sat from that order's
         #nearer edge -- set by measure_all_ew() when the same line falls
@@ -1255,7 +1272,8 @@ class Spectrum_Data():
         self.lines_id_run = True
         return results
 
-    def make_ew_doc(self, name, doc_title='STARNAME, PROJECT, YEAR; ', flagged_name=None):
+    def make_ew_doc(self, name, doc_title='STARNAME, PROJECT, YEAR; ', flagged_name=None,
+                     rejected_name=None, line_formatter=None):
         """
         Write the measured EWs as a MOOG-format linelist.
 
@@ -1267,22 +1285,49 @@ class Spectrum_Data():
         extension), each annotated with its flag reason(s), for later
         interactive/visual review -- not for automatic consumption.
 
+        A line explicitly REJECTED by a human reviewer (lines_human_reject,
+        e.g. via interactive.EWWidget's Accept/Reject toggle) is excluded
+        from `name` the same way, but goes to its OWN file (rejected_name,
+        default: `name` with "_rejected" inserted before the extension)
+        rather than into flagged_name -- a human's explicit "no" is a
+        different kind of exclusion than check_for_flags()' automated
+        criteria, and wins regardless of what check_for_flags() itself
+        would have said about that line.
+
         Calls check_for_flags() itself, so it reflects the current
         measurements even if you haven't called it explicitly.
+
+        Parameters
+        ----------
+        line_formatter : callable(wave, species, ep, gf, rad, ew, ew_err)
+            -> str, optional -- produces one line's worth of text (no
+            trailing newline) for all three output files. Defaults to
+            ew_output.format_moog_ew_line() (the classic MOOG linelist-
+            with-EW format, see its own docstring) -- pass a different
+            callable here for a different output format without needing
+            to change this method itself.
 
         Returns
         -------
         removed_lines : ndarray -- rest wavelengths of lines never measured
             at all (EW == 0, e.g. excluded via measure_all_ew()'s
-            exclude_lines). Distinct from flagged lines, which WERE
-            measured but look untrustworthy.
+            exclude_lines). Distinct from flagged/rejected lines, which
+            WERE measured but are being excluded from `name` regardless.
         """
+        if line_formatter is None:
+            line_formatter = format_moog_ew_line
         if flagged_name is None:
             if '.' in name:
                 base, ext = name.rsplit('.', 1)
                 flagged_name = f'{base}_flagged.{ext}'
             else:
                 flagged_name = f'{name}_flagged'
+        if rejected_name is None:
+            if '.' in name:
+                base, ext = name.rsplit('.', 1)
+                rejected_name = f'{base}_rejected.{ext}'
+            else:
+                rejected_name = f'{name}_rejected'
 
         self.check_for_flags()
 
@@ -1292,36 +1337,44 @@ class Spectrum_Data():
         flagged_doc.write(doc_title + 'FLAGGED lines -- excluded from the main linelist above; for '
                            'interactive/visual review, not automatic use. Trailing comment is the '
                            'flag reason(s) from check_for_flags().\n')
+        rejected_doc = open(rejected_name, 'w')
+        rejected_doc.write(doc_title + 'REJECTED lines -- excluded from the main linelist above by '
+                            'explicit human review (e.g. interactive.EWWidget\'s Accept/Reject '
+                            'toggle), regardless of what check_for_flags() itself found. Distinct '
+                            'from flagged_name above, which is check_for_flags()\' own automated '
+                            'verdict.\n')
         removed_lines = []
         for i in range(len(self.lines)):
             if self.lines_ew[i] != 0.0:
-                wave = "  "+str(self.lines[i])
-                elmnt = str(self.lines_exd[i][0])
-                if self.lines_exd[i][0] < 10:
-                    elmnt = '0'+elmnt
-                while len(elmnt) < 6:
-                    elmnt = elmnt+'0'
-                ep = str(self.lines_exd[i][1])
-                gf = str(self.lines_exd[i][2])
-                rad = str(self.lines_exd[i][3])
-                ew = str(np.round(self.lines_ew[i],3))
-                err = str(np.round(self.lines_ew_err[i],3))
-                current_line = "{0:14s}{1:11s}{2:8s}{3:15s}{4:17s}{5:10s}{6:5s}\n".format(wave,elmnt,ep,gf,rad,ew,err)
-                if self.lines_check_flag[i]:
-                    flagged_doc.write(current_line.rstrip('\n') + '   # ' + self.lines_flag_reasons[i] + '\n')
+                current_line = line_formatter(
+                    self.lines[i], self.lines_exd[i][0], self.lines_exd[i][1],
+                    self.lines_exd[i][2], self.lines_exd[i][3],
+                    self.lines_ew[i], self.lines_ew_err[i])
+                if self.lines_human_reject[i]:
+                    #explicit human rejection wins regardless of what
+                    #check_for_flags() (just recomputed above) says about
+                    #this line -- see lines_human_reject's own docstring.
+                    #Its own dedicated file, not flagged_doc -- every line
+                    #here has the SAME reason (the file's own preamble
+                    #already says so), unlike flagged_doc's varying
+                    #per-line check_for_flags() reasons.
+                    rejected_doc.write(current_line + '\n')
+                elif self.lines_check_flag[i]:
+                    flagged_doc.write(current_line + '   # ' + self.lines_flag_reasons[i] + '\n')
                 elif self.lines_human_keep[i] and self.lines_flag_reasons[i]:
                     #kept in the main linelist by an explicit human review
                     #decision, not because nothing looked wrong -- note why
                     #it would otherwise have been flagged, so this isn't
                     #silently indistinguishable from an uncontroversial line
-                    doc.write(current_line.rstrip('\n') + '   # human-reviewed, kept despite: '
+                    doc.write(current_line + '   # human-reviewed, kept despite: '
                               + self.lines_flag_reasons[i] + '\n')
                 else:
-                    doc.write(current_line)
+                    doc.write(current_line + '\n')
             else:
                 removed_lines.append(self.lines[i])
         doc.close()
         flagged_doc.close()
+        rejected_doc.close()
         return np.array(removed_lines)
 
     def load_reference_atlas(self, path, resolving_power=None):

@@ -1,6 +1,7 @@
 """
 Interactive matplotlib widget for xspect-ew: step through Load -> Normalize
--> RV Shift -> Measure EW, with live-adjustable parameters at each stage.
+-> Spectrum Shift -> Measure EW, with live-adjustable parameters at each
+stage.
 
 Same architecture as moog/interactive.py's SynthWidget -- pure
 matplotlib.widgets (Slider/Button/TextBox), no separate GUI framework --
@@ -34,6 +35,7 @@ continues on its own branch.
 
 import copy
 import os
+import textwrap
 import time
 
 import numpy as np
@@ -41,8 +43,9 @@ import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider, Button, TextBox
 
 from .spectrum_data import Spectrum_Data
+from .radial_velocity import C_KMS
 
-_STAGES = ['Load', 'Normalization', 'RV Shift', 'Measure EW']
+_STAGES = ['Load', 'Normalization', 'Spectrum Shift', 'Measure EW']
 # Reject Back/Next/Combine clicks that land within this long after any
 # stage rebuild -- see _on_nav_clicked()/_on_combine_clicked()'s
 # docstring note for why this exists (it's a different failure mode from
@@ -58,6 +61,13 @@ _NORM_VIEW_COLORS = {'raw': ('#a8d0e8', '#7fb8dc'), 'normalized': (_COMBINE_COLO
 # toggle -- Shifted (rest-frame, the corrected result) = green like
 # Normalized; Observed (uncorrected) = the same blue as Raw+Fit.
 _RV_VIEW_COLORS = {True: _NORM_VIEW_COLORS['normalized'], False: _NORM_VIEW_COLORS['raw']}
+# Stage 4's per-line Accept/Reject toggle -- Accept reuses the same green
+# as every other "good"/processed state above; Reject is a soft red,
+# matching the '#e41a1c' used for flagged lines/warnings elsewhere in
+# this file, just lightened to the same pastel-background style as the
+# other toggle colors (a plain button, not text -- full-strength
+# '#e41a1c' read as alarming rather than a normal, reversible toggle).
+_ACCEPT_REJECT_COLORS = {True: _NORM_VIEW_COLORS['normalized'], False: ('#f4b8b8', '#e88f8f')}
 
 
 def _read_instrument_label(filename):
@@ -142,8 +152,18 @@ class EWWidget:
 
         self._normalized = False
         self._rv_applied = False
+        # The auto-measured (rv, rv_err) from the FIRST apply_rv_shift()
+        # call, cached so the Order Shift box's Reset button can restore it
+        # after the user has tried out manual shifts -- apply_rv_shift(rv=)
+        # itself always overwrites self.spec.rv with (rv, 0.0), so this
+        # would otherwise be lost the moment a manual shift is submitted.
+        self._original_rv = None
         self._show_shifted = True
         self._norm_view = 'raw'  # or 'normalized' -- see _toggle_norm_view()
+        # Stage 4's right (Local continuum) panel: bare points (False, the
+        # plot_ew_fit() default) or connected by a line (True) -- see
+        # _toggle_ew_connected()/_apply_ew_connected_style().
+        self._ew_connected = False
         # order -> (lam, p) actually used for THAT order's own pred_all/
         # normalized_flux -- since the lam/p sliders are shared, single
         # widget state (not per-order), stepping to a different order
@@ -204,10 +224,6 @@ class EWWidget:
         self._lam = 2e3
         self._p = 0.01
 
-        # EW-measurement ex_params, see measure_ew()'s own docstring:
-        # [continuum shift, left bound (A), right bound (A), center (A)]
-        self._ex_params = [0.0, 0.0, 0.0, 0.0]
-
         self._main_axes = []       # main-area axes, rebuilt fresh per stage
         self._dynamic_axes = []    # stage-specific control axes
         self._dynamic_widgets = []  # Button/Slider/TextBox living on those axes
@@ -240,8 +256,9 @@ class EWWidget:
         ax_next = self._fig.add_axes([0.82, 0.895, 0.14, 0.04])
         self._btn_back = Button(ax_back, '← Back')
         # Green like Combine Spectra -- all forward-moving navigation
-        # (Normalization/RV Shift/Measure EW ▶) reads as one consistent
-        # "go" action; Back stays the neutral default to read as distinct.
+        # (Normalization/Spectrum Shift/Measure EW ▶) reads as one
+        # consistent "go" action; Back stays the neutral default to read
+        # as distinct.
         self._btn_next = Button(ax_next, 'Next →', color=_COMBINE_COLOR, hovercolor='#a8d98a')
         self._btn_back.on_clicked(lambda _e: self._on_nav_clicked(self._btn_back, self._stage - 1))
         self._btn_next.on_clicked(lambda _e: self._on_nav_clicked(self._btn_next, self._stage + 1))
@@ -497,7 +514,16 @@ class EWWidget:
 
         self._set_btn_visible(self._btn_back, stage > 0)
         if stage > 0:
-            self._btn_back.label.set_text(f'◀ {_STAGES[stage - 1]}')
+            # Stage 1's Back always returns to stage 0 (Load) -- but when
+            # there's more than one exposure, that's really taking the
+            # user back to review/redo the Combine step (the Load stage
+            # already shows the Combined view by then, see _do_combine()),
+            # not to loading a spectrum from scratch. "Load" would be a
+            # misleading label there; single-exposure sessions have no
+            # combining at all, so they keep the plain stage name.
+            back_label = ('Combine' if stage == 1 and self._n_exposures > 1
+                          else _STAGES[stage - 1])
+            self._btn_back.label.set_text(f'◀ {back_label}')
 
         # On the Load stage with multiple exposures, Next is pointless
         # (and misleading) until Combine Spectra has actually been run --
@@ -904,10 +930,10 @@ class EWWidget:
         self._btn_apply_all.on_clicked(lambda _e: self._on_apply_all_clicked())
 
         # Raw+fit vs. the actual normalized result -- same toggle-button
-        # pattern as the RV stage's "Showing: shifted/raw", so the user
-        # can review what normalize_all()/Apply to ALL orders actually
-        # produced before moving on to RV Shift (mirrors Stage 1's
-        # Combine-then-inspect-the-result flow; there's no single
+        # pattern as the Spectrum Shift stage's "Showing: shifted/raw", so
+        # the user can review what normalize_all()/Apply to ALL orders
+        # actually produced before moving on to Spectrum Shift (mirrors
+        # Stage 1's Combine-then-inspect-the-result flow; there's no single
         # discrete "commit" action to gate Next on here the way Combine
         # had, so this adds the review capability rather than blocking
         # navigation until it's used). Directly under Previous Order.
@@ -1023,17 +1049,27 @@ class EWWidget:
         self._fig.canvas.draw_idle()
 
     # ------------------------------------------------------------------ #
-    # Stage 3: RV shift                                                    #
+    # Stage 3: spectrum wavelength shift (to the laboratory scale)         #
     # ------------------------------------------------------------------ #
 
     def _build_stage_rv(self):
         if not self._rv_applied:
             self.spec.apply_rv_shift(verbose=True)
             self._rv_applied = True
+            self._original_rv = self.spec.rv
 
         ax = self._add_main_axes()
         self._ax_rv = ax
         self._order_pager(0.135, self._redraw_rv)
+
+        # apply_rv_shift() only measures an EFFECTIVE RV (a handful of
+        # named reference lines and/or a linelist cross-check, see its own
+        # docstring) -- good enough to align lines for EW measurement, but
+        # NOT barycentric- or instrument-zero-point-corrected, so it isn't
+        # a reliable measurement of the star's true radial velocity. The
+        # caveat itself is drawn in _redraw_rv(), directly on the plot's own
+        # title line next to the "Effective RV = ..." value it's warning
+        # about -- see there.
 
         # Directly under Previous Order -- same spot as the Normalize
         # stage's own Raw+Fit/Normalized toggle, for a consistent pattern.
@@ -1044,18 +1080,66 @@ class EWWidget:
             color=color, hovercolor=hovercolor))
         self._btn_toggle.on_clicked(lambda _e: self._toggle_shifted())
 
+        wshift0 = self.spec.estimated_shift[self._order] if self.spec.rv is not None else 0.0
+        # self._wshift_baseline: the Å shift the box/slider agreed on the
+        # last time they were put in sync (initially: right now) -- the
+        # slider is a SMALL +/-0.5 A NUDGE relative to this, not the
+        # absolute shift itself (which, for a real target's actual RV, can
+        # be well outside +/-0.5 A -- see _on_wshift_nudge()). Kept in sync
+        # by _redraw_rv(resync_wshift=True), its default, from every path
+        # that changes the COMMITTED shift (order change, manual submit,
+        # Reset) -- NOT from the slider's own drag handler, which would
+        # otherwise snap the slider back to 0 on every drag tick.
+        self._wshift_baseline = wshift0
+
         # Widened now that "Remeasure RV" (removed -- unreliable RVs
         # anyway, per the user) no longer needs the space next to it.
-        ax_rv_tb = self._add_control_axes([0.46, 0.08, 0.20, 0.03])
-        rv0 = self.spec.rv[0] if self.spec.rv is not None else 0.0
+        # x=0.485 matches the order-pager row's Order box directly above
+        # (_order_pager()'s ax_tb, also x=0.485) so the two line up.
+        # A direct wavelength (Angstrom) shift, not a km/s RV override --
+        # entering a velocity asks the user to already think in RV terms,
+        # when what they're actually judging by eye on the plot is "this
+        # line looks off by about this many Angstroms". Converted to an
+        # equivalent effective RV at THIS order's mean wavelength (see
+        # _on_wshift_submit()) and applied via the same apply_rv_shift()
+        # used everywhere else, so it's still one consistent multiplicative
+        # shift across every order, not a second, independent mechanism.
+        # Small, same size as the zoom strip's own boxes (_build_zoom_strip()'s
+        # ax_xmin/ax_xmax/etc, width 0.09/height 0.03) -- one number, no
+        # need for the wider box the old km/s override used.
+        ax_wshift_tb = self._add_control_axes([0.485, 0.08, 0.09, 0.03])
         # NOT _relabel_above() here -- this row (y=0.08) sits directly
         # below the order-pager row with no vertical clearance, so
         # relabeling above collided with it (confirmed via audit). The
         # default left-bleeding position is safe: nothing else occupies
         # this row to its left now that the toggle moved away.
-        self._tb_rv = self._track(
-            TextBox(ax_rv_tb, 'RV override (km/s)  ', initial=f'{rv0:.3f}'))
-        self._tb_rv.on_submit(self._on_rv_submit)
+        # _tabbable(): same Tab/Shift+Tab cycling and double-click-to-clear
+        # as the Order/zoom boxes (see _on_tab_key()/_on_textbox_dblclick()).
+        self._tb_wshift = self._tabbable(self._track(
+            TextBox(ax_wshift_tb, 'Order Shift (Å)  ', initial=f'{wshift0:.3f}')))
+        self._tb_wshift.on_submit(self._on_wshift_submit)
+
+        # Between the Order Shift box (ends x=0.575) and Reset -- NOT
+        # between Shifted/Observed and the box (tried first): a Slider's
+        # own label bleeds left of its axes by roughly its own RENDERED
+        # TEXT WIDTH, not just a small fixed offset, and there wasn't
+        # enough gap there to clear the Shifted/Observed button (confirmed
+        # visually). _relabel_above() sidesteps that by moving the label
+        # above the axes instead -- safe here specifically because nothing
+        # from the order-pager row above (which ends by x=0.53) overlaps
+        # this slider's x-range.
+        ax_nudge = self._add_control_axes([0.61, 0.08, 0.18, 0.03])
+        self._sl_wshift_nudge = self._track(self._relabel_above(
+            Slider(ax_nudge, 'Nudge (Å)', -0.5, 0.5, valinit=0.0, valfmt='%.3f')))
+        self._sl_wshift_nudge.on_changed(self._on_wshift_nudge)
+
+        # Lets the user try out manual shifts and still get back to the
+        # auto-measured one afterward. Pushed out to x=0.85 (was 0.585,
+        # directly after the box) to clear the slider's own value readout,
+        # which bleeds a short way to the right of ITS axes (ends x=0.79).
+        ax_wshift_reset = self._add_control_axes([0.85, 0.08, 0.09, 0.03])
+        self._btn_wshift_reset = self._track(Button(ax_wshift_reset, 'Reset'))
+        self._btn_wshift_reset.on_clicked(lambda _e: self._reset_wshift())
 
         self._build_zoom_strip(lambda: [self._ax_rv])
         self._redraw_rv()
@@ -1069,16 +1153,55 @@ class EWWidget:
         self._btn_toggle.ax.set_facecolor(color)
         self._redraw_rv()
 
-    def _on_rv_submit(self, text):
+    def _on_wshift_submit(self, text):
         try:
-            rv = float(text)
+            delta_aa = float(text)
         except ValueError:
-            print(f"Could not parse RV override '{text}' as a number.")
+            print(f"Could not parse wavelength shift '{text}' as a number.")
             return
+        # Invert apply_rv_shift()'s own relation (see its docstring note by
+        # self.estimated_shift): shifted = wavelength*(1 - rv/c), i.e. the
+        # applied shift at wavelength lambda is -lambda*rv/c. Solving for rv
+        # from the user's requested shift AT THIS ORDER'S MEAN WAVELENGTH
+        # keeps this a single, ordinary effective-RV correction (still
+        # applied identically to every order via apply_rv_shift()) rather
+        # than a second, inconsistent per-order-Angstrom shift mechanism.
+        lambda_ref = self.spec.wavelength[self._order].mean()
+        rv = -delta_aa * C_KMS / lambda_ref
         self.spec.apply_rv_shift(rv=rv, verbose=True)
         self._redraw_rv()
 
-    def _redraw_rv(self):
+    def _reset_wshift(self):
+        if self._original_rv is None:
+            return
+        # apply_rv_shift(rv=...) always reports back (rv, 0.0) -- reapply
+        # the original VALUE to redo the actual shift, then restore its
+        # original (rv, rv_err) afterward so the reported uncertainty comes
+        # back too, not just a fresh 0.0 (the error doesn't affect the
+        # shift itself, only what's displayed/logged).
+        self.spec.apply_rv_shift(rv=self._original_rv[0], verbose=True)
+        self.spec.rv = self._original_rv
+        self._redraw_rv()
+
+    def _on_wshift_nudge(self, val):
+        # val is the slider's own +/-0.5 A offset from self._wshift_baseline
+        # (NOT an absolute shift -- see its own setup comment in
+        # _build_stage_rv()). Same lambda_ref/rv conversion as
+        # _on_wshift_submit(); fires continuously while dragging, so kept
+        # cheap (apply_rv_shift(rv=...) skips all line measurement/CCF work
+        # and is just a per-order array multiply) and quiet (verbose=False).
+        total_aa = self._wshift_baseline + val
+        lambda_ref = self.spec.wavelength[self._order].mean()
+        rv = -total_aa * C_KMS / lambda_ref
+        self.spec.apply_rv_shift(rv=rv)
+        self._tb_wshift.eventson = False
+        self._tb_wshift.set_val(f'{total_aa:.3f}')
+        self._tb_wshift.eventson = True
+        # resync_wshift=False -- MUST NOT reset the slider/baseline here,
+        # or every drag tick would snap the slider straight back to 0.
+        self._redraw_rv(resync_wshift=False)
+
+    def _redraw_rv(self, resync_wshift=True):
         ax = self._ax_rv
         saved_zoom = self._capture_zoom([ax])
         self._redrawing = True
@@ -1089,17 +1212,78 @@ class EWWidget:
         ax.plot(wave, self.spec.normalized_flux[o], 'k-', lw=0.6)
         if self.spec.lines is not None:
             lo, hi = wave.min(), wave.max()
+            # label= only on the first one drawn -- matplotlib's legend()
+            # would otherwise repeat this same entry once per line in range.
+            first_line = True
             for line in self.spec.lines:
                 if lo <= line <= hi:
-                    ax.axvline(line, color='#e41a1c', lw=0.7, ls='--', alpha=0.6)
-        rv_txt = f'{self.spec.rv[0]:.3f} ± {self.spec.rv[1]:.3f} km/s' if self.spec.rv else 'not measured'
+                    ax.axvline(line, color='#e41a1c', lw=0.7, ls='--', alpha=0.6,
+                               label='Linelist Identification' if first_line else None)
+                    first_line = False
+            if not first_line:
+                ax.legend(loc='upper right', fontsize=8, framealpha=0.8)
+        # Drop "+/- 0.000" -- apply_rv_shift(rv=...) (a manual Order Shift
+        # submit, a Nudge drag, or Reset restoring the exact original
+        # value) always reports back a bare 0.0 error, which isn't a real
+        # "measured to perfect precision" claim, just "no formal error
+        # available for this value" -- showing it as "+/- 0.000" implied
+        # the former. A genuinely measured error (from apply_rv_shift()'s
+        # own automatic named-line/CCF estimate) still prints normally.
+        if self.spec.rv is None:
+            rv_txt = 'not measured'
+        elif self.spec.rv[1] == 0:
+            rv_txt = f'{self.spec.rv[0]:.3f} km/s'
+        else:
+            rv_txt = f'{self.spec.rv[0]:.3f} ± {self.spec.rv[1]:.3f} km/s'
         ax.set_xlabel('Wavelength (Å)')
         ax.set_ylabel('Normalized flux')
-        ax.set_title(f'Order {o}  ({"rest-frame" if self._show_shifted else "observed"} wavelength)  '
-                      f'|  RV = {rv_txt}', fontsize=10, loc='left')
+        title_artist = ax.set_title(
+            f'Order {o}  ({"rest-frame" if self._show_shifted else "observed"} wavelength)  '
+            f'|  Effective RV = {rv_txt}', fontsize=10, loc='left')
+        # The EFFECTIVE-RV caveat, right after "km/s" on the SAME title
+        # line, separated by exactly two spaces -- the title's own
+        # rendered length varies (order number, RV sign/digits, whether an
+        # error is shown), so "two spaces after" needs the title's ACTUAL
+        # rendered right edge, not a guessed fixed x. draw() first so
+        # get_window_extent() reflects the title text just set (an extra
+        # render pass per redraw -- including every Nudge-slider drag
+        # tick -- but this is a single line plot with no heavy artists, so
+        # the added cost is negligible next to apply_rv_shift() itself).
+        self._fig.canvas.draw()
+        title_bbox = title_artist.get_window_extent(renderer=self._fig.canvas.get_renderer())
+        # Taking y FROM THE SAME bbox (not a hardcoded 1.0) matters --
+        # set_title() adds its own pad above y=1.0 axes-fraction, so a
+        # fixed va='bottom' at y=1.0 sat visibly lower than the title's
+        # own baseline (confirmed visually: about half a line low).
+        # bbox.y0 is the title's rendered bottom edge, in DISPLAY coords;
+        # transforming it back into axes-fraction, then anchoring our own
+        # text there with the same va='bottom', reproduces the title's
+        # exact baseline regardless of that pad.
+        x_after_title, y_after_title = ax.transAxes.inverted().transform(
+            (title_bbox.x1, title_bbox.y0))
+        ax.text(x_after_title, y_after_title,
+                "  * EFFECTIVE RV ONLY — not the star's true RV",
+                transform=ax.transAxes, ha='left', va='bottom',
+                fontsize=9, weight='bold', style='italic', color='#b35900')
         self._apply_zoom([ax], saved_zoom)
         self._redrawing = False
         self._zoom_sync()
+        if resync_wshift:
+            # The Angstrom-shift textbox shows the CURRENT effective RV's
+            # equivalent shift at this order's own mean wavelength --
+            # changing order (Prev/Next/jump-to-order) needs a fresh value
+            # even though self.spec.rv itself hasn't changed, since that
+            # equivalent Angstrom amount is different at every order's
+            # wavelength. Re-baselines the nudge slider to this new value
+            # and recenters it at 0 -- callers that DON'T want that (the
+            # slider's own drag handler, mid-drag) pass resync_wshift=False.
+            self._wshift_baseline = self.spec.estimated_shift[o]
+            self._tb_wshift.eventson = False
+            self._tb_wshift.set_val(f'{self._wshift_baseline:.3f}')
+            self._tb_wshift.eventson = True
+            self._sl_wshift_nudge.eventson = False
+            self._sl_wshift_nudge.set_val(0.0)
+            self._sl_wshift_nudge.eventson = True
         self._fig.canvas.draw_idle()
 
     # ------------------------------------------------------------------ #
@@ -1124,7 +1308,8 @@ class EWWidget:
             return
 
         if not self._rv_applied:
-            print("Note: RV shift has not been applied yet (visit Step 3 first) -- "
+            print("Note: the spectrum has not been shifted to the laboratory "
+                  "wavelength scale yet (visit Step 3, Spectrum Shift, first) -- "
                   "measuring against the unshifted wavelength solution.")
 
         self._ax_fit, self._ax_data = self._add_main_axes(2)
@@ -1136,27 +1321,91 @@ class EWWidget:
         self._btn_line_next = self._track(Button(ax_next, 'Next Line ▶'))
         self._btn_line_prev.on_clicked(lambda _e: self._step_line(-1))
         self._btn_line_next.on_clicked(lambda _e: self._step_line(1))
-        self._line_label = self._add_text(0.46, 0.155, '', fontsize=9, va='center')
 
-        labels = ['cont. shift', 'left bound (Å)', 'right bound (Å)', 'center (Å)']
-        ranges = [(-0.05, 0.05), (-0.3, 0.3), (-0.3, 0.3), (-0.2, 0.2)]
+        # Directly under Previous Line -- the same spot the Points/
+        # Connected toggle used to occupy before it moved up by the right
+        # panel. Per-line state lives on self.spec.lines_human_reject
+        # itself (see its own docstring in spectrum_data.py), not on the
+        # widget, so it's the single source of truth make_ew_doc() reads
+        # too -- stepping to a different line just reflects THAT line's
+        # already-stored value (see _sync_accept_button()), not a fresh
+        # per-widget default.
+        ax_accept = self._add_control_axes([0.08, 0.075, 0.16, 0.045])
+        self._btn_accept = self._track(Button(ax_accept, ''))
+        self._btn_accept.on_clicked(lambda _e: self._toggle_line_reject())
+        # "Accepted"/"Rejected" (the button's own label) says what the
+        # CURRENT state is -- but on its own, that reads like a status
+        # display, not something clickable, and gives no hint that
+        # clicking it FLIPS to the other state. This caption -- BELOW the
+        # button, in the gap before the zoom strip (y=0.01-0.04) -- says
+        # what a click will actually do, and (unlike the label) changes
+        # its wording each time, so it can't be misread as a fixed
+        # instruction ("click to accept") sitting next to an
+        # already-accepted line.
+        self._accept_caption = self._add_text(0.16, 0.058, '', ha='center', va='center',
+                                               fontsize=8, style='italic', color='0.3')
+        self._sync_accept_button()
+
+        # Above and to the right of the right (Local continuum) panel,
+        # which spans x=0.535-0.96 (see _main_rect_split(2)) with its own
+        # title -- ALWAYS "Local continuum not estimated (fit_continuum=
+        # False)" in this widget (fit_continuum isn't exposed here) --
+        # centered on that panel, rendering at x=0.618-0.877, y=0.857-
+        # 0.873 (measured via get_window_extent(), not guessed). x=0.885
+        # clears its right edge (0.877); the row above (Back/Next/Combine
+        # Spectra) starts at y=0.895, so height is kept small to fit
+        # underneath it.
+        ax_ew_view = self._add_control_axes([0.885, 0.857, 0.065, 0.033])
+        color, hovercolor = (_NORM_VIEW_COLORS['normalized'] if self._ew_connected
+                             else _NORM_VIEW_COLORS['raw'])
+        self._btn_ew_connected = self._track(Button(
+            ax_ew_view, 'Connected' if self._ew_connected else 'Points',
+            color=color, hovercolor=hovercolor))
+        self._btn_ew_connected.label.set_fontsize(8)
+        self._btn_ew_connected.on_clicked(lambda _e: self._toggle_ew_connected())
+
+        # At the top of the window, alongside the persistent header --
+        # bold, but smaller than the "XSpect-EW: <instrument>" text
+        # (fontsize=13, see _build_figure()) so it still reads as
+        # secondary to it. Centered in the gap between Back (ends x=0.24)
+        # and Next/Combine Spectra (starts x=0.82).
+        self._line_label = self._add_text(0.53, 0.915, '', fontsize=11,
+                                           weight='bold', ha='center', va='center')
+
+        # These sliders hold small +/-A NUDGES -- _remeasure_ew() converts
+        # the bound ones into the ABSOLUTE wavelengths (offset from this
+        # line's rest wavelength) get_line_window() actually expects for
+        # them, since 0.0 there is a SENTINEL meaning "auto-detect this
+        # one" rather than "no shift" (unlike continuum shift, a plain
+        # additive delta throughout) -- see _remeasure_ew()'s own comment.
+        # No center slider (removed) -- with an unconstrained Gaussian fit
+        # (see gfit_direct()), nudging just the initial center guess
+        # essentially never changed the converged result for a normal
+        # line (confirmed on a real blended-line test: auto and a manual
+        # override converged to the same fitted center); rescuing a
+        # misidentified line is the bound sliders' job, since THEY
+        # directly control which data enters the fit.
+        labels = ['cont. shift', 'left bound (Å)', 'right bound (Å)']
+        ranges = [(-0.05, 0.05), (-0.3, 0.3), (-0.3, 0.3)]
         self._sl_ex = []
         for k, (lab, (lo, hi)) in enumerate(zip(labels, ranges)):
-            # y=0.055, not 0.08 -- _relabel_above() puts each slider's own
-            # label above its axes, and at 0.08 that landed inside the
-            # line-pager row (y=0.135) for the first slider (confirmed
-            # via audit); 0.055 gives enough clearance underneath it.
-            ax_s = self._add_control_axes([0.32 + k * 0.145, 0.055, 0.13, 0.03])
-            sl = self._track(self._relabel_above(Slider(ax_s, lab, lo, hi, valinit=0.0)))
-            # Slider's default numeric readout sits just to the RIGHT of
-            # its axes (mirror image of the label's left-bleed problem);
-            # packed this tightly (0.015 gap between axes), each one
-            # landed on the NEXT slider's axes (confirmed via audit --
-            # pre-existing, not introduced by today's other layout
-            # changes). No room to relocate it without recreating the
-            # same crowding, so it's hidden here; the slider's own
-            # position still shows the current value interactively.
-            sl.valtext.set_visible(False)
+            # Stacked vertically to the right of the Next Line button
+            # (ends x=0.42), one per row, top row (k=0) sharing Next
+            # Line's own row height (y=0.135) so the stack visually reads
+            # as starting right where that button ends. x=0.55, not
+            # closer to 0.42 -- NOT using _relabel_above() here (its own
+            # default left-of-axes label position is what's wanted now,
+            # not above), so the label itself bleeds left of the axes by
+            # roughly its own rendered width; the longest ("right bound
+            # (Å)") needs about that much clearance to stay clear of the
+            # Next Line button ending at x=0.42 (confirmed via audit).
+            ax_s = self._add_control_axes([0.55, 0.135 - k * 0.04, 0.30, 0.03])
+            sl = self._track(Slider(ax_s, lab, lo, hi, valinit=0.0))
+            # No longer hidden -- that was ONLY because these sliders used
+            # to sit side by side (the readout of one bled onto the NEXT
+            # slider's axes); stacked vertically, each row has nothing to
+            # its right except empty space before the Reset button
+            # (x=0.90), so the live readout has room now.
             sl.on_changed(lambda _v: self._remeasure_ew())
             self._sl_ex.append(sl)
 
@@ -1173,7 +1422,27 @@ class EWWidget:
         self._line_idx = (self._line_idx + delta) % len(self.spec.lines)
         self._zoom_locked = False  # a different line has a different natural range
         self._reset_ex_params(redraw=False)
+        self._sync_accept_button()
         self._remeasure_ew()
+
+    def _toggle_line_reject(self):
+        i = self._line_idx
+        self.spec.lines_human_reject[i] = not self.spec.lines_human_reject[i]
+        self._sync_accept_button()
+        self._fig.canvas.draw_idle()
+
+    def _sync_accept_button(self):
+        # Reflects self.spec.lines_human_reject[self._line_idx] -- the
+        # single source of truth make_ew_doc() itself reads (see its own
+        # docstring) -- not separate per-widget state, so stepping to a
+        # different line shows THAT line's own already-stored decision.
+        accepted = not self.spec.lines_human_reject[self._line_idx]
+        self._btn_accept.label.set_text('Accepted' if accepted else 'Rejected')
+        color, hovercolor = _ACCEPT_REJECT_COLORS[accepted]
+        self._btn_accept.color = color
+        self._btn_accept.hovercolor = hovercolor
+        self._btn_accept.ax.set_facecolor(color)
+        self._accept_caption.set_text('(click to reject)' if accepted else '(click to accept)')
 
     def _reset_ex_params(self, redraw=True):
         for sl in self._sl_ex:
@@ -1182,6 +1451,31 @@ class EWWidget:
             sl.eventson = True
         if redraw:
             self._remeasure_ew()
+
+    def _toggle_ew_connected(self):
+        self._ew_connected = not self._ew_connected
+        self._btn_ew_connected.label.set_text('Connected' if self._ew_connected else 'Points')
+        color, hovercolor = (_NORM_VIEW_COLORS['normalized'] if self._ew_connected
+                             else _NORM_VIEW_COLORS['raw'])
+        self._btn_ew_connected.color = color
+        self._btn_ew_connected.hovercolor = hovercolor
+        self._btn_ew_connected.ax.set_facecolor(color)
+        self._apply_ew_connected_style()
+        self._fig.canvas.draw_idle()
+
+    def _apply_ew_connected_style(self):
+        # plot_ew_fit() (plotting.py) draws the right panel's data points
+        # as label='cont' with NO connecting line (show_errorbars=False --
+        # see there); re-applied here rather than threaded through
+        # measure_ew()/plot_ew_fit() as a parameter, since that plotting
+        # code is treated as a black box this widget only draws into via
+        # axes= (see this module's own docstring) -- toggling an already-
+        # drawn Line2D's linestyle directly avoids touching either. Must
+        # be reapplied after every redraw (_ax_data.clear() inside
+        # plot_ew_fit() wipes it back to the 'None' default each time).
+        for line in self._ax_data.lines:
+            if line.get_label() == 'cont':
+                line.set_linestyle('-' if self._ew_connected else 'None')
 
     def _remeasure_ew(self):
         rest_wave = self.spec.lines[self._line_idx]
@@ -1203,7 +1497,25 @@ class EWWidget:
         axes = [self._ax_fit, self._ax_data]
         saved_zoom = self._capture_zoom(axes)
         self._redrawing = True
-        ex_params = [sl.val for sl in self._sl_ex]
+        raw_ex = [sl.val for sl in self._sl_ex]
+        # The bound SLIDERS are small +/-A NUDGES from this line's rest
+        # wavelength, for an intuitive UI -- but get_line_window() (via
+        # measure_ew()) actually expects ABSOLUTE wavelengths for these
+        # two, with 0.0 as a SENTINEL meaning "auto-detect this one
+        # instead" (unlike ex_params[0], continuum shift, which really is
+        # just a plain additive delta -- see get_line_window()'s own
+        # left_bound==0/right_bound==0 checks). Passing the raw slider
+        # deltas straight through fed it boundaries around 0.0-0.3 A --
+        # nowhere near this line's real, thousands-of-A wavelength -- an
+        # all-but-empty, degenerate window every time either was moved
+        # off 0: the reported "fit disappears" bug. Converting here,
+        # instead of changing get_line_window()'s own long-established
+        # absolute-wavelength convention (used elsewhere too, e.g.
+        # measure_all_ew()'s exclude_lines overrides).
+        # ex_params[3] (center) is always 0.0 -- no slider for it (see the
+        # removal note where the sliders are built) -- always auto-detect.
+        ex_params = [raw_ex[0]] + [
+            (rest_wave + delta) if delta != 0 else 0.0 for delta in raw_ex[1:]] + [0.0]
         try:
             self.spec.measure_ew(self._line_idx, order, ex_params=ex_params,
                                   axes=(self._ax_fit, self._ax_data))
@@ -1213,6 +1525,7 @@ class EWWidget:
             # do -- must reconnect here too.
             self._connect_view_watch(self._ax_fit)
             self._connect_view_watch(self._ax_data)
+            self._apply_ew_connected_style()
             self._apply_zoom(axes, saved_zoom)
             self._zoom_sync()
         except Exception as exc:
@@ -1225,9 +1538,15 @@ class EWWidget:
             self._ax_data.clear()
             self._connect_view_watch(self._ax_fit)
             self._connect_view_watch(self._ax_data)
-            self._ax_fit.text(0.5, 0.5, f'Fit failed with these ex_params:\n{exc}',
-                               transform=self._ax_fit.transAxes, ha='center',
-                               va='center', wrap=True, color='#e41a1c')
+            # Manually wrapped, not wrap=True -- that wraps to the FIGURE's
+            # width, not this axes' own (this is the LEFT of a two-panel
+            # main area, so only about half the figure wide), which is
+            # exactly why long messages were spilling into the
+            # neighboring axes.
+            msg = (f'Fit failed with these slider offsets (Δ from rest wavelength):\n'
+                   f'{raw_ex}\n\n' + textwrap.fill(str(exc), width=38))
+            self._ax_fit.text(0.5, 0.5, msg, transform=self._ax_fit.transAxes,
+                               ha='center', va='center', fontsize=9, color='#e41a1c')
         finally:
             self._redrawing = False
         self._fig.canvas.draw_idle()

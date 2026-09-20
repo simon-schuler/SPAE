@@ -74,13 +74,18 @@ def plot_ew_fit(order, wave_min, wave_max, line_rest, found_line, line_bound,
         fit_view.clear()
         local_view.clear()
 
-    def _draw_window(ax):
+    def _draw_window(ax, show_errorbars=True):
         #shared data/window-markers drawing for both panels below -- only
-        #the overlaid fit curve differs between them
+        #the overlaid fit curve (and, for the right panel, the error
+        #bars) differs between them
         ax.grid()
         ax.set_xlabel(r'$\rm Wavelength~(\AA)$', size=14)
-        ax.errorbar(plot_x_array, plot_y_array + ex_params[0],
-                    yerr=2 * plot_err_array / plot_pred_array, capsize=0, fmt='.',
+        if show_errorbars:
+            ax.errorbar(plot_x_array, plot_y_array + ex_params[0],
+                        yerr=2 * plot_err_array / plot_pred_array, capsize=0, fmt='.',
+                        color='k', label='cont', zorder=2)
+        else:
+            ax.plot(plot_x_array, plot_y_array + ex_params[0], '.',
                     color='k', label='cont', zorder=2)
         ax.scatter(plot_x_array[plot_points_within_norm],
                    plot_y_array[plot_points_within_norm] + ex_params[0],
@@ -121,7 +126,11 @@ def plot_ew_fit(order, wave_min, wave_max, line_rest, found_line, line_bound,
     #Right panel: fit against the per-line estimated LOCAL continuum --
     #diagnostic/comparison only (lines_ew_local), shown only when
     #fit_continuum=True was requested; never drives self.lines_ew itself.
-    _draw_window(local_view)
+    #No error bars here (unlike the left/REPORTED panel) -- this panel is
+    #the "just look at the data" view, and the whiskers added visual
+    #clutter without this panel's own fit depending on them the way the
+    #left panel's weighted Gaussian fit does.
+    _draw_window(local_view, show_errorbars=False)
     if fit_continuum:
         local_view.set_title(f'Local continuum (diagnostic only) -- EW={ew:.2f}±{ew_err:.2f} mÅ',
                               fontsize=9 if axes is not None else 10)
