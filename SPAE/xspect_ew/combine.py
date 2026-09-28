@@ -2,6 +2,7 @@
 shift estimation/cleaning (Spectrum_Data.estimate_shift()/clean_shift())."""
 
 import numpy as np
+from scipy.interpolate import interp1d
 
 
 def make_line(x,m,b):
@@ -32,6 +33,73 @@ def parabolic_refine(shifts, chi, k_min):
     d = shifts[k_min] - shifts[k_min - 1]  # grid spacing
     delta = 0.5 * (y_lo - y_hi) / denom
     return shifts[k_min] + delta * d
+
+
+def measure_order_alignment(wave_A, flux_A, wave_B, flux_B, search_radius=0.1, n_shifts=201):
+    """
+    Fine-grained DIRECT cross-correlation between two spectra's own
+    overlapping data, to measure any REMAINING residual wavelength
+    offset between them -- for Spectrum_Data.combine_spectra(), used
+    AFTER both spectra have already been independently rest-framed via
+    apply_rv_shift(). Distinct from (and much more precise than) either
+    spectrum's own independent absolute RV measurement: two independent
+    RV measurements of the same real star routinely disagree by several
+    tenths of a km/s from real per-line measurement noise alone
+    (confirmed on real data: -3.97 vs -4.45 km/s from the same 4
+    reference lines in both spectra) -- a real residual misalignment of
+    several mA at optical wavelengths, easily enough to measurably smear
+    a naively-co-added spectrum. This function instead compares the two
+    spectra directly, over many points at once, which averages out each
+    spectrum's own per-line noise rather than inheriting it.
+
+    Pass NORMALIZED flux (continuum-divided) for the cleanest cross-
+    correlation signal, not raw flux -- confirmed on real data: raw flux
+    carries each exposure's own absolute throughput/continuum level,
+    which normalized_flux removes and raw flux does not.
+
+    Parameters
+    ----------
+    wave_A, flux_A : spectrum A's (already rest-framed) wavelength/
+        normalized flux for one order.
+    wave_B, flux_B : spectrum B's, for the matched order.
+    search_radius : Angstrom half-width searched. 0.1 A comfortably
+        covers the residual sizes confirmed on real data (5-19 mA
+        typical, one order up to ~29 mA) after both spectra are already
+        independently rest-framed -- this is hunting for a small leftover
+        mismatch, not a real uncorrected RV.
+    n_shifts : grid resolution before parabolic_refine()'s sub-grid
+        interpolation.
+
+    Returns
+    -------
+    residual : float, Angstrom -- the amount to ADD to a wavelength
+        query into B's flux array so it aligns with A (i.e., evaluate
+        B's flux at `wave_A_point + residual` to get the value that
+        truly corresponds to `wave_A_point`). None if the overlap is too
+        small/noisy to measure (fewer than 20 usable points, or every
+        trial shift left fewer than 20 valid overlapping points).
+    """
+    lo = max(wave_A.min(), wave_B.min()) + search_radius
+    hi = min(wave_A.max(), wave_B.max()) - search_radius
+    if hi <= lo:
+        return None
+    ref_mask = (wave_A >= lo) & (wave_A <= hi)
+    if ref_mask.sum() < 20:
+        return None
+    ref_wave, ref_flux = wave_A[ref_mask], flux_A[ref_mask]
+
+    shifts = np.linspace(-search_radius, search_radius, n_shifts)
+    chi = np.empty(n_shifts)
+    interp_B = interp1d(wave_B, flux_B, bounds_error=False, fill_value=np.nan)
+    for k, s in enumerate(shifts):
+        test = interp_B(ref_wave + s)
+        valid = np.isfinite(test)
+        chi[k] = np.mean((ref_flux[valid] - test[valid]) ** 2) if valid.sum() >= 20 else np.inf
+
+    k_min = np.argmin(chi)
+    if not np.isfinite(chi[k_min]):
+        return None
+    return parabolic_refine(shifts, chi, k_min)
 
 
 def combine_files(empty_obj,objects = []):

@@ -23,3 +23,4 @@ from .radial_velocity import measure_effective_rv, measure_rv_from_linelist, RV_
 from .response_correction import apply_response_correction
 from .overlap_check import check_order_overlaps, print_overlap_report, flagged_overlap_ranges
 from .line_identification import identify_line, identify_lines_in_spectrum
+from .interactive import EWWidget, ew_interactive
