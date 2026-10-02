@@ -59,6 +59,12 @@ def _curve(state) -> None:
 
     # Phase 2: increase gf one step at a time, collecting COG points
     while state.w[state.ncurve] < wstop:
+        if state.ncurve + 1 >= len(state.w) or not np.isfinite(state.w[state.ncurve]):
+            raise ValueError(
+                f"_curve: COG for line {state.wave1[lim1]:.3f} A did not reach "
+                f"log(RW)={state.rwhigh} after {state.ncurve + 1} points (EW stuck at "
+                f"{state.w[state.ncurve]:.4f} A, target {wstop:.4f} A) -- the line "
+                f"profile window in oneline() is likely too narrow for this atmosphere")
         state.ncurve += 1
         state.gf1[state.ncurve]   = state.gf1[state.ncurve - 1] * dec
         state.kapnu0[lim1, :ntau] *= dec
