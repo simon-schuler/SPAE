@@ -265,9 +265,22 @@ def _read_ew_lines(path):
         for line in f:
             if not line.strip():
                 continue
-            wave = line.split()[0]
+            # fixed-width field, not line.split()[0]: make_ew_doc() writes
+            # 10-char MOOG columns, and a full-width wavelength runs straight
+            # into the left-justified species field ('  4779.43926.000')
+            wave = line[:10].strip()
             lines[wave] = line
     return lines
+
+
+def _ew_fractional_error(line):
+    """sigma_EW / EW from make_ew_doc()'s fixed 10-char columns (EW in the
+    7th, its error in the 8th); inf if either is missing or unusable."""
+    try:
+        ew, err = float(line[60:70]), float(line[70:80])
+    except ValueError:
+        return np.inf
+    return err / ew if ew > 0 and err > 0 else np.inf
 
 
 def _write_ew_lines(path, header, wave_to_line, waves):
@@ -317,13 +330,16 @@ def measure_and_merge(paths, output_dir, reference_atlas_path, review, doc_title
                 header = f.readline()
         overlap = set(piece_lines) & set(merged)
         if overlap:
-            #expected to be rare (pieces are mostly disjoint wavelength
-            #ranges), and harmless when it happens -- just keep whichever
-            #copy was merged first, both are the same star's EW for the
-            #same line measured independently, not a real conflict to
-            #resolve carefully
-            print(f'    {len(overlap)} line(s) already covered by an earlier '
-                  f'{label} -- keeping the first measurement')
+            #the same line measured independently in two pieces (e.g. the
+            #overlap between a spectrograph's blue and red arms, where one
+            #arm is usually much noisier) -- keep whichever copy has the
+            #smaller fractional EW error, not just whichever came first
+            replaced = [w for w in overlap
+                        if _ew_fractional_error(piece_lines[w]) < _ew_fractional_error(merged[w])]
+            print(f'    {len(overlap)} line(s) also measured by an earlier {label} -- '
+                  f'kept the lower-fractional-EW-error copy ({len(replaced)} replaced '
+                  f'by this {label})')
+            merged.update({w: piece_lines[w] for w in replaced})
         merged.update({k: v for k, v in piece_lines.items() if k not in merged})
 
     merged_path = os.path.join(output_dir, merged_filename)
