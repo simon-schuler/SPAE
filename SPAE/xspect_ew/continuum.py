@@ -226,7 +226,8 @@ from scipy.stats import norm
 def fit_als_continuum(wave, flux, err, lam=2e3, p=0.01, n_iter=15, adaptive=True,
                        stiffen_factor=15.0, local_window=3.0, wide_window=25.0,
                        severity_threshold=0.02, severity_scale=0.06, low_reject_sigma=2.5,
-                       p_reduction_factor=30.0, target_percentile=80.0, edge_ignore_aa=2.0):
+                       p_reduction_factor=30.0, target_percentile=80.0, edge_ignore_aa=2.0,
+                       calib_window_aa=None):
     """
     Fit the continuum as the (noise-aware) upper envelope of flux via
     Asymmetric Least Squares (AsLS) smoothing: iteratively solve the
@@ -339,6 +340,15 @@ def fit_als_continuum(wave, flux, err, lam=2e3, p=0.01, n_iter=15, adaptive=True
         before). A continuum value is still returned at every point,
         including excluded edges -- the smoothness penalty extrapolates
         into them from the trusted interior.
+    calib_window_aa : None (default) calibrates target_percentile's noise
+        scale once over the whole input (one factor per order -- the
+        original behavior). An Angstrom width instead calibrates it in
+        consecutive windows of that width, interpolated between window
+        centres -- for a long merged spectrum (e.g. a whole GHOST arm
+        fit at once) where the real-vs-`err` noise mismatch varies along
+        the spectrum: confirmed on real GHOST data, a single factor
+        dominated by the noisy blue end pushed the red end's continuum
+        10-50% above the data.
 
     Returns
     -------
@@ -458,6 +468,17 @@ def fit_als_continuum(wave, flux, err, lam=2e3, p=0.01, n_iter=15, adaptive=True
         flux_floor = np.maximum(flux, 1e-3 * np.median(flux[flux > 0]) if np.any(flux > 0) else 1.0)
         continuum_scale = np.clip(pred / flux_floor, 0.0, 100.0)
         err_at_continuum = err * np.sqrt(continuum_scale)
+        # The offset is a property of the CONTINUUM's noise level, which
+        # varies smoothly -- so use a running median over local_window
+        # rather than each point's own err. Confirmed on real GHOST/DRAGONS
+        # data: isolated 3-4 px runs carry VAR ~16-20x their neighbours',
+        # and a per-point offset turned each one into a narrow 5-13% spike
+        # in the reported continuum. A near no-op for sqrt(counts)-style
+        # err (Keck/GRACES), which is already smooth at continuum level.
+        if L > 4:
+            dx = (wave[-1] - wave[0]) / (L - 1)
+            smooth_pts = max(int(round(local_window / dx)), 1) | 1
+            err_at_continuum = median_filter(err_at_continuum, size=smooth_pts, mode='nearest')
 
         # `err` is a THEORETICAL noise scale (Poisson-style sqrt
         # scaling); real extracted spectra don't always match it. An
@@ -481,12 +502,28 @@ def fit_als_continuum(wave, flux, err, lam=2e3, p=0.01, n_iter=15, adaptive=True
         # offset. A no-op when err already matches reality (Keck/GRACES);
         # self-corrects when it doesn't, without needing to know why.
         above = (resid > 0) & trusted  # exclude edge_ignore_aa's edges from this too
-        calib = 1.0
-        if above.sum() > 10:
-            empirical = np.median(resid[above])
-            theoretical = np.median(err_at_continuum[above]) * 0.6744897501960817
-            if theoretical > 0:
-                calib = np.clip(empirical / theoretical, 0.05, 3.0)
+
+        def _calib(sel):
+            if sel.sum() > 10:
+                empirical = np.median(resid[sel])
+                theoretical = np.median(err_at_continuum[sel]) * 0.6744897501960817
+                if theoretical > 0:
+                    return np.clip(empirical / theoretical, 0.05, 3.0)
+            return np.nan
+
+        calib = _calib(above)
+        calib = 1.0 if np.isnan(calib) else calib
+        if calib_window_aa is not None and wave[-1] - wave[0] > calib_window_aa:
+            n_win = int(np.ceil((wave[-1] - wave[0]) / calib_window_aa))
+            win_edges = np.linspace(wave[0], wave[-1], n_win + 1)
+            centres, factors = [], []
+            for lo, hi in zip(win_edges[:-1], win_edges[1:]):
+                c = _calib(above & (wave >= lo) & (wave <= hi))
+                if np.isfinite(c):
+                    centres.append(0.5 * (lo + hi))
+                    factors.append(c)
+            if centres:
+                calib = np.interp(wave, centres, factors)
 
         pred = pred + sigma_offset * calib * err_at_continuum
         resid = flux - pred

@@ -17,7 +17,7 @@ from .line_profile import (get_line_window, gauss_model, gfit_direct, gauss_ew, 
                             estimate_local_continuum_sloped, EW_K)
 from .combine import make_line, parabolic_refine, measure_order_alignment
 from .plotting import make_plots_folder, plot_ew_fit
-from .readers import read_spectrum
+from .readers import read_spectrum, detect_format, FORMAT_NORMALIZE_DEFAULTS
 from .radial_velocity import measure_effective_rv, measure_rv_ccf, C_KMS
 from .response_correction import apply_response_correction as _apply_response_correction
 from .overlap_check import check_order_overlaps as _check_order_overlaps
@@ -55,9 +55,16 @@ class Spectrum_Data():
         """
         self.filename = filename
         self.gain = None
+        reader_err = None
+        #reader format name ('ghost', 'keck_hires', ...) -- selects
+        #per-format normalize_all() defaults (FORMAT_NORMALIZE_DEFAULTS)
+        self.instrument = None
         if KECK_file:
-            self.wavelength, self.flux, self.gain = read_spectrum(
-                filename, instrument=instrument, custom_reader=custom_reader, **reader_kwargs)
+            self.instrument = detect_format(filename, instrument=instrument,
+                                            custom_reader=custom_reader)
+            self.wavelength, self.flux, self.gain, reader_err = read_spectrum(
+                filename, instrument=instrument, custom_reader=custom_reader,
+                return_err=True, **reader_kwargs)
         else:
             #split input array into orders
             if order_split[0]:
@@ -119,6 +126,12 @@ class Spectrum_Data():
             #weight (1/err) infinite -- also confirmed on suni.fits: 146
             #pixels, non-contiguous, near one order's far edge.
             self.obs_err[i] = np.maximum(np.sqrt(np.abs(self.flux[i])), 1.0)
+            #a reader that ships a real per-pixel error (e.g. GHOST's VAR
+            #extension -- see readers._read_ghost()) supersedes the
+            #sqrt(counts) estimate above, which is badly wrong for flux that
+            #isn't pure photon counts
+            if reader_err is not None:
+                self.obs_err[i] = np.asarray(reader_err[i], dtype=float)
         #print('empty continuum arrays created', self.continuum)
         #Old way of setting these variables (change back if above code causes problems)
         # self.continuum = np.full((len(self.wavelength),len(self.wavelength[0])), False)
@@ -389,12 +402,45 @@ class Spectrum_Data():
         self.corrected_pixel_wavelengths.extend(corrected)
         return corrected
 
-    def normalize_all(self, lam = 2e3, p = 0.01, n_iter = 15, adaptive = True, **als_kwargs):
+    def _normalize_settings(self, **explicit):
+        """fit_als_continuum() settings: package defaults, overridden by this
+        spectrum's format defaults (FORMAT_NORMALIZE_DEFAULTS, e.g. a stiff
+        whole-arm fit for GHOST/DRAGONS), overridden by any argument the
+        caller actually passed (None = not passed). Returns (settings,
+        merged)."""
+        settings = dict(lam=2e3, p=0.01, n_iter=15, adaptive=True)
+        # getattr: Spectrum_Data pickled before self.instrument existed
+        settings.update(FORMAT_NORMALIZE_DEFAULTS.get(getattr(self, 'instrument', None), {}))
+        settings.update({k: v for k, v in explicit.items() if v is not None})
+        merged = settings.pop('merged', False)
+        return settings, merged
+
+    def normalize_all(self, lam = None, p = None, n_iter = None, adaptive = None,
+                      merged = None, **als_kwargs):
+        """
+        Fit and divide out the continuum of every order. Unset arguments
+        fall back to this spectrum's format defaults (see
+        _normalize_settings()), then to lam=2e3, p=0.01, n_iter=15,
+        adaptive=True.
+
+        merged : if True, the "orders" are artificial chunks of ONE merged
+            spectrum (e.g. GHOST/DRAGONS; see readers._read_ghost()) -- the
+            continuum is fit once across the whole de-duplicated spectrum
+            and then split back into the chunks, so no chunk boundary
+            introduces a continuum discontinuity. Defaults to the format's
+            setting (True for 'ghost', False otherwise).
+        """
+        settings, use_merged = self._normalize_settings(
+            lam=lam, p=p, n_iter=n_iter, adaptive=adaptive, merged=merged, **als_kwargs)
+        if use_merged:
+            self._normalize_merged(**settings)
+            return None
+
         #loop through orders
         for i in range(len(self.flux)):
 
             #fit continuum via Asymmetric Least Squares smoothing
-            self.normalize(i, lam=lam, p=p, n_iter=n_iter, adaptive=adaptive, **als_kwargs)
+            self.normalize(i, **settings)
 
             #Replace un-normalized points with value before it
             #This should only be replacing the last point in the
@@ -406,8 +452,29 @@ class Spectrum_Data():
 
         return None
 
-    def normalize(self, order, clip = [-999,-999], lam = 2e3, p = 0.01, n_iter = 15,
-                  adaptive = True, **als_kwargs):
+    def _normalize_merged(self, **settings):
+        """normalize_all(merged=True): one fit over the union of every
+        chunk's pixels (overlapping chunks share the same original pixels,
+        de-duplicated by wavelength), then each chunk takes its own pixels'
+        values back out of it."""
+        wave = np.concatenate([np.asarray(w, dtype=float) for w in self.wavelength])
+        flux = np.concatenate([np.asarray(f, dtype=float) for f in self.flux])
+        err = np.concatenate([np.asarray(e, dtype=float) for e in self.obs_err])
+        wave, idx = np.unique(wave, return_index=True)
+        flux, err = flux[idx], err[idx]
+
+        pred, pred_var = fit_als_continuum(wave, flux, err, **settings)
+
+        for i in range(len(self.wavelength)):
+            j = np.searchsorted(wave, self.wavelength[i])
+            self.pred_all[i] = pred[j]
+            self.pred_var_all[i] = pred_var[j]
+            self.continuum[i] = self.flux[i] >= self.pred_all[i]
+            self.normalized_flux[i] = self.flux[i] / self.pred_all[i]
+        return None
+
+    def normalize(self, order, clip = [-999,-999], lam = None, p = None, n_iter = None,
+                  adaptive = None, **als_kwargs):
         """
         Fit and divide out the continuum for one order via Asymmetric
         Least Squares (AsLS) smoothing (fit_als_continuum(), continuum.py).
@@ -455,8 +522,12 @@ class Spectrum_Data():
         this replaced and why each earlier attempt failed on real data.
 
         lam/p/n_iter/adaptive control the fit; see
-        fit_als_continuum()'s docstring.
+        fit_als_continuum()'s docstring. Unset ones fall back to this
+        spectrum's format defaults, as in normalize_all() -- but this
+        always fits the one order alone, even for a merged format.
         """
+        settings, _ = self._normalize_settings(lam=lam, p=p, n_iter=n_iter,
+                                               adaptive=adaptive, **als_kwargs)
         if clip[0] != -999 and clip[1] != -999:
             #clipped = True
             clipl = np.where(self.wavelength[order] <= clip[0])[0][-1]
@@ -478,8 +549,7 @@ class Spectrum_Data():
         # clean, response-corrected MAROON-X order).
         err = self.obs_err[order][clipl:clipr]
 
-        pred, pred_var = fit_als_continuum(wave, flux, err, lam=lam, p=p, n_iter=n_iter,
-                                           adaptive=adaptive, **als_kwargs)
+        pred, pred_var = fit_als_continuum(wave, flux, err, **settings)
 
         self.continuum[order][clipl:clipr] = flux >= pred
         self.pred_all[order][clipl:clipr] = pred
