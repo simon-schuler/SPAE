@@ -102,7 +102,7 @@ def measure_order_alignment(wave_A, flux_A, wave_B, flux_B, search_radius=0.1, n
     return parabolic_refine(shifts, chi, k_min)
 
 
-def combine_epochs(spectra, verbose=False, **combine_kwargs):
+def combine_epochs(spectra, verbose=False, renormalize=True, **combine_kwargs):
     """
     Chain Spectrum_Data.combine_spectra() pairwise across an arbitrary
     number (>=2) of same-star exposures/epochs, folding each one into a
@@ -118,17 +118,12 @@ def combine_epochs(spectra, verbose=False, **combine_kwargs):
     known-bad orders should have flag_bad_orders() run beforehand, again
     exactly as for a single pairwise combine_spectra() call.
 
-    Known limitation, inherited unchanged from combine_spectra()'s own
-    docstring and the interactive widget's identical chaining pattern:
-    update_combined() only overwrites spectra[0].flux/obs_err, NOT
-    spectra[0].normalized_flux -- so from the second fold onward,
-    apply_rv_shift()'s RV measurement and the per-order fine-alignment
-    cross-correlation both still run against spectra[0]'s ORIGINAL
-    (pre-combine) normalized_flux, not the updated combined flux. This
-    is an accepted simplification (it's exactly what the interactive
-    widget already does for its own multi-exposure Combine step, not a
-    new gap introduced here); call spectra[0].normalize_all() again
-    between folds if this turns out to matter for a given dataset.
+    update_combined() only overwrites spectra[0].flux/obs_err, NOT its
+    continuum (pred_all) or normalized_flux -- so by default (renormalize=
+    True) spectra[0].normalize_all() is re-run after every fold, keeping
+    the next fold's alignment, cross-exposure spike check and spike
+    replacement (which rescales to pred_all) consistent with the running
+    SUM rather than with spectra[0]'s original single exposure.
 
     Parameters
     ----------
@@ -137,6 +132,9 @@ def combine_epochs(spectra, verbose=False, **combine_kwargs):
         are folded into it one at a time, in list order.
     verbose : passed through to every combine_spectra() call, plus this
         wrapper's own per-fold progress print.
+    renormalize : re-run spectra[0].normalize_all() (its format defaults)
+        after every fold -- see above. False restores the old behavior
+        (the interactive widget's own Combine step still works that way).
     **combine_kwargs : forwarded to every combine_spectra() call (e.g.
         min_overlap_fraction, align, align_search_radius,
         align_warn_threshold, cross_exposure_check,
@@ -178,6 +176,8 @@ def combine_epochs(spectra, verbose=False, **combine_kwargs):
             print(f"combine_epochs(): folding in exposure {step + 1}/{len(spectra)}...")
         n = primary.combine_spectra(other, verbose=verbose, **combine_kwargs)
         primary.update_combined()
+        if renormalize:
+            primary.normalize_all()
         combine_debug_chain.append(primary.combine_debug)
         n_combined_per_fold.append(n)
 

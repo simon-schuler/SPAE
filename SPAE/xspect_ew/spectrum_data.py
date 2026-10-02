@@ -826,14 +826,23 @@ class Spectrum_Data():
                 # with flux_B_interp/err_B_interp (both built from wave_A[in_range]).
                 if cx_bad.any():
                     combo_idx = np.where(in_range)[0]
+                    pred_B_interp = interp1d(wave_B, spectB.pred_all[best_j], kind='linear')(query)
                     for pos in np.where(cx_bad)[0]:
                         idx = combo_idx[pos]
                         # use whichever side has the LOWER excess significance
-                        # (the less-contaminated one), not the sum of both
+                        # (the less-contaminated one), not the sum of both --
+                        # rescaled from that one spectrum's own continuum up
+                        # to the SUM's (pred_A + pred_B), since every other
+                        # combined pixel is A+B: substituting one spectrum's
+                        # bare flux left a fake absorption dip of depth
+                        # ~(the other spectrum's share) at every corrected pixel
+                        pred_sum = self.pred_all[i][idx] + pred_B_interp[pos]
                         if cx_a_higher[pos]:
-                            cflux[idx], cerr[idx] = flux_B_interp[pos], err_B_interp[pos]
+                            scale = pred_sum / pred_B_interp[pos]
+                            cflux[idx], cerr[idx] = flux_B_interp[pos] * scale, err_B_interp[pos] * scale
                         else:
-                            cflux[idx], cerr[idx] = flux_A[idx], err_A[idx]
+                            scale = pred_sum / self.pred_all[i][idx]
+                            cflux[idx], cerr[idx] = flux_A[idx] * scale, err_A[idx] * scale
                         self.corrected_pixel_wavelengths.append(float(wave_A[idx]))
                         n_cross_corrected += 1
                     if verbose:
