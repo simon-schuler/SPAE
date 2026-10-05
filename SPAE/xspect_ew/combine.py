@@ -159,6 +159,13 @@ def combine_epochs(spectra, verbose=False, renormalize=True, **combine_kwargs):
     fold's per-order detail -- see combine_spectra()'s own docstring).
     combine_debug_chain[k] is the combine_debug produced by folding in
     spectra[k + 1].
+
+    Each entry combine_spectra() adds to combined.dropped_line_exposures
+    (a line whose window in one side was dropped for cross-exposure
+    contamination -- needs combined.load_lines() BEFORE calling this; see
+    combine_spectra()'s point 9) also gets 'fold' and 'exposures_dropped'
+    (indices into spectra). Dropping the 'A' side at a later fold drops
+    the whole running sum of earlier exposures for that line's window.
     """
     if len(spectra) < 2:
         raise ValueError(f"combine_epochs() needs at least 2 spectra, got {len(spectra)}")
@@ -174,8 +181,14 @@ def combine_epochs(spectra, verbose=False, renormalize=True, **combine_kwargs):
     for step, other in enumerate(spectra[1:], start=1):
         if verbose:
             print(f"combine_epochs(): folding in exposure {step + 1}/{len(spectra)}...")
+        n_dropped_before = len(getattr(primary, 'dropped_line_exposures', []))
         n = primary.combine_spectra(other, verbose=verbose, **combine_kwargs)
         primary.update_combined()
+        # name which exposure(s) each new whole-line drop removed: 'B' is
+        # spectra[step]; 'A' is the running sum of spectra[0..step-1]
+        for d in primary.dropped_line_exposures[n_dropped_before:]:
+            d['fold'] = step
+            d['exposures_dropped'] = [step] if d['dropped'] == 'B' else list(range(step))
         if renormalize:
             primary.normalize_all()
         combine_debug_chain.append(primary.combine_debug)
