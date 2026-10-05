@@ -86,22 +86,38 @@ def oneline(state, imode: int) -> None:
     # This replaces the original sequential loop (100× taukap + cdcalc + rinteg).
     # maxsteps=70 covers the observed maximum profile extent (max ndepths=55 in
     # testing) while saving 30 % of the per-step compute vs the former 100-step batch.
-    maxsteps = 70
-    waves = state.wave1[lim1] + np.arange(maxsteps, dtype=float) * st1
+    # If the wing hasn't converged within a batch, further batches are
+    # computed (up to len(state.dellam) steps): st1 is fixed while the line
+    # is still weak (and cached), so a strongly saturated line with a small
+    # Doppler width (low microturbulence, hot atmosphere) can need far more
+    # than 70 steps. A hard 70-step window capped the EW at 2*69*st1 --
+    # confirmed: fakeline's reference line plateaued at 0.911 A (Teff 6370,
+    # micro 0.3), below the COG's 0.999 A stopping point, crashing _curve.
+    # (The original Fortran-faithful loop ran 100 steps.)
+    batch = 70
+    max_total = len(state.dellam)
+    d_parts = []
+    ndepths = None
+    n_done = 0
+    while n_done < max_total:
+        n_batch = min(batch, max_total - n_done)
+        waves = state.wave1[lim1] + np.arange(n_done, n_done + n_batch, dtype=float) * st1
+        kapnu_b, taunu_b = taukap_batch(state, waves)          # (n_batch, ntau)
+        cd_b = cdcalc_batch(state, kapnu_b, taunu_b, waves)    # (n_batch, ntau)
+        first_b = 0.4343 * cd_b[:, 0]                         # (n_batch,)
+        d_parts.append(rinteg_batch_total(state.xref[:ntau], cd_b, first_b))
+        n_done += n_batch
+        d_prof_all = np.concatenate(d_parts)
 
-    kapnu_b, taunu_b = taukap_batch(state, waves)          # (maxsteps, ntau)
-    cd_b = cdcalc_batch(state, kapnu_b, taunu_b, waves)    # (maxsteps, ntau)
-    first_b = 0.4343 * cd_b[:, 0]                         # (maxsteps,)
-    d_prof_all = rinteg_batch_total(
-        state.xref[:ntau], cd_b, first_b)                  # (maxsteps,)
-
-    # Determine convergence depth (profile wing < 0.5 % of line centre)
-    ndepths = maxsteps
-    if d_prof_all[0] > 0.0:
-        ratio = d_prof_all / d_prof_all[0]
-        below = np.where(ratio[1:] < 0.005)[0]
+        # Determine convergence depth (profile wing < 0.5 % of line centre)
+        if d_prof_all[0] <= 0.0:
+            break
+        below = np.where(d_prof_all[1:] / d_prof_all[0] < 0.005)[0]
         if len(below) > 0:
             ndepths = int(below[0]) + 2   # include the converged step
+            break
+    if ndepths is None:
+        ndepths = n_done
 
     state.ndepths = ndepths
 

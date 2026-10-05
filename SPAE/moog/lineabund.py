@@ -31,6 +31,50 @@ def _interp_cog(state, rwlg: float) -> float:
     return float(gftab[ntot - 1])
 
 
+def _cog_slope(state, rwlg: float) -> float:
+    """
+    Local slope d(log gf)/d(log RW) of the fine COG table at rwlg, from the
+    same bracketing table segment _interp_cog() would use. On the linear
+    (unsaturated) part of the curve of growth this slope is ~1; it drops
+    below 1 approaching saturation, which is what makes it a better basis
+    for error propagation than assuming unit slope outright.
+    """
+    ntot  = state.ntabtot
+    rwtab = state.rwtab[:ntot]
+    gftab = state.gftab[:ntot]
+    for i in range(1, ntot):
+        if rwtab[i] > rwlg:
+            d_rw = rwtab[i] - rwtab[i - 1]
+            return (gftab[i] - gftab[i - 1]) / d_rw if d_rw != 0.0 else 1.0
+    if ntot >= 2:
+        d_rw = rwtab[ntot - 1] - rwtab[ntot - 2]
+        if d_rw != 0.0:
+            return (gftab[ntot - 1] - gftab[ntot - 2]) / d_rw
+    return 1.0
+
+
+def line_abund_err(state, lim1: int) -> float:
+    """
+    Propagate the line's EW uncertainty (state.width_err[lim1]) into a 1-sigma
+    abundance uncertainty [dex], using the local curve-of-growth slope:
+
+        sigma_A = |d(log gf)/d(log RW)| * sigma_EW / (EW * ln10)
+
+    On the linear (unsaturated) part of the curve of growth EW scales
+    directly with abundance, so this reduces to the standard weak-line
+    formula sigma_A = sigma_EW / (EW * ln10); the COG slope generalizes it
+    for lines that are somewhat saturated. Returns 0.0 if the EW or its
+    uncertainty is unknown/non-positive.
+    """
+    ew     = state.width[lim1]
+    ew_err = state.width_err[lim1]
+    if ew <= 0.0 or ew_err <= 0.0:
+        return 0.0
+    rwlgobs = np.log10(ew / state.wave1[lim1])
+    slope   = _cog_slope(state, rwlgobs)
+    return abs(slope) * (ew_err / ew) / np.log(10.0)
+
+
 # ---------------------------------------------------------------------------
 # lineabund
 # ---------------------------------------------------------------------------

@@ -1140,7 +1140,483 @@ A parallel EW-measurement-stage S/N characterization is deferred until
 that (separately developed) code is available, per the user's original
 two-step framing of this question.
 
-## 15. Commit reference
+## 15. New GRACES format, a negative-flux bug, and whole-order outlier flagging
+
+Motivated by testing/improving `combine_spectra()` (multi-exposure
+co-addition) -- the user provided two real GRACES exposures of the same
+star (Theia 456-6, `N20220115G0040i.fits`/`N20220118G0038i.fits`) as test
+data, which turned out to use a GRACES/OPERA output variant this package
+didn't support yet.
+
+### 15.1 New reader: GRACES/OPERA merged "intensity" (.i) format
+
+Different from the already-supported per-order "spectrum" (.m) format
+(§7's original GRACES reader): no `Order` column at all -- every echelle
+order pre-merged into one continuous ~194000-point array. The header is
+fully self-documenting (verified via its own source, not assumed): 4
+wavelength/intensity/errorbar column triplets (`COL1-3`, `4-6`, `7-9`,
+`10-12`), Normalized/UnNormalized crossed with autowave-corrected
+(telluric-line-based)/uncorrected, distinguished only by each `COLn`'s
+header COMMENT (the VALUES are identical repeated 'Wavelength'/
+'Intensity'/'ErrorBar' labels). Confirmed directly against the OPERA
+pipeline's own C++ source (`operaGenerateLEFormats.cpp`,
+github.com/CFHT/OPERA): "UnNormalized" = `RawFluxInElectronsPerElement`
+(a literal copy of the raw extracted flux, no background subtraction),
+"no autowave correction" = `ThArCalibratedInNM` (comparison-lamp
+wavelength solution only, no telluric-line fine correction) -- both the
+least-processed options, matching this module's established "prefer
+raw/uncorrected" design principle exactly the way GRACES's `.m` format's
+`RawFlux` column did.
+
+New `_read_graces_intensity()`/`_detect_graces_intensity()` in
+`readers.py` (registered as `'graces_intensity'`). Since there's no Order
+column, orders are recovered by detecting wavelength BOUNDARIES -- a
+less robust heuristic than the `.m` reader's explicit column, used only
+because this format gives us nothing better. A first attempt (negative
+jumps only, i.e. order OVERLAP) silently merged the reddest ~5 orders
+into one 39101-point, 2270-A-wide "order" at ~22x coarser effective
+sampling than everywhere else, because real order overlap stops past
+~820 nm and adjacent orders there have a small wavelength GAP instead
+(a forward jump, not a negative one). Fixed: flag a boundary at either a
+negative jump OR an abnormally large positive jump relative to a ROLLING
+local median spacing (needed either way, since real point spacing itself
+grows gradually and smoothly from blue to red). Confirmed against both
+real files: recovers exactly 35 orders, matching this instrument's
+known-good order count from the `.m` format, with smoothly increasing
+order sizes throughout. No regression confirmed on the existing `.m`
+GRACES file, Keck, or MAROON-X.
+
+### 15.2 Negative raw flux crashing an entire order's continuum fit
+
+GRACES's real raw ("UnNormalized") flux can be genuinely negative --
+confirmed via the OPERA source above (ordinary CCD read noise
+symmetrically scattering a near-zero-signal pixel below zero after
+bias/dark subtraction, not a data error -- more common here simply
+because these two exposures are fainter, SNR ~20-70 per the header, than
+anything tested against so far). `Spectrum_Data.__init__`'s initial
+`obs_err = sqrt(flux)` produced NaN for those points, and even a modest
+fraction of NaN weights (539/4055, ~13%, in one real order) was confirmed
+to corrupt the ENTIRE order's AsLS continuum fit output, not just the
+affected points. Fixed: `sqrt(abs(flux))` -- keeps the correct order of
+magnitude of Poisson-like noise at that pixel either way, and is a
+general fix (not format-specific), since any sufficiently faint spectrum
+in any format could hit the same failure mode.
+
+### 15.3 Whole-order outlier flagging (new `outlier_check.py`)
+
+Fixing 15.2 let `normalize_all()` complete without crashing, but order 0
+of both real files still came back with an absurd median normalized flux
+of ~0.055 (should be ~0.9-1.0). Root cause: a single raw-flux point at
+~28,000-60,000x the order's own typical scale (154.16 million vs. a
+~5,475 median) was dragging the AsLS fit up across the WHOLE order via
+its smoothness-penalty coupling. Confirmed NOT a random cosmic ray: the
+same defect appears at the same wavelength (~400.56 nm) and nearly the
+same pixel index (540/4055 vs. 540/4054) in BOTH independent exposures,
+taken 3 days apart -- a fixed, reproducible detector/pipeline defect
+(plausibly related to GRACES's dual-amplifier readout boundary), not
+noise. Per the user's explicit preference and this package's established
+flag-and-exclude precedent (§8's overlap check) rather than trying to
+make the shared AsLS routine itself robust to every possible corruption:
+new `outlier_check.py` / `Spectrum_Data.flag_bad_orders()`, wired into
+`check_for_flags()` exactly like `overlap_flag_ranges` (new
+`self.bad_order_ranges`, same `wave_lo`/`wave_hi` key convention, same
+silent-no-op-until-called behavior).
+
+**Getting the detection metric right took one real iteration**: a first
+attempt (median absolute deviation, symmetric around the order's median)
+false-flagged 11 of 35 real orders in the first test file alone, whose
+only "outlier" was a genuine, deep, real spectral feature (Na D at
+5889.95 A, H-alpha at 6562.63 A, the O2 B telluric band at 6869.59 A)
+sitting in an otherwise very low-scatter stretch. Root cause: deep
+ABSORPTION already has purpose-built, asymmetric handling in the
+continuum-fitting routine itself (§6) -- this check only needs to catch
+the failure mode that mechanism can't, an extreme point ABOVE the
+order's own natural peak level, so checking symmetrically was both
+unnecessary and actively wrong. Fixed: compare the order's single
+highest point against its own 99th-percentile flux (max/p99), not a
+median-centered measure. Confirmed directly against every real spectrum
+in this project's test set (Keck, both GRACES formats, MAROON-X
+pre-/post-response-correction): every genuine order sits at max/p99 <=
+1.51, while the real defect sits at 96.7-713 in the two test files --
+a >60x gap between the two clusters, with the default `outlier_factor`
+(20.0) sitting at that gap's log-space midpoint.
+
+## 16. `combine_spectra()` redesign (multi-exposure co-addition)
+
+User request: two or more exposures of the same star are often co-added
+for higher combined S/N; XSpect-EW already had a `combine_spectra()` for
+this, asked to make it more robust. Test data: the two real GRACES
+exposures of Theia 456-6 from §15 (`N20220115G0040i.fits`/
+`N20220118G0038i.fits`), the only reason that section's reader/NaN/
+outlier work happened at all.
+
+**Problems found in the original implementation** (code review, before
+any real-data testing):
+1. Orders matched by nearest *median* wavelength only, no check that A
+   and B's candidate orders actually overlap.
+2. Wavelength alignment reused `estimate_shift()`/`clean_shift()` --
+   built for cross-correlating a star against a REFERENCE spectrum (e.g.
+   a solar atlas), with a documented extrapolation failure mode for
+   orders with no reference overlap (§3/§13). Wrong tool for this case:
+   A and B are two exposures of the *same* star, so the natural, already-
+   more-robust approach is to rest-frame each one independently via
+   `apply_rv_shift()` (§13's work) rather than cross-correlate them
+   against each other.
+3. The actual flux combination did not interpolate at all: for each of
+   A's pixels, it grabbed B's single nearest sample within a hardcoded
+   +/-5-pixel INDEX window around the SAME pixel index -- silently
+   assuming A and B share an identical pixel grid/length per order, not
+   a safe assumption for two independently-reduced exposures.
+4. Error was recomputed as `sqrt(combined counts)`, discarding each
+   exposure's own already-computed `obs_err` rather than propagating it.
+5. A blocking `plt.show()` per order made it impossible to run non-
+   interactively.
+
+**Redesign** (`Spectrum_Data.combine_spectra()`, `spectrum_data.py`):
+rest-frames both spectra independently via `apply_rv_shift()`; matches
+each of A's orders to whichever B order has the MOST real wavelength-
+range overlap (minimum overlap fraction required, default 0.5, else that
+order is left as A alone rather than paired with something unrelated);
+properly interpolates B's flux/error onto A's rest-frame grid
+(`scipy.interpolate.interp1d`) over the real overlap only; sums flux and
+propagates error as a quadrature sum of each spectrum's own (interpolated)
+`obs_err`; skips combining any order flagged by `flag_bad_orders()` (§15)
+in EITHER spectrum -- combining a good order with a known-corrupted one
+would spread the corruption, not average it out -- falling back to that
+spectrum's own order alone instead, same flag-and-fall-back philosophy as
+everywhere else rather than trying to salvage a known-bad order; plotting
+is now opt-in (`plot=True`) and non-blocking (one PNG per combined order,
+not a per-order `plt.show()`). `update_combined()` now also restores
+`self.obs_err` (previously only `self.flux`), matching that the combined
+error is now a real, propagated quantity worth keeping.
+
+**Verified end-to-end on the two real Theia 456-6 exposures** (both
+already `flag_bad_orders()`'d and `normalize_all()`'d first, per the new
+docstring's stated requirement -- `apply_rv_shift()` needs
+`normalized_flux` to measure each spectrum's own RV):
+- Each spectrum's own RV measured independently and reasonably (-3.97
+  and -4.45 km/s, from the same 4 named reference lines in both) --
+  confirms two independent measurements of the same real target agree at
+  the ~0.5 km/s level, consistent with real per-line scatter already
+  characterized in §13.
+- Order 0 (flagged bad in BOTH exposures, §15) correctly skipped and left
+  as A's own data, not combined -- combined count 34/35, matching "1
+  flagged bad in A, 1 flagged bad in B" (the same order in both, as
+  expected: it's a fixed detector defect, not per-exposure noise).
+- All 34 other orders matched 1:1 (both files share the same GRACES order
+  structure) at overlap=1.00 and combined successfully -- finite,
+  sane flux/error everywhere (no NaN/inf), median relative error on a
+  representative order improved from 1.87% (A alone) to 1.25% (combined)
+  -- a 1.51x improvement, close to (and, since the two exposures are not
+  perfectly equal quality, reasonably above) the sqrt(2)~1.41x expected
+  for two equal-quality co-added exposures.
+- Fallback path confirmed by deliberately displacing one B order out of
+  range: that order correctly falls back to "using A alone" (best
+  overlap 0.26 < the 0.5 minimum), combined count correctly drops to
+  33/35.
+- `plot=True` confirmed to write one non-blocking PNG per combined order
+  (34 files, no `plt.show()` blocking); visually, A and B track each
+  other closely (same real absorption features, well RV-aligned) and
+  A+B shows the expected ~2x continuum level with all line depths
+  preserved.
+
+## 17. Precise alignment and cosmic-ray/bad-pixel handling for `combine_spectra()`
+
+After reviewing the §16 before/after plot, the user raised two requirements
+that §16 did not yet address: (1) "ensuring the spectra are perfectly
+aligned before adding is of paramount importance" -- a residual mismatch
+between A and B injects noise/smearing into the co-add; (2) a general way
+to detect AND CORRECT cosmic rays/bad pixels -- both when a second
+exposure is available for cross-checking, and when only a SINGLE
+spectrum exists (explicit requirement: "not every star we analyze will
+have more than one spectrum"); and (3) any line whose measurement window
+contains a corrected pixel should be excluded from the linelist
+entirely, not just flagged.
+
+### 17.1 Alignment was NOT actually verified before this
+
+Direct answer to the user's question: no. §16's independent
+`apply_rv_shift()` on each spectrum gets each one close to its OWN rest
+frame, but nothing verified the two ended up mutually aligned. Confirmed
+this matters: two independent RV measurements of the same real star
+disagreed by ~0.5 km/s (§16, from real per-line measurement noise alone)
+-- a real several-mA residual mismatch at optical wavelengths.
+
+New `combine.measure_order_alignment()`: a fine, direct cross-correlation
+between A and B's own overlapping NORMALIZED flux (not raw -- removes
+each exposure's own absolute throughput level), reusing the existing
+`parabolic_refine()` sub-pixel machinery. Distinct from (and more precise
+than) trusting either spectrum's own independent RV, since it compares
+the two spectra directly over many points at once rather than inheriting
+either one's own per-line noise. Measured directly on the real Theia
+456-6 pair: residuals of 5-29 mA across different orders (order 15's own
+cross-correlation chi^2 improved 8x, 0.00524->0.00065, confirming this is
+a real, measurable improvement, not fitting noise). `combine_spectra()`
+now measures this per matched order pair and applies it to B's wavelength
+query before interpolating (`align=True` by default; warns above
+`align_warn_threshold`, default 0.05 A, comfortably above every residual
+confirmed normal on real data).
+
+### 17.2 Single-spectrum spike detection: `detect_spikes()`/`correct_spikes()`
+
+Needed to work with NO second exposure, per the user's explicit
+requirement. Two sigma-based designs were tried and rejected on real
+data before landing on a factor-based one -- both failure modes are
+documented in `outlier_check.py`'s docstring in detail, summarized here:
+(1) comparing each point to a local window's median-absolute-deviation
+badly UNDER-estimated the true noise inside any real large-scale slope,
+since a short window straddling real curvature has an artificially small
+point-to-point MAD -- false-flagged ordinary, smooth Keck continuum
+points at up to ~250x their true significance. (2) Comparing to the
+spectrum's own theoretical Poisson error (`obs_err`) fared even worse:
+real, genuinely RESOLVED spectral structure (a real continuum peak
+between two blended lines, or a real sky-emission line) routinely varies
+pixel-to-pixel by many sigma of pure photon noise over just a few
+pixels -- confirmed directly on real Keck data (a smooth, symmetric,
+several-pixel-wide bump, visually indistinguishable in shape from a real
+line) and on the real GRACES 5577 A sky-emission-line case (a genuinely
+resolved feature, not a defect) -- neither test can tell a modest real
+feature from a modest defect using shape/statistics alone.
+
+A simple **ratio to a tight (5-point) local median** can, because on
+every real spectrum checked (Keck, both GRACES formats, MAROON-X, the
+real GRACES sky-emission line) this ratio never exceeds ~1.6x, while the
+real defect motivating `check_bad_orders()` (§15) reaches 5.5-126x at
+the same window size -- confirmed via full-spectrum regression, zero
+false positives anywhere in this project's validated test set.
+`detect_spikes()` (`outlier_check.py`) implements this; deliberately
+only catches EXTREME, unambiguous cases (the user's own framing:
+"strong spikes") -- a moderate, ambiguous excursion (like the real
+5577 A line, ratio ~1.2-1.25x) is deliberately left for the two-exposure
+comparison below, which can resolve the ambiguity with a second,
+independent measurement instead of guessing from shape alone.
+`Spectrum_Data.correct_spikes()` runs this per order, REPLACES (not just
+flags) each affected point with its local median, recomputes `obs_err`
+there, and records the wavelength in the new
+`self.corrected_pixel_wavelengths` (same silent-no-op-until-called
+convention as every other `flag_*()`/`correct_*()` method; `skip_orders=`
+lets a caller exclude orders already handled by `flag_bad_orders()`).
+
+### 17.3 Cross-exposure spike detection: `check_cross_exposure_spikes()`
+
+When a second exposure IS available, far more sensitive detection is
+possible: compare what SHOULD be (for real absorption) two independent
+measurements of the same true signal directly. Two designs were tried
+and rejected before the final one, both documented in detail in
+`outlier_check.py`:
+
+1. A raw-flux difference test (`flux_A - flux_B_interp`, scaled by
+   propagated error) flagged nearly every point in the bluest orders --
+   root cause: A and B have genuinely different absolute continuum
+   levels (different nights' throughput), which a raw difference doesn't
+   account for at all.
+2. Switching to a NORMALIZED-flux difference (removes the throughput
+   issue) still over-flagged low-S/N blue orders by hundreds of points --
+   root cause: naive theoretical error underestimates true noise there
+   by up to 3x (the same effect `_empirical_noise_calibration()`, §12,
+   already exists to correct) -- and even after applying that
+   calibration, still over-flagged red orders by dozens of points each,
+   this time because two independently-noisy real spectra routinely
+   disagree by many sigma of pure photon noise at deep, narrow line
+   CORES from ordinary residual sub-pixel sampling differences (confirmed
+   directly: order 29's flagged points were all real line cores, with a
+   consistent, one-directional bias -- A always deeper than B at dozens
+   of unrelated lines, the signature of a real alignment/sampling effect,
+   not contamination).
+
+The fix: stop comparing the two spectra's DIFFERENCE at all. Instead,
+test each spectrum's own normalized flux against the CONTINUUM (1.0)
+independently -- a real absorption line can only ever push flux DOWN, so
+"significantly above 1.0" (using each spectrum's own calibrated relative
+error) is an unambiguous, physically-motivated excess signature
+regardless of local line density or alignment noise. Confirmed on real
+data: the known line-core mismatches show excess significance NEGATIVE
+(below continuum) in BOTH spectra and are correctly never flagged, while
+the real 5577 A and 6300 A [OI] auroral sky-emission lines show a clear,
+positive excess.
+
+An asymmetry requirement (flag only if one side is significant AND the
+other is not) was tried first, motivated by exactly this real-vs-defect
+distinction, but this LEFT THE WORST PART of real contamination
+uncorrected: a real sky line present in both exposures at different
+strength (confirmed on real data, order 27) shows comparably significant
+excess in BOTH spectra right at its peak, only becoming "asymmetric"
+toward its weaker edges -- the asymmetry gate correctly avoided real
+line-core noise but also skipped the CENTER of genuine contamination,
+catching only its edges (confirmed directly: the real 5577 A peak,
+~13,300 combined counts, was untouched by the asymmetry-gated version,
+only the flanking points at ~3,100-3,800 counts were corrected). Fixed:
+flag whenever EITHER side's excess significance clears the threshold (no
+asymmetry gate), always using the LOWER (less-contaminated) side's value
+-- safe because real absorption can never trigger a positive-excess test
+in either spectrum, so no real protection is lost, while the full extent
+of real contamination (not just its edges) is now corrected. Verified
+directly: order 15's combined peak dropped from ~13,300 (uncorrected sum)
+to a sane 7,156 counts (matching the higher of the two individual
+exposures' own contaminated values, not their sum) after this fix, with
+zero new false positives in the order-29 line-core region.
+
+Wired into `combine_spectra()` as `cross_exposure_check=True` (default),
+using the SAME per-order alignment residual from 17.1 so both checks
+operate on identically-defined points. A flagged point uses only the
+less-contaminated side's raw flux/error (not the sum) and is appended to
+`self.corrected_pixel_wavelengths`.
+
+### 17.4 Line exclusion for corrected pixels
+
+`check_for_flags()` extended with a new check: excludes (not just flags)
+any line whose rest wavelength falls within 0.1 A (matching
+`get_line_window()`'s own default search radius) of any wavelength in
+`self.corrected_pixel_wavelengths` -- populated by both
+`correct_spikes()` and `combine_spectra()`'s cross-exposure correction.
+Deliberately EXCLUDES rather than just flags, since the measurement at
+that point reflects a corrected, not originally observed, value.
+
+### 17.5 Final verification on the real Theia 456-6 pair
+
+- 693 total points cross-exposure-corrected across 35 orders (up from
+  103 with the rejected asymmetry-gated version) -- concentrated
+  overwhelmingly in the red orders (dozens to ~100 per order from order
+  25 onward), consistent with the well-known, dense real population of
+  OH airglow emission lines longward of ~7000 A; minimal in blue/mid
+  orders (0-4 points each) where only the two confirmed [OI] auroral
+  lines and a few similar features appear.
+- All combined flux/error values finite (no NaN/inf) across every order;
+  `update_combined()` correctly restores both `self.flux` and
+  `self.obs_err`.
+- `check_for_flags()` integration confirmed: a synthetic line placed
+  within 0.1 A of a real corrected pixel is excluded with the correct
+  reason string; a clean line elsewhere is untouched.
+
+## 18. Interactive widget (`interactive.py`)
+
+Prior to this work, running xspect-ew meant driving `Spectrum_Data`
+directly from a Jupyter notebook -- no way to visually confirm each
+pipeline stage before moving to the next. Added `EWWidget`
+(`interactive.py`), a 4-stage step wizard -- Load, Normalize, RV Shift,
+Measure EW -- built entirely from `matplotlib.widgets`
+(Slider/Button/TextBox), mirroring the architecture already established
+in `SPAE/moog/interactive.py`'s `SynthWidget`: manual `fig.add_axes()`
+figure-fraction layout, no separate GUI framework, so the identical code
+opens as a standalone window from a terminal script or embeds in a
+Jupyter cell via `%matplotlib widget`. Launch via `ew_interactive(...)`.
+
+Every stage calls the same `Spectrum_Data` methods an automated script
+would call -- `normalize()`/`normalize_all()`, `apply_rv_shift()`,
+`measure_ew()` -- so the widget is a thin, optional layer on the one
+shared pipeline API, not a second code path:
+
+- **Load**: confirms order count, wavelength coverage, and linelist size;
+  plots every order's raw flux for a first visual sanity check.
+- **Normalize**: per-order continuum overlay (raw flux + AsLS fit) with
+  live `lam`/`p` sliders (`normalize()` re-fits just the current order on
+  each change) and an "Apply to ALL orders" button (`normalize_all()`).
+- **RV Shift**: runs `apply_rv_shift()` on first entry, displays the
+  measured RV (with its named-line/linelist-cross-check warning text, if
+  any -- see §13), and lets the user toggle the current order's display
+  between observed and rest-frame wavelength, remeasure, or type in a
+  manual RV override.
+- **Measure EW**: pages through loaded lines; for each, locates the
+  covering order and calls `measure_ew(..., axes=(fit_view, data_view))`
+  to draw directly into the widget's persistent axes. Sliders expose
+  `measure_ew()`'s own `ex_params` (continuum shift, left/right bound,
+  center) for live manual adjustment.
+
+**Refactor required first**: `measure_ew()`'s ~50-line inline plotting
+block was extracted into a new pure-drawing function, `plot_ew_fit()`
+(`plotting.py`), which either creates a new figure (`axes=None`,
+preserving `measure_ew()`'s original `plot=True` behavior exactly) or
+clears and redraws into a caller-supplied `(fit_view, data_view)` axes
+pair (the new capability the widget needs). This was done deliberately
+as a black-box wrapper -- the widget's EW stage does not depend on any
+of `measure_ew()`'s internal fitting logic, only on the `axes=` parameter
+and the array shapes it already produces, since that fitting logic is
+expected to keep changing on the colleague's own branch.
+
+**Degenerate-fit guard**: some `ex_params` slider combinations (e.g. a
+center/bound shift narrow enough to leave too few points in the fit
+window) make `get_line_window()`'s downstream `np.gradient()` call raise
+outright (`ValueError: Shape of array too small...`), confirmed by
+smoke-testing every stage against `sunb.fits`. Since a slider drag must
+never crash the whole session, `_remeasure_ew()` catches any exception
+from `measure_ew()` and reports it in-place in the fit axes instead;
+resetting the sliders recovers cleanly (verified: EW measurement for Fe I
+4779.439/order 22 returns to ~40.3 +/- 0.5 mA, matching the established
+regression value, both before triggering the guard and after).
+
+Regression-tested all three `measure_ew()` call paths (`plot=False`
+no-op, `plot=True` original standalone-figure behavior, `axes=(...)`
+embedded behavior) against that same Fe I 4779.439/order 22/`sunb.fits`
+case -- all three agree on EW within GP-sampling noise.
+
+## 19. Merging `fix_ew_fitting`: new global/local-continuum `measure_ew()`
+
+Merged a colleague's parallel branch (`fix_ew_fitting`) into
+`pymoog-conversion` after committing the interactive-widget work above.
+Their rewrite replaced the old GP-based (`SEKernel`/`Pred_GP`) EW fit
+entirely with a direct weighted Gaussian fit (`gfit_direct`) plus an
+independent reference-atlas cross-check (`reference_atlas.py`,
+`load_reference_atlas()`), and introduced two parallel continuum
+treatments per line: a **global-continuum fit** (assumes the existing
+normalization already puts this window's continuum at 1.0 -- this is
+what `self.lines_ew` actually reports) and an optional **local-continuum
+diagnostic fit** (`fit_continuum=True`: estimate a flat local continuum
+from the line's own wing data and refit against that instead, kept only
+as a comparison value in `lines_ew_local`). `measure_ew()`'s plotting
+changed to match: two side-by-side panels, "Global continuum
+(REPORTED)" and "Local continuum (diagnostic only)".
+
+`spectrum_data.py` had 7 conflicting blocks against the interactive
+widget's own recent changes (imports, `obs_err`/`pred_all` init,
+`combine_spectra()`'s redesigned body, `measure_ew()`'s signature and
+its plotting tail). Resolved by taking main's side for the EW-fitting
+rewrite itself (imports, init bugfixes, `measure_ew()`, the new
+`load_reference_atlas()` method) while keeping this branch's
+`combine_spectra()` redesign (§16-17) and `bad_order_ranges`/
+`corrected_pixel_wavelengths` state intact -- confirmed via `grep` that
+main's own `combine_spectra()` on that side was the pre-redesign
+nearest-neighbor version this branch had already superseded, not a
+competing rewrite.
+
+**`axes=` re-integration**: the merge dropped `measure_ew()`'s `axes=`
+parameter (and `plotting.py`'s `plot_ew_fit()` helper) that
+`interactive.EWWidget`'s EW stage (§18) depends on to draw into its own
+persistent figure rather than popping up a new one every remeasurement.
+Rather than resolve this inside the merge itself, took main's plotting
+code as-is first to get a clean, working `measure_ew()`, then reapplied
+the same black-box wrapper strategy as §18 as a separate follow-up:
+`plot_ew_fit()` was rewritten to draw the new Global/Local two-panel
+layout, still either into a new figure (`axes=None`, unchanged
+`plot=True` behavior) or into a caller-supplied `(fit_view, local_view)`
+pair (cleared first) -- folding the order/flagged title into the left
+panel when embedded, since an embedded figure has no `fig.suptitle` of
+its own to use. `measure_ew()` regained `axes=None`, forwarded through
+the `auto_widen` retry call; plotting now runs whenever `plot=True` OR
+`axes is not None`, and `show_plot`/`plt.show()`/`plt.close()` are
+skipped whenever `axes` is supplied, matching §18's original contract.
+Smoke-tested `plot_ew_fit()` directly (synthetic line profile, `Agg`
+backend) in all three combinations (`axes=None`/flagged,
+`axes=(ax1,ax2)`/`fit_continuum=False` placeholder panel,
+`axes=(ax1,ax2)`/flagged) -- all draw without error.
+
+**Full widget regression, `test_ew_widget_sunb.py` (`/tmp`, not under
+version control)**: end-to-end drive of `EWWidget` against the bundled
+`sunb.fits` + `Sun_fe_sample.txt` (`Agg` backend, no real display) --
+Stage 1's `normalize_all()`/per-order refit/Apply-to-ALL, Stage 2's
+`apply_rv_shift()` (correctly preferred the cross-correlation RV over
+the disagreeing named-line RV here) and manual override, and Stage 3
+stepping through all 78 linelist lines (75 fall outside this
+spectrum's 3643-4795 A coverage, exercising the "no order covers this
+line" path; the 3 in-range lines -- Fe I 4779.439/4788.757, Fe II
+4620.521 -- measured real EWs of 40.4/66.6/54.3 mA) plus slider-driven
+`ex_params` changes, all run with zero exceptions. Rendered Stage 4 to
+PNG and visually confirmed both the default (`fit_continuum=False`,
+widget's own path) and `fit_continuum=True` (called directly, since
+the widget itself doesn't expose that flag) panel layouts populate
+correctly, including the local-continuum estimate line on the right
+panel.
+
+## 20. Commit reference
 
 | Commit | Summary |
 |---|---|
@@ -1157,3 +1633,6 @@ two-step framing of this question.
 | `0a08008` | Recalibrate `lam`; add density-severity signal; empirical noise calibration |
 | `e6d016d` | Cross-order overlap check; EW-flagging integration |
 | `0dd202c` | Line identification (§12); RV linelist cross-check and wavelength-shift sign fix (§13) |
+| `802cf66` | Add interactive `EWWidget` (§18) |
+| `5905744` | Merge `fix_ew_fitting` (new global/local-continuum `measure_ew()`) (§19) |
+| `a00c5d5` | Re-integrate `axes=` support into the merged `measure_ew()`/`plot_ew_fit()` (§19) |
