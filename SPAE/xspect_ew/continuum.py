@@ -476,6 +476,17 @@ def fit_als_continuum(wave, flux, err, lam=2e3, p=0.01, n_iter=15, adaptive=True
         # in the reported continuum. A near no-op for sqrt(counts)-style
         # err (Keck/GRACES), which is already smooth at continuum level.
         if L > 4:
+            # Pixels a reader marked unusable (error inflated ~1e3x after
+            # interpolating over them -- readers._read_ghost()/_read_apf())
+            # carry no information about the continuum's noise: interpolate
+            # their noise from good neighbours first. Clustered at an order
+            # edge (APF), they otherwise survive the running median and put
+            # the continuum tens of times above the data there.
+            unusable = err > 100.0 * np.median(err)
+            if unusable.any() and not unusable.all():
+                err_at_continuum = err_at_continuum.copy()
+                err_at_continuum[unusable] = np.interp(wave[unusable], wave[~unusable],
+                                                       err_at_continuum[~unusable])
             dx = (wave[-1] - wave[0]) / (L - 1)
             smooth_pts = max(int(round(local_window / dx)), 1) | 1
             err_at_continuum = median_filter(err_at_continuum, size=smooth_pts, mode='nearest')

@@ -31,6 +31,13 @@ from .reference_atlas import (load_reference_atlas as _load_reference_atlas,
                                estimate_resolving_power, reference_continuum_mask)
 
 
+# combine_spectra(): a pixel whose error exceeds this multiple of its order's
+# median is treated as unusable on that side -- the readers inflate
+# interpolated (DQ-flagged/zeroed) pixels' errors 1e3x (readers._read_ghost(),
+# readers._read_apf()), far above any real pixel's.
+_BAD_PIXEL_ERR_RATIO = 100.0
+
+
 class Spectrum_Data():
     def __init__(self, filename, KECK_file = True, spectx=False, specty=False, order_split = (False,3500),
                  instrument = 'auto', custom_reader = None, **reader_kwargs):
@@ -59,6 +66,10 @@ class Spectrum_Data():
         self.filename = filename
         self.gain = None
         reader_err = None
+        #per-order continuum supplied by the FILE itself (e.g. the summed
+        #continuum written with a combine_epochs() result) -- normalize_all()
+        #uses it instead of fitting; None for every ordinary spectrum
+        self.file_continuum = None
         #reader format name ('ghost', 'keck_hires', ...) -- selects
         #per-format normalize_all() defaults (FORMAT_NORMALIZE_DEFAULTS)
         self.instrument = None
@@ -70,9 +81,9 @@ class Spectrum_Data():
         if KECK_file:
             self.instrument = detect_format(filename, instrument=instrument,
                                             custom_reader=custom_reader)
-            self.wavelength, self.flux, self.gain, reader_err = read_spectrum(
+            self.wavelength, self.flux, self.gain, reader_err, self.file_continuum = read_spectrum(
                 filename, instrument=instrument, custom_reader=custom_reader,
-                return_err=True, **reader_kwargs)
+                return_err=True, return_continuum=True, **reader_kwargs)
             if self.instrument == 'apf':
                 self.barycentric_correction = apf_barycentric_correction(
                     filename, coord=reader_kwargs.get('coord'))
@@ -436,12 +447,17 @@ class Spectrum_Data():
         return settings, merged
 
     def normalize_all(self, lam = None, p = None, n_iter = None, adaptive = None,
-                      merged = None, **als_kwargs):
+                      merged = None, use_file_continuum = True, **als_kwargs):
         """
         Fit and divide out the continuum of every order. Unset arguments
         fall back to this spectrum's format defaults (see
         _normalize_settings()), then to lam=2e3, p=0.01, n_iter=15,
         adaptive=True.
+
+        use_file_continuum : if the file supplied its own continuum
+            (self.file_continuum -- e.g. a combine_epochs() result written
+            with its summed continuum), divide by that instead of fitting;
+            False forces a fit.
 
         merged : if True, the "orders" are artificial chunks of ONE merged
             spectrum (e.g. GHOST/DRAGONS; see readers._read_ghost()) -- the
@@ -450,6 +466,15 @@ class Spectrum_Data():
             introduces a continuum discontinuity. Defaults to the format's
             setting (True for 'ghost', False otherwise).
         """
+        if use_file_continuum and getattr(self, 'file_continuum', None) is not None:
+            for i in range(len(self.flux)):
+                self.pred_all[i] = np.asarray(self.file_continuum[i], dtype=float)
+                self.normalized_flux[i] = np.asarray(self.flux[i]) / self.pred_all[i]
+                self.continuum[i] = np.asarray(self.flux[i]) >= self.pred_all[i]
+            print('normalize_all(): using the continuum supplied by the file '
+                  '(use_file_continuum=False to fit one instead)')
+            return None
+
         settings, use_merged = self._normalize_settings(
             lam=lam, p=p, n_iter=n_iter, adaptive=adaptive, merged=merged, **als_kwargs)
         if use_merged:
@@ -739,6 +764,20 @@ class Spectrum_Data():
            widest auto-widened fit window (widen_window_size=2.5 A, i.e.
            +/-1.25 A) around a line centre found up to 0.1 A off the
            rest wavelength.
+        10. Summed continuum: the combined continuum is pred_A + pred_B
+           (each spectrum's own normalize_all() fit, B's shifted with it;
+           A's alone where B doesn't reach), stored in combined_pred and
+           installed as pred_all by update_combined(). The sum is never
+           re-fitted: at the sum's higher S/N, fit_als_continuum()'s
+           noise-scaled down-weighting of below-continuum points leaves
+           line-dense stretches with almost no weight, and with adaptive
+           stiffening the fit then ran away above the data (confirmed on
+           18 summed APF exposures: 2-7x too high over the blue half of
+           most orders, while every single-exposure fit was fine).
+        11. A pixel unusable on ONE side -- its error inflated more than
+           _BAD_PIXEL_ERR_RATIO x that order's median (the readers' marker
+           for interpolated DQ-flagged/zeroed pixels) -- takes the other
+           side alone, rescaled to the summed continuum as in point 8.
 
         Parameters
         ----------
@@ -784,7 +823,10 @@ class Spectrum_Data():
 
         combined_flux = np.empty(len(self.flux), dtype=object)
         combined_err = np.empty(len(self.flux), dtype=object)
+        combined_pred = np.empty(len(self.flux), dtype=object)
+        combined_pred_var = np.empty(len(self.flux), dtype=object)
         n_combined = 0
+        n_bad_px_replaced = 0
         n_cross_corrected = 0
         n_lines_dropped = 0
         n_lines_excluded = 0
@@ -818,6 +860,7 @@ class Spectrum_Data():
 
             if i in bad_A:
                 combined_flux[i], combined_err[i] = flux_A, err_A
+                combined_pred[i], combined_pred_var[i] = self.pred_all[i], self.pred_var_all[i]
                 self.combine_debug.append({'order': i, 'other_order': None, 'wave': wave_A,
                                             'flux_A': flux_A, 'flux_B_aligned': None,
                                             'combined': flux_A})
@@ -839,6 +882,7 @@ class Spectrum_Data():
 
             if best_j is None or best_overlap < min_overlap_fraction:
                 combined_flux[i], combined_err[i] = flux_A, err_A
+                combined_pred[i], combined_pred_var[i] = self.pred_all[i], self.pred_var_all[i]
                 self.combine_debug.append({'order': i, 'other_order': None, 'wave': wave_A,
                                             'flux_A': flux_A, 'flux_B_aligned': None,
                                             'combined': flux_A})
@@ -874,6 +918,31 @@ class Spectrum_Data():
             cflux, cerr = flux_A.copy(), err_A.copy()
             cflux[in_range] = flux_A[in_range] + flux_B_interp
             cerr[in_range] = np.sqrt(err_A[in_range]**2 + err_B_interp**2)
+
+            # point 10: the continuum of A+B is pred_A + pred_B (A alone
+            # wherever B doesn't reach)
+            pred_A = np.asarray(self.pred_all[i], dtype=float)
+            pred_B_q = interp1d(wave_B, spectB.pred_all[best_j], kind='linear')(query)
+            cpred = pred_A.copy()
+            cpred[in_range] = pred_A[in_range] + pred_B_q
+            cpred_var = np.asarray(self.pred_var_all[i], dtype=float).copy()
+            cpred_var[in_range] += interp1d(wave_B, spectB.pred_var_all[best_j], kind='linear')(query)
+
+            # point 11: a pixel unusable on ONE side (reader-interpolated,
+            # error inflated) takes the other side alone, rescaled to the
+            # summed continuum -- otherwise the quadrature sum inherits the
+            # inflated error and one bad exposure blanks that pixel for all
+            combo_idx = np.where(in_range)[0]
+            bad_px_A = err_A[in_range] > _BAD_PIXEL_ERR_RATIO * np.median(err_A)
+            bad_px_B = err_B_interp > _BAD_PIXEL_ERR_RATIO * np.median(err_B)
+            only_B, only_A = bad_px_A & ~bad_px_B, bad_px_B & ~bad_px_A
+            scale_B = cpred[in_range] / pred_B_q
+            scale_A = cpred[in_range] / pred_A[in_range]
+            cflux[combo_idx[only_B]] = flux_B_interp[only_B] * scale_B[only_B]
+            cerr[combo_idx[only_B]] = err_B_interp[only_B] * scale_B[only_B]
+            cflux[combo_idx[only_A]] = flux_A[in_range][only_A] * scale_A[only_A]
+            cerr[combo_idx[only_A]] = err_A[in_range][only_A] * scale_A[only_A]
+            n_bad_px_replaced += int(only_A.sum() + only_B.sum())
 
             if cross_exposure_check:
                 cx_in_range, cx_bad, cx_a_higher = _check_cross_exposure_spikes(
@@ -973,6 +1042,7 @@ class Spectrum_Data():
                               f"inside whole-line drops)")
 
             combined_flux[i], combined_err[i] = cflux, cerr
+            combined_pred[i], combined_pred_var[i] = cpred, cpred_var
             n_combined += 1
             if verbose:
                 print(f"order {i}: combined with B order {best_j} (overlap={best_overlap:.2f})")
@@ -997,18 +1067,31 @@ class Spectrum_Data():
 
         self.combined_flux = combined_flux
         self.combined_err = combined_err
+        self.combined_pred = combined_pred
+        self.combined_pred_var = combined_pred_var
         print(f"combine_spectra(): combined {n_combined}/{len(self.flux)} orders "
               f"({len(bad_A)} flagged bad in A, {len(bad_B)} flagged bad in B, "
               f"{n_cross_corrected} point(s) cross-exposure-corrected per pixel, "
               f"{n_lines_dropped} line(s) taken from one spectrum only, "
-              f"{n_lines_excluded} line(s) contaminated in both and excluded)")
+              f"{n_lines_excluded} line(s) contaminated in both and excluded, "
+              f"{n_bad_px_replaced} pixel(s) unusable on one side taken from the other)")
         print('Use self.update_combined() when you are happy with the combined flux/error '
               'to override self.flux/self.obs_err.')
         return n_combined
 
     def update_combined(self):
+        """Make the last combine_spectra() result this spectrum's own flux/
+        obs_err -- and its continuum: pred_all becomes the summed continuum
+        (combine_spectra() point 10) and normalized_flux is recomputed from
+        it, so no refit of the high-S/N sum is needed."""
         self.flux = self.combined_flux
         self.obs_err = self.combined_err
+        if getattr(self, 'combined_pred', None) is not None:
+            for i in range(len(self.flux)):
+                self.pred_all[i] = np.asarray(self.combined_pred[i], dtype=float)
+                self.pred_var_all[i] = np.asarray(self.combined_pred_var[i], dtype=float)
+                self.normalized_flux[i] = np.asarray(self.flux[i]) / self.pred_all[i]
+                self.continuum[i] = np.asarray(self.flux[i]) >= self.pred_all[i]
 
     def estimate_shift(self, sun_spectra, shift_max = 5, shift_min = -5, shift_spacing = 100, verbose = False):
         """

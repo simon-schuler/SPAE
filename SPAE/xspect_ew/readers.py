@@ -191,6 +191,12 @@ def _read_graces_intensity(hdul, **kwargs):
 
 _TABLE_WAVE_NAMES = ['wave', 'wavelength']
 _TABLE_FLUX_NAMES = ['flux', 'counts']
+# optional 1-sigma flux error column (returned via read_spectrum(return_err=True))
+_TABLE_ERR_NAMES = ['err', 'error', 'sigma', 'flux_err']
+# optional continuum column (read_spectrum(return_continuum=True)) -- e.g. the
+# summed continuum of a combine_epochs() result, which Spectrum_Data.
+# normalize_all() then uses instead of re-fitting
+_TABLE_CONT_NAMES = ['cont', 'continuum']
 
 
 def _table_hdus(hdul):
@@ -214,12 +220,26 @@ def _read_binary_table(hdul, **kwargs):
     print(f"Detected FITS binary-table format -- wavelength column '{wave_name}', "
           f"flux column '{flux_name}' ({len(tables)} order/extension(s))")
 
+    def optional(candidates):
+        return next((tables[0].columns.names[i] for i, n in enumerate(names)
+                     if n in candidates), None)
+    err_name, cont_name = optional(_TABLE_ERR_NAMES), optional(_TABLE_CONT_NAMES)
+
     wavelength = np.empty(len(tables), dtype=object)
     flux = np.empty(len(tables), dtype=object)
+    err = np.empty(len(tables), dtype=object) if err_name else None
+    cont = np.empty(len(tables), dtype=object) if cont_name else None
     for i, t in enumerate(tables):
         wavelength[i] = np.asarray(t.data[wave_name], dtype=float)
         flux[i] = np.asarray(t.data[flux_name], dtype=float)
-    return wavelength, flux, None
+        if err_name:
+            err[i] = np.asarray(t.data[err_name], dtype=float)
+        if cont_name:
+            cont[i] = np.asarray(t.data[cont_name], dtype=float)
+    for label, name in (('errors', err_name), ('continuum', cont_name)):
+        if name:
+            print(f"  {label} from column '{name}'")
+    return wavelength, flux, None, err, cont
 
 
 # ---------------------------------------------------------------------------
@@ -801,7 +821,8 @@ def detect_format(filename, instrument='auto', custom_reader=None):
     return None
 
 
-def read_spectrum(filename, instrument='auto', custom_reader=None, return_err=False, **kwargs):
+def read_spectrum(filename, instrument='auto', custom_reader=None, return_err=False,
+                  return_continuum=False, **kwargs):
     """
     Read a spectrum file, auto-detecting its format.
 
@@ -817,24 +838,35 @@ def read_spectrum(filename, instrument='auto', custom_reader=None, return_err=Fa
         are object arrays of per-order ndarrays (Angstrom, counts).
     return_err : if True, also return per-order 1-sigma flux errors (the
         fourth element) -- only formats that ship a real error/variance
-        array provide one (currently 'ghost', 'apf'); None otherwise, in which case
+        array provide one (currently 'ghost', 'apf', and 'fits_table' with an
+        err/error/sigma/flux_err column); None otherwise, in which case
         callers fall back to their own sqrt(flux) estimate. False (default)
         keeps the original 3-tuple return for existing callers.
+    return_continuum : if True, also return a per-order continuum the FILE
+        supplies (currently 'fits_table' with a cont/continuum column), or
+        None -- after err if return_err is also True.
 
     Returns
     -------
     wavelength, flux : object arrays of per-order ndarrays
     gain : ndarray or None
     err : object array of per-order ndarrays, or None -- only if return_err
+    continuum : object array of per-order ndarrays, or None -- only if
+        return_continuum
     """
     result = _read_spectrum_raw(filename, instrument=instrument,
                                 custom_reader=custom_reader, **kwargs)
-    result = tuple(result) + (None,) * (4 - len(result))
-    return result if return_err else result[:3]
+    result = tuple(result) + (None,) * (5 - len(result))
+    out = result[:3]
+    if return_err:
+        out += (result[3],)
+    if return_continuum:
+        out += (result[4],)
+    return out
 
 
 def _read_spectrum_raw(filename, instrument='auto', custom_reader=None, **kwargs):
-    """read_spectrum()'s dispatch; returns whatever tuple (2-4 elements) the
+    """read_spectrum()'s dispatch; returns whatever tuple (2-5 elements) the
     matched reader produced."""
     if custom_reader is not None:
         return custom_reader(filename, **kwargs)
