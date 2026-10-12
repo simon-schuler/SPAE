@@ -25,6 +25,8 @@ custom_reader= callable to read_spectrum()/Spectrum_Data() for a one-off
 format without editing this file at all.
 """
 
+import os
+
 import numpy as np
 from astropy.io import fits
 from scipy.ndimage import median_filter
@@ -613,6 +615,147 @@ def _read_ghost(hdul, ifu='auto', chunk_kms=5000.0, pad_kms=200.0, **kwargs):
 
 
 # ---------------------------------------------------------------------------
+# FITS: Lick APF (Automated Planet Finder), reduced r*.fits
+# ---------------------------------------------------------------------------
+# Verified against 18 real exposures of Gaia DR3 1125337614021152256
+# (2024-08 to 2026-05): a single 2D PrimaryHDU of extracted counts, 79
+# orders x 4608 px (float32, row 0 = bluest order, ~3730-10207 A), GAIN=1,
+# identified by VERSION='apf'. The file carries NO wavelength information
+# (no WCS keywords, no extension), so the wavelength comes from a STATIC
+# solution shipped with this package (data/apf_wavelength_solution.npz; see
+# its 'note' for provenance): text exports of those same 18 exposures were
+# all that one solution times (1 + BC/c), identical to 0.2 m/s across the
+# two years -- i.e. the reduction pipeline itself uses one fixed solution.
+#
+# Checked on the same data (per-order cross-correlation against the
+# Kurucz solar atlas, plus individual lines of known lab wavelength): orders
+# from 4300-6800 A agree to +/-0.4 km/s (~0.01 A) with a pattern that
+# repeats epoch to epoch to ~0.1 km/s, and the O2 telluric bands -- fixed on
+# the detector -- move by only ~0.4 km/s rms between epochs, so the
+# spectrograph itself didn't drift. Wavelengths are air (same frame as the
+# Kurucz atlas and this package's linelists). Below ~4300 A this star was
+# too faint to test, and the O I 7772-7775 A triplet sat 2-3 km/s off --
+# inconclusive (weak lines), but worth a look if it's in the linelist.
+#
+# "Prefer raw" (see module docstring): wavelengths are returned in the
+# OBSERVED frame by default; barycentric=True applies the correction
+# computed by apf_barycentric_correction(). Errors are sqrt(counts)
+# (GAIN=1, real counts).
+#
+# Pixels the reduction set to EXACTLY 0 (every file checked: ~600-2400 per
+# exposure, in short runs, up to ~11% of the faintest blue/red orders --
+# never real Poisson zeros, e.g. an order with median 115 counts had 228)
+# have flux linearly interpolated across them and error inflated to
+# _APF_BAD_ERR_FACTOR x the order's median error, as for GHOST's DQ-flagged
+# pixels: left at 0, they made fit_als_continuum() return NaN for the whole
+# order. Error-weighted EW fits then give them ~no weight. Ordinary
+# negative pixels (background-subtracted noise) are left as they are.
+
+_APF_SHAPE = (79, 4608)
+_APF_BAD_ERR_FACTOR = 1e3
+_APF_WAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              'data', 'apf_wavelength_solution.npz')
+# APF at Lick Observatory (astropy's 'Lick Observatory' site entry, fixed
+# here so the barycentric correction doesn't need astropy's online site
+# registry)
+_APF_LON_DEG, _APF_LAT_DEG, _APF_HEIGHT_M = -121.636667, 37.343333, 1290.0
+_apf_wave_cache = None
+
+
+def _apf_wavelength_solution():
+    global _apf_wave_cache
+    if _apf_wave_cache is None:
+        with np.load(_APF_WAVE_FILE) as d:
+            _apf_wave_cache = d['wave']
+    return _apf_wave_cache
+
+
+def apf_barycentric_correction(header, coord=None):
+    """
+    Barycentric velocity correction (km/s) for an APF exposure: add it to
+    a measured (observed-frame) velocity to get the barycentric RV, or
+    multiply observed wavelengths by (1 + BC/c).
+
+    header : the file's primary FITS header (or a filename).
+    coord : optional astropy SkyCoord for the target. Default: the
+        header's RA/DEC (telescope pointing; equinox not recorded, so a
+        precise J2000 position with proper motion is better if you need
+        RVs to better than ~0.1 km/s).
+
+    Uses the photon-weighted exposure midpoint (THEMIDPT) when present,
+    else DATE-OBS + EXPTIME/2.
+    """
+    from astropy.coordinates import SkyCoord, EarthLocation
+    from astropy.time import Time
+    import astropy.units as u
+
+    if isinstance(header, str):
+        header = fits.getheader(header)
+    if coord is None:
+        coord = SkyCoord(header['RA'], header['DEC'], unit=(u.hourangle, u.deg))
+    mid = str(header.get('THEMIDPT', '')).strip()
+    if mid:
+        t = Time(mid, scale='utc')
+    else:
+        t = Time(header['DATE-OBS'], scale='utc') + 0.5 * float(header['EXPTIME']) * u.s
+    site = EarthLocation.from_geodetic(lon=_APF_LON_DEG * u.deg, lat=_APF_LAT_DEG * u.deg,
+                                       height=_APF_HEIGHT_M * u.m)
+    return coord.radial_velocity_correction('barycentric', obstime=t,
+                                            location=site).to(u.km / u.s).value
+
+
+def _detect_apf(hdul):
+    h = hdul[0]
+    return (str(h.header.get('VERSION', '')).strip().lower() == 'apf'
+            and h.data is not None and h.data.ndim == 2)
+
+
+def _read_apf(hdul, barycentric=False, coord=None, **kwargs):
+    """
+    barycentric : if True, return barycentric-frame wavelengths (observed
+        x (1 + BC/c)); default False returns the observed frame.
+    coord : passed to apf_barycentric_correction() (only used when
+        barycentric=True).
+    """
+    header = hdul[0].header
+    flux = np.asarray(hdul[0].data, dtype=float)
+    if flux.shape != _APF_SHAPE:
+        raise SpectrumFormatError(
+            f"APF file has shape {flux.shape}, but the shipped static wavelength "
+            f"solution is for {_APF_SHAPE} (orders x pixels) -- this file comes "
+            f"from a different reduction/extraction, so that solution can't be "
+            f"applied to it. Supply wavelengths another way (e.g. "
+            f"Spectrum_Data(..., KECK_file=False, spectx=..., specty=...)).")
+    wave = _apf_wavelength_solution().copy()
+    frame = 'observed frame'
+    if barycentric:
+        bc = apf_barycentric_correction(header, coord=coord)
+        wave = wave * (1.0 + bc / _C_KMS)
+        frame = f'barycentric frame (BC = {bc:+.3f} km/s applied)'
+    gain = np.full(_APF_SHAPE[0], float(header.get('GAIN', 1.0)))
+
+    wavelength = np.empty(_APF_SHAPE[0], dtype=object)
+    flux_out = np.empty(_APF_SHAPE[0], dtype=object)
+    err_out = np.empty(_APF_SHAPE[0], dtype=object)
+    n_bad = 0
+    for i in range(_APF_SHAPE[0]):
+        f = flux[i].copy()
+        bad = (f == 0) | ~np.isfinite(f)
+        err = np.maximum(np.sqrt(np.abs(np.where(bad, 0.0, f)) * gain[i]) / gain[i], 1.0)
+        if bad.any() and not bad.all():
+            f[bad] = np.interp(wave[i][bad], wave[i][~bad], f[~bad])
+            err[bad] = _APF_BAD_ERR_FACTOR * np.median(err[~bad])
+            n_bad += int(bad.sum())
+        wavelength[i], flux_out[i], err_out[i] = wave[i], f, err
+
+    print(f"Detected Lick APF format -- {header.get('OBJECT', '?')}, "
+          f"{header.get('DATE-OBS', '?')}, {_APF_SHAPE[0]} orders x {_APF_SHAPE[1]} px; "
+          f"wavelengths from the shipped static APF solution, {frame}; "
+          f"interpolated over {n_bad} zeroed px")
+    return wavelength, flux_out, gain, err_out
+
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
@@ -620,6 +763,7 @@ _FITS_FORMATS = [
     (_detect_graces, _read_graces, 'graces'),
     (_detect_graces_intensity, _read_graces_intensity, 'graces_intensity'),
     (_detect_ghost, _read_ghost, 'ghost'),
+    (_detect_apf, _read_apf, 'apf'),
     (_detect_keck_makee, _read_keck_makee, 'keck_hires'),
     (_detect_binary_table, _read_binary_table, 'fits_table'),
 ]
@@ -628,6 +772,7 @@ _NAMED_READERS = {
     'graces': _read_graces,
     'graces_intensity': _read_graces_intensity,
     'ghost': _read_ghost,
+    'apf': _read_apf,
     'keck_hires': _read_keck_makee,
     'fits_table': _read_binary_table,
     'maroonx': _read_maroonx,
@@ -664,15 +809,15 @@ def read_spectrum(filename, instrument='auto', custom_reader=None, return_err=Fa
     ----------
     filename : str
     instrument : 'auto' (default) or one of 'graces', 'graces_intensity',
-        'ghost', 'keck_hires', 'fits_table', 'maroonx' to skip detection and
-        force a specific reader.
+        'ghost', 'apf', 'keck_hires', 'fits_table', 'maroonx' to skip
+        detection and force a specific reader.
     custom_reader : callable(filename, **kwargs) -> (wavelength, flux),
         (wavelength, flux, gain) or (wavelength, flux, gain, err), optional
         -- for a one-off format without editing this file. wavelength/flux
         are object arrays of per-order ndarrays (Angstrom, counts).
     return_err : if True, also return per-order 1-sigma flux errors (the
         fourth element) -- only formats that ship a real error/variance
-        array provide one (currently 'ghost'); None otherwise, in which case
+        array provide one (currently 'ghost', 'apf'); None otherwise, in which case
         callers fall back to their own sqrt(flux) estimate. False (default)
         keeps the original 3-tuple return for existing callers.
 

@@ -18,7 +18,8 @@ from .constants import ELEMENTS
 from .plotting import plot_line_info, plot_comparison_res
 from .combine import combine_files, combine_epochs
 from .io_utils import load_object
-from .readers import read_spectrum, SpectrumFormatError, load_maroonx_response, get_maroonx_bands
+from .readers import (read_spectrum, SpectrumFormatError, load_maroonx_response, get_maroonx_bands,
+                      apf_barycentric_correction)
 from .radial_velocity import measure_effective_rv, measure_rv_from_linelist, RV_REFERENCE_LINES
 from .response_correction import apply_response_correction
 from .overlap_check import check_order_overlaps, print_overlap_report, flagged_overlap_ranges

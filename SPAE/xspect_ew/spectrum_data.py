@@ -17,7 +17,8 @@ from .line_profile import (get_line_window, gauss_model, gfit_direct, gauss_ew, 
                             estimate_local_continuum_sloped, EW_K)
 from .combine import make_line, parabolic_refine, measure_order_alignment
 from .plotting import make_plots_folder, plot_ew_fit
-from .readers import read_spectrum, detect_format, FORMAT_NORMALIZE_DEFAULTS
+from .readers import (read_spectrum, detect_format, FORMAT_NORMALIZE_DEFAULTS,
+                      apf_barycentric_correction)
 from .radial_velocity import measure_effective_rv, measure_rv_ccf, C_KMS
 from .response_correction import apply_response_correction as _apply_response_correction
 from .overlap_check import check_order_overlaps as _check_order_overlaps
@@ -45,13 +46,15 @@ class Spectrum_Data():
                 if using order_split:
                     input format: [x1,x2,x3,...]
             instrument - 'auto' (default), or force a specific reader by name
-                ('graces', 'keck_hires', 'fits_table', 'maroonx') -- see
-                readers.read_spectrum(). Only used when KECK_file=True.
+                ('graces', 'graces_intensity', 'ghost', 'apf', 'keck_hires',
+                'fits_table', 'maroonx') -- see readers.read_spectrum(). Only
+                used when KECK_file=True.
             custom_reader - callable(filename, **kwargs) -> (wavelength, flux)
                 or (wavelength, flux, gain), for a one-off format not yet
                 recognized by readers.py. Only used when KECK_file=True.
             reader_kwargs - passed through to the reader (e.g. fiber=... for
-                MAROON-X to override the assumed science fiber).
+                MAROON-X to override the assumed science fiber, or
+                barycentric=True / coord=SkyCoord(...) for APF).
         """
         self.filename = filename
         self.gain = None
@@ -59,12 +62,23 @@ class Spectrum_Data():
         #reader format name ('ghost', 'keck_hires', ...) -- selects
         #per-format normalize_all() defaults (FORMAT_NORMALIZE_DEFAULTS)
         self.instrument = None
+        #barycentric correction (km/s; add to an observed-frame velocity
+        #for the barycentric RV) and whether the reader already applied it
+        #to self.wavelength -- None where the format doesn't say
+        self.barycentric_correction = None
+        self.barycentric_applied = None
         if KECK_file:
             self.instrument = detect_format(filename, instrument=instrument,
                                             custom_reader=custom_reader)
             self.wavelength, self.flux, self.gain, reader_err = read_spectrum(
                 filename, instrument=instrument, custom_reader=custom_reader,
                 return_err=True, **reader_kwargs)
+            if self.instrument == 'apf':
+                self.barycentric_correction = apf_barycentric_correction(
+                    filename, coord=reader_kwargs.get('coord'))
+                self.barycentric_applied = bool(reader_kwargs.get('barycentric', False))
+            elif self.instrument == 'ghost':
+                self.barycentric_applied = True   # by DRAGONS, see readers._read_ghost()
         else:
             #split input array into orders
             if order_split[0]:
