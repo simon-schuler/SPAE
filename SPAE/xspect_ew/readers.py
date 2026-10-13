@@ -657,6 +657,19 @@ def _read_ghost(hdul, ifu='auto', chunk_kms=5000.0, pad_kms=200.0, **kwargs):
 # too faint to test, and the O I 7772-7775 A triplet sat 2-3 km/s off --
 # inconclusive (weak lines), but worth a look if it's in the linelist.
 #
+# Order-edge error (found 2026-10-12, after the check above, which averaged
+# over whole orders and so missed it): the pipeline's static solution is
+# wrong over roughly the bluest 20-40% of every order -- ~-5 km/s at the
+# first pixel (up to -10 km/s), fading to 0 by ~40% -- with a small dip at
+# the red end. It is fixed in (order, pixel): all 18 exposures trace the
+# same curve to ~0.1 km/s rms over 21 months. Since measure_ew() searches
+# only +/-0.1 A for a line's centre, an offset past that silently fits the
+# wrong feature (Fe II 7711.7 A: -9.4 km/s, half its EW). The shipped npz
+# therefore carries a CORRECTED solution (per-order spline measured against
+# the Kurucz solar atlas and adjacent-order overlaps, telluric bands masked)
+# plus each order's calibrated pixel range; orders or edges that couldn't be
+# calibrated are trimmed. See data/derive_apf_wavelength_solution.py.
+#
 # "Prefer raw" (see module docstring): wavelengths are returned in the
 # OBSERVED frame by default; barycentric=True applies the correction
 # computed by apf_barycentric_correction(). Errors are sqrt(counts)
@@ -683,10 +696,17 @@ _apf_wave_cache = None
 
 
 def _apf_wavelength_solution():
+    """(corrected wave, static wave, valid_lo, valid_hi) from the shipped
+    npz -- see data/derive_apf_wavelength_solution.py. An older file with
+    only 'wave' is the static solution with every pixel valid."""
     global _apf_wave_cache
     if _apf_wave_cache is None:
         with np.load(_APF_WAVE_FILE) as d:
-            _apf_wave_cache = d['wave']
+            if 'wave_static' in d:
+                _apf_wave_cache = (d['wave'], d['wave_static'], d['valid_lo'], d['valid_hi'])
+            else:
+                _apf_wave_cache = (d['wave'], d['wave'], np.zeros(_APF_SHAPE[0], int),
+                                   np.full(_APF_SHAPE[0], _APF_SHAPE[1] - 1))
     return _apf_wave_cache
 
 
@@ -730,12 +750,19 @@ def _detect_apf(hdul):
             and h.data is not None and h.data.ndim == 2)
 
 
-def _read_apf(hdul, barycentric=False, coord=None, **kwargs):
+def _read_apf(hdul, barycentric=False, coord=None, wavelength_solution='corrected',
+              trim_edges=True, **kwargs):
     """
     barycentric : if True, return barycentric-frame wavelengths (observed
         x (1 + BC/c)); default False returns the observed frame.
     coord : passed to apf_barycentric_correction() (only used when
         barycentric=True).
+    wavelength_solution : 'corrected' (default) -- the pipeline's static
+        solution with its order-edge error removed where it could be
+        measured -- or 'static', the pipeline's solution as is.
+    trim_edges : if True (default), keep only each order's calibrated
+        pixel range (valid_lo..valid_hi in the shipped npz): where the edge
+        correction couldn't be measured, those edges are dropped instead.
     """
     header = hdul[0].header
     flux = np.asarray(hdul[0].data, dtype=float)
@@ -746,7 +773,10 @@ def _read_apf(hdul, barycentric=False, coord=None, **kwargs):
             f"from a different reduction/extraction, so that solution can't be "
             f"applied to it. Supply wavelengths another way (e.g. "
             f"Spectrum_Data(..., KECK_file=False, spectx=..., specty=...)).")
-    wave = _apf_wavelength_solution().copy()
+    wave_corr, wave_static, valid_lo, valid_hi = _apf_wavelength_solution()
+    if wavelength_solution not in ('corrected', 'static'):
+        raise ValueError(f"wavelength_solution must be 'corrected' or 'static', got {wavelength_solution!r}")
+    wave = (wave_corr if wavelength_solution == 'corrected' else wave_static).copy()
     frame = 'observed frame'
     if barycentric:
         bc = apf_barycentric_correction(header, coord=coord)
@@ -766,11 +796,13 @@ def _read_apf(hdul, barycentric=False, coord=None, **kwargs):
             f[bad] = np.interp(wave[i][bad], wave[i][~bad], f[~bad])
             err[bad] = _APF_BAD_ERR_FACTOR * np.median(err[~bad])
             n_bad += int(bad.sum())
-        wavelength[i], flux_out[i], err_out[i] = wave[i], f, err
+        keep = slice(valid_lo[i], valid_hi[i] + 1) if trim_edges else slice(None)
+        wavelength[i], flux_out[i], err_out[i] = wave[i][keep], f[keep], err[keep]
 
     print(f"Detected Lick APF format -- {header.get('OBJECT', '?')}, "
           f"{header.get('DATE-OBS', '?')}, {_APF_SHAPE[0]} orders x {_APF_SHAPE[1]} px; "
-          f"wavelengths from the shipped static APF solution, {frame}; "
+          f"{wavelength_solution} APF wavelength solution, {frame}; "
+          f"{'orders trimmed to their calibrated pixel ranges; ' if trim_edges else ''}"
           f"interpolated over {n_bad} zeroed px")
     return wavelength, flux_out, gain, err_out
 
