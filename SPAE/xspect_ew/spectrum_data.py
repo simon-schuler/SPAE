@@ -230,6 +230,11 @@ class Spectrum_Data():
         #below where the unreliable clean_shift()-extrapolated positions
         #commonly landed (many 90-160 mA off in the same test).
         self.position_thresh = 0.07
+        #line - False makes check_for_flags()'s no-flat-continuum check a
+        #warning (reason recorded, written next to the line in the main
+        #linelist) instead of a rejection -- for a deliberately relaxed run
+        #on a line-rich star where nearly every wing is blended
+        self.flag_no_flat_continuum = True
         #line - X squared value above threshold or EW = 0
         self.lines_check_flag = None
         #line - human-readable reason(s) lines_check_flag was set, '' if not
@@ -1609,6 +1614,11 @@ class Spectrum_Data():
                     #silently indistinguishable from an uncontroversial line
                     doc.write(current_line.rstrip('\n') + '   # human-reviewed, kept despite: '
                               + self.lines_flag_reasons[i] + '\n')
+                elif self.lines_flag_reasons[i]:
+                    #a check that was relaxed to a warning (e.g.
+                    #flag_no_flat_continuum=False) -- kept, but noted
+                    doc.write(current_line.rstrip('\n') + '   # kept with warning: '
+                              + self.lines_flag_reasons[i] + '\n')
                 else:
                     doc.write(current_line)
             else:
@@ -2079,19 +2089,27 @@ class Spectrum_Data():
             #of the LAST check_for_flags() call -- for a plot generated
             #before that's been (re)run on this measurement, this is
             #whatever it was left at previously (default: unflagged/'')
-            fig, (fit_view, local_view) = plot_ew_fit(
+            plot_args = (
                 order, self.shifted_wavelength[order].min(), self.shifted_wavelength[order].max(),
                 self.lines[i], found_line, line_bound,
                 plot_x_array, plot_y_array, plot_err_array, plot_pred_array,
                 plot_points_within_norm, ex_params, norm,
                 bf_global, pcov_global, ew_global, ew_err_global,
-                fit_continuum, best_bf, pcov, cont_offset, ew, ew_err,
+                fit_continuum, best_bf, pcov, cont_offset, ew, ew_err)
+            fig, (fit_view, local_view) = plot_ew_fit(
+                *plot_args,
                 flagged=self.lines_check_flag[i], flag_reasons=self.lines_flag_reasons[i],
                 axes=axes)
 
             if save_plot:
                 fig_title = ELEMENTS[self.lines_exd[i][0]] + '_' + str(self.lines[i]) + '_' + str(order) + '.pdf'
                 fig.savefig('line_plots/'+fig_title)
+                #kept so annotate_line_plots() can redraw this plot with
+                #the line's final kept/rejected status once that's known
+                if getattr(self, 'saved_line_plots', None) is None:
+                    self.saved_line_plots = {}
+                self.saved_line_plots[(i, order)] = (
+                    os.path.abspath(os.path.join('line_plots', fig_title)), plot_args)
             if axes is None:
                 # caller-supplied axes (e.g. interactive.EWWidget) owns its
                 # own figure/redraw -- only show/block or close here in the
@@ -2111,7 +2129,7 @@ class Spectrum_Data():
                 self.lines_exp[i] = np.array(ex_params)
             print('extra params:',ex_params)
 
-    def measure_all_ew(self, exclude_lines= [], plot_lines=[], ex_params = {}, window_size = 1.5, save_all = False, fit_continuum = False, auto_widen = True, widen_window_size = 2.5, slope_sig_thresh = 3.0, slope_min_points = 5, slope_internal_sig_thresh = 3.0, plot_window_size = None):
+    def measure_all_ew(self, exclude_lines= [], plot_lines=[], ex_params = {}, window_size = 1.5, save_all = False, fit_continuum = False, auto_widen = True, widen_window_size = 2.5, slope_sig_thresh = 3.0, slope_min_points = 5, slope_internal_sig_thresh = 3.0, plot_window_size = None, min_edge_margin = None):
         """
         Measure every loaded line's EW.
 
@@ -2158,9 +2176,29 @@ class Spectrum_Data():
         continuum.py's edge_ignore_aa and its module docstring for a
         real confirmed case), so this is a real reliability choice, not
         just deduplication for its own sake.
+
+        min_edge_margin : Angstrom. An order is used for a line only if the
+            line's rest wavelength sits at least this far from both of the
+            order's ends, so the whole fit window fits inside it. Default:
+            half the widest window measure_ew() may use (widen_window_size
+            if auto_widen, else window_size) plus get_line_window()'s 0.1 A
+            centre search -- 1.35 A with the defaults. A line no order covers
+            with that margin is NOT measured (lines_ew stays 0, so it never
+            reaches make_ew_doc()'s output) and is listed in
+            self.lines_skipped_edge {line: best edge distance}. Before this,
+            such a line was fitted on a truncated window -- confirmed on a
+            trimmed APF order: Fe II 7222.394 sat 0.25 A from the order end,
+            the fit had 6 points redward vs 23 blueward and returned a
+            meaningless 146 mA.
         """
         if save_all:
             make_plots_folder()
+            self.saved_line_plots = {}
+
+        if min_edge_margin is None:
+            min_edge_margin = 0.5 * (max(window_size, widen_window_size) if auto_widen
+                                     else window_size) + 0.1
+        self.lines_skipped_edge = {}
 
         #running "best so far" edge-distance per line, for this call only
         #(not persisted -- self.lines_edge_distance below is the public,
@@ -2192,6 +2230,11 @@ class Spectrum_Data():
                     #is negligible against orders that are tens of A wide
                     edge_dist = min(self.lines[i] - self.shifted_wavelength[order][0],
                                      self.shifted_wavelength[order][-1] - self.lines[i])
+                    if edge_dist < min_edge_margin:
+                        # whole fit window doesn't fit in this order -- don't fit a truncated one
+                        self.lines_skipped_edge[self.lines[i]] = max(
+                            edge_dist, self.lines_skipped_edge.get(self.lines[i], -np.inf))
+                        continue
                     keep_result = edge_dist > best_edge_dist[i]
                     if keep_result:
                         best_edge_dist[i] = edge_dist
@@ -2211,7 +2254,65 @@ class Spectrum_Data():
                                          slope_sig_thresh=slope_sig_thresh, slope_min_points=slope_min_points,
                                          slope_internal_sig_thresh=slope_internal_sig_thresh, keep_result=keep_result,
                                          plot_window_size=plot_window_size)
+        # lines some order covered, but none with the margin: not measured at all
+        measured = {self.lines[i] for i in range(len(self.lines)) if np.isfinite(best_edge_dist[i])}
+        self.lines_skipped_edge = {l: d for l, d in self.lines_skipped_edge.items() if l not in measured}
+        for l, d in sorted(self.lines_skipped_edge.items()):
+            print(f'{l}: not measured -- at best {d:.2f} A from an order end, less than the '
+                  f'{min_edge_margin:.2f} A its fit window needs')
         #self.lines_bf_params = np.array(self.lines_bf_params)
+
+    def line_status(self, i, order=None):
+        """
+        The final outcome of line i as measured in `order` (default: the
+        order its EW came from), as (text, color) for a plot caption.
+
+        KEPT      -- in make_ew_doc()'s main linelist (also when a human
+                     review kept a flagged line; the reasons are noted)
+        REJECTED  -- flagged by check_for_flags(), so it goes to the
+                     _flagged linelist instead
+        NOT USED  -- this order's measurement was discarded because the
+                     line sits further from the edge of another order
+                     (measure_all_ew()'s order-overlap handling)
+        Reflects the last check_for_flags() call.
+        """
+        if order is not None and order != self.lines_order[i]:
+            return (f'NOT USED -- superseded by order {self.lines_order[i]}, where the line '
+                    f'sits further from the order edge', '#7f7f7f')
+        if self.lines_ew[i] == 0.0:
+            return 'NOT MEASURED -- no EW recorded for this line', '#7f7f7f'
+        ew = f'EW = {self.lines_ew[i]:.2f} ± {self.lines_ew_err[i]:.2f} mÅ'
+        if self.lines_check_flag[i]:
+            # the flag reasons themselves are on plot_ew_fit()'s FLAGGED line
+            return f'REJECTED ({ew}) -- flagged, goes to the _flagged linelist', '#e41a1c'
+        if self.lines_human_keep[i] and self.lines_flag_reasons[i]:
+            return (f'KEPT by human review ({ew}) despite a flag -- in the main linelist',
+                    '#ff7f00')
+        if self.lines_flag_reasons[i]:
+            return f'KEPT with warning ({ew}) -- in the main linelist (relaxed checks)', '#ff7f00'
+        return f'KEPT ({ew}) -- in the main linelist', '#4daf4a'
+
+    def annotate_line_plots(self):
+        """
+        Redraw every plot measure_all_ew(save_all=True) saved, with the
+        line's final status (line_status()) as the top caption. The plots
+        are first drawn while each line is being measured, before
+        check_for_flags() has run and before a later order can supersede
+        the measurement, so they can't show the outcome then. Calls
+        check_for_flags() itself. Returns the number of plots redrawn.
+        """
+        saved = getattr(self, 'saved_line_plots', None) or {}
+        if not saved:
+            return 0
+        self.check_for_flags()
+        for (i, order), (path, plot_args) in saved.items():
+            used = order == self.lines_order[i]
+            fig, _ = plot_ew_fit(*plot_args, flagged=used and bool(self.lines_flag_reasons[i]),
+                                 flag_reasons=self.lines_flag_reasons[i],
+                                 status=self.line_status(i, order))
+            fig.savefig(path)
+            plt.close(fig)
+        return len(saved)
 
     def measure_line_ew(self,line,ex_params=[0,0,0,0], save_line = False, save_plot = False, window_size = 1.5, fit_continuum = False, auto_widen = True, widen_window_size = 2.5, slope_sig_thresh = 3.0, slope_min_points = 5, slope_internal_sig_thresh = 3.0, plot_window_size = None):
         if save_plot:
@@ -2336,7 +2437,8 @@ class Spectrum_Data():
             #does not itself change lines_ew/lines_ew_err (the GLOBAL-
             #continuum fit, see measure_ew()).
             if self.lines_internal_trend_blue[i] and self.lines_internal_trend_red[i]:
-                self.lines_check_flag[i] = True
+                if getattr(self, 'flag_no_flat_continuum', True):
+                    self.lines_check_flag[i] = True
                 reasons.append('no flat continuum found in either wing (both sides show a '
                                 'significant internal trend) -- likely pervasive weak-line blending')
                 print(self.lines[i], 'both wings show a significant internal trend -- '

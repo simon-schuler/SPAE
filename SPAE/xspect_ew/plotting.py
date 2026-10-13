@@ -13,7 +13,7 @@ def plot_ew_fit(order, wave_min, wave_max, line_rest, found_line, line_bound,
                  plot_points_within_norm, ex_params, norm,
                  bf_global, pcov_global, ew_global, ew_err_global,
                  fit_continuum, best_bf, pcov, cont_offset, ew, ew_err,
-                 flagged=False, flag_reasons='', axes=None):
+                 flagged=False, flag_reasons='', axes=None, status=None):
     """
     Draw one line's EW-fit window: two panels -- "Global continuum
     (REPORTED)" (always shown, the fit that actually sets self.lines_ew)
@@ -50,6 +50,11 @@ def plot_ew_fit(order, wave_min, wave_max, line_rest, found_line, line_bound,
     axes : (fit_view, local_view) existing Axes to draw into (cleared
         first), or None to create a new figure (measure_ew()'s original
         plot=True behavior).
+    status : (text, color) or None -- the line's final outcome (kept in
+        the main linelist / rejected / superseded by another order), put
+        first in the title in that color. Only known after
+        check_for_flags(), so measure_ew()'s own plots leave it None and
+        Spectrum_Data.annotate_line_plots() redraws them with it.
 
     Returns
     -------
@@ -61,8 +66,13 @@ def plot_ew_fit(order, wave_min, wave_max, line_rest, found_line, line_bound,
         title += "\nFLAGGED: " + str(flag_reasons)
 
     if axes is None:
-        fig = plt.figure(figsize=(12, 5))
-        if flagged:
+        fig = plt.figure(figsize=(12, 5.6 if status else 5))
+        if status:
+            status_text, status_color = status
+            fig.text(0.5, 0.985, status_text, ha='center', va='top', fontsize=12,
+                     fontweight='bold', color=status_color)
+            fig.suptitle(title, y=0.935, fontsize=10, color='#e41a1c' if flagged else 'k')
+        elif flagged:
             fig.suptitle(title, color='#e41a1c', fontsize=10)
         else:
             fig.suptitle(title)
@@ -142,7 +152,10 @@ def plot_ew_fit(order, wave_min, wave_max, line_rest, found_line, line_bound,
         local_view.set_title('Local continuum not estimated (fit_continuum=False)',
                               fontsize=9 if axes is not None else 10)
 
-    fig.tight_layout()
+    if status and axes is None:
+        fig.tight_layout(rect=(0, 0, 1, 0.9))
+    else:
+        fig.tight_layout()
     return fig, (fit_view, local_view)
 
 

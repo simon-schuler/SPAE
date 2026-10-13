@@ -214,6 +214,11 @@ N_CORES = None                   # None: use every available core
 # to N_STEPS=1000; e.g. for a short N_STEPS=100 test run, drop this to ~20,
 # or analysis will silently see an empty post-burn-in chain and crash).
 BURN_IN = 100
+# Walkers kept only if their acceptance fraction exceeds this (analysis.
+# clip_run()). 0.4 was too strict for a 63-line cool-star fit whose
+# walkers all sat at a healthy 0.17-0.35, so analysis failed after the
+# sampler had finished.
+A_FRAC = 0.40
 # =====================================================================
 
 
@@ -410,6 +415,137 @@ def restrict_to_common_lines(target_ew_path, solar_ew_path, target_common_path,
     return target_common_path, solar_common_path
 
 
+def analyze_mcmc_stage(directory, target_common_path, sun_el, sun_abs, sampler,
+                       burn_in=BURN_IN, a_frac=A_FRAC, provisional=True):
+    """Stage 4's post-processing of a finished (or reloaded sampler.pickle)
+    MCMC run: summary, corner plot and ep_vs_abundance.png in `directory`.
+    Separate from run_mcmc_stage() so a saved sampler can be re-analyzed
+    with a different burn_in/a_frac without re-running it. Prints to
+    whatever stdout is current; returns the AnalysisResult."""
+    from SPAE.moog.inlines import parse_linelist
+    from SPAE.analysis import analyze_run, summarize, plot_corner
+    parsed = parse_linelist(target_common_path)
+    result = analyze_run(sampler, parsed, sun_el=sun_el, sun_abs=sun_abs, burn_in=burn_in,
+                          a_frac=a_frac)
+    #provisional=True: BURN_IN above is a hardcoded config value,
+    #not chosen by inspecting this run's own trace plot -- treat
+    #this as a first look, then see summarize()'s own banner for
+    #the recipe to get a final result
+    summary = summarize(result, provisional=provisional)
+    print('=== SUMMARY ===')
+    print(summary)
+
+    #corner plot: the CLIPPED posterior (result.clipped), i.e.
+    #after BURN_IN and the acceptance-fraction cut already applied
+    try:
+        corner_fig, _ = plot_corner(result.clipped)
+        corner_path = os.path.join(directory, 'corner_plot.png')
+        corner_fig.savefig(corner_path, dpi=150)
+        print(f'saved {corner_path}')
+    except ImportError as e:
+        print(f'skipped corner plot: {e}')
+
+    #excitation-potential vs. Fe abundance -- Fe I and Fe II
+    #separately, at the MCMC median solution (result.median_balance
+    #is already computed by analyze_run() above, no extra MOOG
+    #call needed). This is the "no flat continuum"-style physical
+    #check for the WHOLE fit, not a per-line QC plot -- a real
+    #trend here means the adopted Teff is off (see the Fe I fit
+    #line/slope annotated on the plot itself).
+    import matplotlib.pyplot as plt
+    balance = result.median_balance
+    fe1, fe2 = balance.fe1, balance.fe2
+    ep_fig, ep_ax = plt.subplots(figsize=(9, 6))
+    #y-error bars: each line's own abundance uncertainty, propagated
+    #from its measured EW error (SPAE.moog.lineabund.line_abund_err(),
+    #via the abund_err field in abunds._RESULT_DTYPE) -- not the
+    #line-to-line scatter, which is a separate, already-plotted trend
+    ep_ax.errorbar(fe1['EP'], fe1['abund'], yerr=fe1['abund_err'], fmt='o',
+                   color='#377eb8', ecolor='#377eb8', elinewidth=1, capsize=3,
+                   markersize=5, label=f'Fe I (n={len(fe1)})')
+    ep_ax.errorbar(fe2['EP'], fe2['abund'], yerr=fe2['abund_err'], fmt='^',
+                   color='#e41a1c', ecolor='#e41a1c', elinewidth=1, capsize=3,
+                   markersize=6, label=f'Fe II (n={len(fe2)})')
+    ep_line_x = np.array([fe1['EP'].min(), fe1['EP'].max()])
+    ep_ax.plot(ep_line_x, balance.ep.intercept + balance.ep.slope * ep_line_x, 'k--',
+               label=f"Fe I fit: slope={balance.ep.slope:+.4f} "
+                     f"(r={balance.ep.rvalue:+.3f}, p={balance.ep.pvalue:.3f})")
+    ep_ax.set_xlabel('Excitation Potential (eV)', fontsize=12)
+    #per-line differential abundance (this line's abundance minus
+    #the Sun's own, from rel_abunds() -- see balance_stats()) --
+    #NOT the same number as the bulk MCMC [Fe/H] in the title
+    #below, which is the fitted model parameter, not a per-line
+    #average of this plot's points
+    ep_ax.set_ylabel('[Fe/H] (per line)', fontsize=12)
+    ep_ax.set_title(
+        f'{os.path.basename(directory)} -- Fe abundance vs. excitation potential '
+        f'(MCMC median, common lines only)\nTeff={result.median.teff.median:.0f} K, '
+        f'logg={result.median.logg.median:.2f}, [Fe/H]={result.median.feh.median:.2f}, '
+        f'micro={result.median.micro.median:.2f} km/s')
+    ep_ax.legend(fontsize=10)
+    ep_fig.tight_layout()
+    ep_path = os.path.join(directory, 'ep_vs_abundance.png')
+    ep_fig.savefig(ep_path, dpi=150)
+    print(f'saved {ep_path}')
+    return result
+
+
+def run_mcmc_stage(directory, target_common_path, solar_common_path):
+    """Stage 4: the differential MCMC fit on already-written common-line
+    EW linelists (restrict_to_common_lines()'s outputs). Writes
+    mcmc_fit.log, sampler.pickle, flat_blob.npy, trace_plot.png,
+    corner_plot.png and ep_vs_abundance.png to `directory`. Split out of
+    main() so saved EWs can be fitted without re-measuring them."""
+    stdout_orig, stderr_orig = sys.stdout, sys.stderr
+    from SPAE.abunds import sun_abs as compute_sun_abs
+    from SPAE.moog.inlines import parse_linelist
+    sun_el, sun_abs = compute_sun_abs(parse_linelist(solar_common_path), teff_sun=TEFF_SUN,
+                                       logg_sun=LOGG_SUN, feh_sun=FEH_SUN, micro_sun=MICRO_SUN)
+
+    # ---------------- Stage 4: MCMC stellar-parameter fit (differential) ----------------
+    from SPAE.pipeline import fit_stellar_params
+    from SPAE.analysis import analyze_run, summarize, plot_trace, plot_corner
+
+    mcmc_log_path = os.path.join(directory, 'mcmc_fit.log')
+    with open(mcmc_log_path, 'w') as mcmc_log:
+        sys.stdout = Tee(stdout_orig, mcmc_log)
+        sys.stderr = Tee(stderr_orig, mcmc_log)
+        try:
+            print(f'=== MCMC fit (relative to solar, common lines only): '
+                  f'{N_WALKERS} walkers x {N_STEPS} steps ===')
+            t0 = time.time()
+            #summarize_result=False: save the (expensive) raw sampler to
+            #disk BEFORE attempting analysis, so a post-processing problem
+            #(e.g. a burn_in that doesn't fit N_STEPS) can never cost
+            #re-running the sampler itself -- see BURN_IN's comment above
+            sampler, flat_blob, log, _, _ = fit_stellar_params(
+                target_common_path, sun_el=sun_el, sun_abs=sun_abs, x_0=X_0,
+                n_walkers=N_WALKERS, n_steps=N_STEPS, n_cores=N_CORES,
+                summarize_result=False)
+            print(f'MCMC wall time: {time.time()-t0:.1f} s')
+            print(log)
+
+            sampler_path = os.path.join(directory, 'sampler.pickle')
+            with open(sampler_path, 'wb') as f:
+                pickle.dump(sampler, f)
+            np.save(os.path.join(directory, 'flat_blob.npy'), flat_blob)
+            print(f'saved {sampler_path}')
+
+            #trace plot: FULL unclipped chain, on purpose -- burn_in is a
+            #visual judgment call made by looking at this, so pre-clipping
+            #it here would defeat the point (see plot_trace()'s docstring)
+            trace_fig, _ = plot_trace(sampler.get_chain())
+            trace_path = os.path.join(directory, 'trace_plot.png')
+            trace_fig.savefig(trace_path, dpi=150)
+            print(f'saved {trace_path}')
+
+            analyze_mcmc_stage(directory, target_common_path, sun_el, sun_abs, sampler)
+        finally:
+            sys.stdout, sys.stderr = stdout_orig, stderr_orig
+    print(f'MCMC fit log: {mcmc_log_path}')
+
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -480,113 +616,7 @@ def main():
     solar_common_path = os.path.join(solar_directory, 'linelist_with_ew_common.txt')
     restrict_to_common_lines(ew_path, solar_merged_path, target_common_path, solar_common_path)
 
-    from SPAE.abunds import sun_abs as compute_sun_abs
-    from SPAE.moog.inlines import parse_linelist
-    sun_el, sun_abs = compute_sun_abs(parse_linelist(solar_common_path), teff_sun=TEFF_SUN,
-                                       logg_sun=LOGG_SUN, feh_sun=FEH_SUN, micro_sun=MICRO_SUN)
-
-    # ---------------- Stage 4: MCMC stellar-parameter fit (differential) ----------------
-    from SPAE.pipeline import fit_stellar_params
-    from SPAE.analysis import analyze_run, summarize, plot_trace, plot_corner
-
-    mcmc_log_path = os.path.join(directory, 'mcmc_fit.log')
-    with open(mcmc_log_path, 'w') as mcmc_log:
-        sys.stdout = Tee(stdout_orig, mcmc_log)
-        sys.stderr = Tee(stderr_orig, mcmc_log)
-        try:
-            print(f'=== MCMC fit (relative to solar, common lines only): '
-                  f'{N_WALKERS} walkers x {N_STEPS} steps ===')
-            t0 = time.time()
-            #summarize_result=False: save the (expensive) raw sampler to
-            #disk BEFORE attempting analysis, so a post-processing problem
-            #(e.g. a burn_in that doesn't fit N_STEPS) can never cost
-            #re-running the sampler itself -- see BURN_IN's comment above
-            sampler, flat_blob, log, _, _ = fit_stellar_params(
-                target_common_path, sun_el=sun_el, sun_abs=sun_abs, x_0=X_0,
-                n_walkers=N_WALKERS, n_steps=N_STEPS, n_cores=N_CORES,
-                summarize_result=False)
-            print(f'MCMC wall time: {time.time()-t0:.1f} s')
-            print(log)
-
-            sampler_path = os.path.join(directory, 'sampler.pickle')
-            with open(sampler_path, 'wb') as f:
-                pickle.dump(sampler, f)
-            np.save(os.path.join(directory, 'flat_blob.npy'), flat_blob)
-            print(f'saved {sampler_path}')
-
-            parsed = parse_linelist(target_common_path)
-            result = analyze_run(sampler, parsed, sun_el=sun_el, sun_abs=sun_abs, burn_in=BURN_IN)
-            #provisional=True: BURN_IN above is a hardcoded config value,
-            #not chosen by inspecting this run's own trace plot -- treat
-            #this as a first look, then see summarize()'s own banner for
-            #the recipe to get a final result
-            summary = summarize(result, provisional=True)
-            print('=== SUMMARY ===')
-            print(summary)
-
-            #trace plot: FULL unclipped chain, on purpose -- burn_in is a
-            #visual judgment call made by looking at this, so pre-clipping
-            #it here would defeat the point (see plot_trace()'s docstring)
-            trace_fig, _ = plot_trace(sampler.get_chain())
-            trace_path = os.path.join(directory, 'trace_plot.png')
-            trace_fig.savefig(trace_path, dpi=150)
-            print(f'saved {trace_path}')
-
-            #corner plot: the CLIPPED posterior (result.clipped), i.e.
-            #after BURN_IN and the acceptance-fraction cut already applied
-            try:
-                corner_fig, _ = plot_corner(result.clipped)
-                corner_path = os.path.join(directory, 'corner_plot.png')
-                corner_fig.savefig(corner_path, dpi=150)
-                print(f'saved {corner_path}')
-            except ImportError as e:
-                print(f'skipped corner plot: {e}')
-
-            #excitation-potential vs. Fe abundance -- Fe I and Fe II
-            #separately, at the MCMC median solution (result.median_balance
-            #is already computed by analyze_run() above, no extra MOOG
-            #call needed). This is the "no flat continuum"-style physical
-            #check for the WHOLE fit, not a per-line QC plot -- a real
-            #trend here means the adopted Teff is off (see the Fe I fit
-            #line/slope annotated on the plot itself).
-            import matplotlib.pyplot as plt
-            balance = result.median_balance
-            fe1, fe2 = balance.fe1, balance.fe2
-            ep_fig, ep_ax = plt.subplots(figsize=(9, 6))
-            #y-error bars: each line's own abundance uncertainty, propagated
-            #from its measured EW error (SPAE.moog.lineabund.line_abund_err(),
-            #via the abund_err field in abunds._RESULT_DTYPE) -- not the
-            #line-to-line scatter, which is a separate, already-plotted trend
-            ep_ax.errorbar(fe1['EP'], fe1['abund'], yerr=fe1['abund_err'], fmt='o',
-                           color='#377eb8', ecolor='#377eb8', elinewidth=1, capsize=3,
-                           markersize=5, label=f'Fe I (n={len(fe1)})')
-            ep_ax.errorbar(fe2['EP'], fe2['abund'], yerr=fe2['abund_err'], fmt='^',
-                           color='#e41a1c', ecolor='#e41a1c', elinewidth=1, capsize=3,
-                           markersize=6, label=f'Fe II (n={len(fe2)})')
-            ep_line_x = np.array([fe1['EP'].min(), fe1['EP'].max()])
-            ep_ax.plot(ep_line_x, balance.ep.intercept + balance.ep.slope * ep_line_x, 'k--',
-                       label=f"Fe I fit: slope={balance.ep.slope:+.4f} "
-                             f"(r={balance.ep.rvalue:+.3f}, p={balance.ep.pvalue:.3f})")
-            ep_ax.set_xlabel('Excitation Potential (eV)', fontsize=12)
-            #per-line differential abundance (this line's abundance minus
-            #the Sun's own, from rel_abunds() -- see balance_stats()) --
-            #NOT the same number as the bulk MCMC [Fe/H] in the title
-            #below, which is the fitted model parameter, not a per-line
-            #average of this plot's points
-            ep_ax.set_ylabel('[Fe/H] (per line)', fontsize=12)
-            ep_ax.set_title(
-                f'{os.path.basename(directory)} -- Fe abundance vs. excitation potential '
-                f'(MCMC median, common lines only)\nTeff={result.median.teff.median:.0f} K, '
-                f'logg={result.median.logg.median:.2f}, [Fe/H]={result.median.feh.median:.2f}, '
-                f'micro={result.median.micro.median:.2f} km/s')
-            ep_ax.legend(fontsize=10)
-            ep_fig.tight_layout()
-            ep_path = os.path.join(directory, 'ep_vs_abundance.png')
-            ep_fig.savefig(ep_path, dpi=150)
-            print(f'saved {ep_path}')
-        finally:
-            sys.stdout, sys.stderr = stdout_orig, stderr_orig
-    print(f'MCMC fit log: {mcmc_log_path}')
+    run_mcmc_stage(directory, target_common_path, solar_common_path)
 
     print('Done.')
 

@@ -31,7 +31,8 @@ from .analysis import analyze_run, summarize
 
 def measure_star_ew(spectrum_path, linelist_path, output_dir, reference_atlas_path=None,
                      resolving_power=None, window_size=1.5, review=False, save_plots=None,
-                     rv=None, doc_title='STARNAME, PROJECT, YEAR; ', **measure_kwargs):
+                     rv=None, doc_title='STARNAME, PROJECT, YEAR; ', flag_settings=None,
+                     **measure_kwargs):
     """Stage 1: measure every line's EW for one star and write the final
     MOOG-format linelist, either unattended or with a human review pass.
 
@@ -74,6 +75,9 @@ def measure_star_ew(spectrum_path, linelist_path, output_dir, reference_atlas_pa
         manual spot-checking). None (default) follows review, i.e. the
         previous all-or-nothing behavior; pass True/False explicitly to
         decouple the two.
+    flag_settings : dict or None -- Spectrum_Data attributes to override
+        before check_for_flags(), e.g. {'X_thresh': 0.01,
+        'flag_no_flat_continuum': False} to relax the checks for one star
     **measure_kwargs : forwarded to measure_all_ew() (e.g. exclude_lines,
         fit_continuum, auto_widen, widen_window_size, slope_sig_thresh)
 
@@ -90,6 +94,10 @@ def measure_star_ew(spectrum_path, linelist_path, output_dir, reference_atlas_pa
     flagged_path = os.path.join(output_dir, 'linelist_with_ew_flagged.txt')
 
     spec = Spectrum_Data(spectrum_path)
+    for attr, value in (flag_settings or {}).items():
+        if not hasattr(spec, attr):
+            raise ValueError(f'flag_settings: Spectrum_Data has no attribute {attr!r}')
+        setattr(spec, attr, value)
     spec.normalize_all()
     #load_lines() BEFORE apply_rv_shift(): apply_rv_shift()'s own docstring
     #says calling it in this order lets it cross-check the (few, sometimes
@@ -120,6 +128,10 @@ def measure_star_ew(spectrum_path, linelist_path, output_dir, reference_atlas_pa
     spec.check_for_flags()
     if review:
         _review_flagged_lines(spec, plots_dir=os.path.join(output_dir, 'line_plots'))
+    if save_plots:
+        #redraw line_plots/ with each line's final KEPT/REJECTED status in
+        #the caption -- only known now, after flagging and any review
+        spec.annotate_line_plots()
 
     spec.make_ew_doc(ew_path, doc_title=doc_title, flagged_name=flagged_path)
     return ew_path, flagged_path, spec
