@@ -2,6 +2,15 @@ Tests
 Versions
 notes.txt
 test_notes.txt
+
+# External reference material / local run data, not meant for the repo.
+# Anchored to the repo root (leading /) -- git matches gitignore patterns
+# case-insensitively on this machine (core.ignorecase=true), so an
+# unanchored "MOOG/" also matched the real, tracked SPAE/moog/ package.
+/Claude/
+/Fedi/
+/MOOG/
+/Verification/
 SPAE/data/*.DAT
 SPAE/data/*.pickle
 .DS_Store
