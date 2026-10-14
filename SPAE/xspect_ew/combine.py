@@ -102,6 +102,102 @@ def measure_order_alignment(wave_A, flux_A, wave_B, flux_B, search_radius=0.1, n
     return parabolic_refine(shifts, chi, k_min)
 
 
+def combine_epochs(spectra, verbose=False, renormalize=True, **combine_kwargs):
+    """
+    Chain Spectrum_Data.combine_spectra() pairwise across an arbitrary
+    number (>=2) of same-star exposures/epochs, folding each one into a
+    running combined spectrum -- combine_spectra() itself only combines
+    TWO spectra at a time (see its own docstring), so this is the actual
+    all-of-them wrapper. Mirrors the interactive EW widget's own multi-
+    exposure Combine step (interactive.py's _do_combine): repeatedly
+    calls spectra[0].combine_spectra(next_one) then update_combined(),
+    each round folding one more exposure's flux into spectra[0].
+
+    All spectra must already have had normalize_all() run (same
+    precondition as combine_spectra() itself), and any exposure with
+    known-bad orders should have flag_bad_orders() run beforehand, again
+    exactly as for a single pairwise combine_spectra() call.
+
+    update_combined() only overwrites spectra[0].flux/obs_err, NOT its
+    continuum (pred_all) or normalized_flux -- so by default (renormalize=
+    True) spectra[0].normalize_all() is re-run after every fold, keeping
+    the next fold's alignment, cross-exposure spike check and spike
+    replacement (which rescales to pred_all) consistent with the running
+    SUM rather than with spectra[0]'s original single exposure.
+
+    Parameters
+    ----------
+    spectra : list of >=2 Spectrum_Data, all the SAME star/epochs to
+        combine. spectra[0] accumulates the result in place; the rest
+        are folded into it one at a time, in list order.
+    verbose : passed through to every combine_spectra() call, plus this
+        wrapper's own per-fold progress print.
+    renormalize : re-run spectra[0].normalize_all() (its format defaults)
+        after every fold -- see above. False restores the old behavior
+        (the interactive widget's own Combine step still works that way).
+    **combine_kwargs : forwarded to every combine_spectra() call (e.g.
+        min_overlap_fraction, align, align_search_radius,
+        align_warn_threshold, cross_exposure_check,
+        cross_exposure_significance, plot, plot_dir). rv_A/rv_B are
+        rejected here -- they name ONE specific spectrum's RV and don't
+        generalize across a chain of folds; omit them to let each fold
+        remeasure RV automatically (rv_shift=True, the default), or pass
+        rv_shift=False if every spectrum is already correctly
+        rest-framed.
+
+    Returns
+    -------
+    combined : Spectrum_Data -- spectra[0], mutated in place and
+        returned for convenience/chaining. Each fold already calls
+        update_combined() internally, so its flux/obs_err are current.
+    n_combined_per_fold : list of int -- combine_spectra()'s own
+        n_combined return value from each fold, in order.
+
+    Also sets combined.combine_debug_chain: list of each fold's own
+    combine_debug (combine_spectra() overwrites self.combine_debug every
+    call, so without this, a chain of >2 folds would only keep the LAST
+    fold's per-order detail -- see combine_spectra()'s own docstring).
+    combine_debug_chain[k] is the combine_debug produced by folding in
+    spectra[k + 1].
+
+    Each entry combine_spectra() adds to combined.dropped_line_exposures
+    (a line whose window in one side was dropped for cross-exposure
+    contamination -- needs combined.load_lines() BEFORE calling this; see
+    combine_spectra()'s point 9) also gets 'fold' and 'exposures_dropped'
+    (indices into spectra). Dropping the 'A' side at a later fold drops
+    the whole running sum of earlier exposures for that line's window.
+    """
+    if len(spectra) < 2:
+        raise ValueError(f"combine_epochs() needs at least 2 spectra, got {len(spectra)}")
+    if 'rv_A' in combine_kwargs or 'rv_B' in combine_kwargs:
+        raise ValueError("combine_epochs() does not accept rv_A/rv_B -- they name "
+                          "a single spectrum's RV and don't generalize across a "
+                          "chain of folds; omit them (rv_shift=True remeasures "
+                          "automatically each fold) or pass rv_shift=False instead.")
+
+    primary = spectra[0]
+    n_combined_per_fold = []
+    combine_debug_chain = []
+    for step, other in enumerate(spectra[1:], start=1):
+        if verbose:
+            print(f"combine_epochs(): folding in exposure {step + 1}/{len(spectra)}...")
+        n_dropped_before = len(getattr(primary, 'dropped_line_exposures', []))
+        n = primary.combine_spectra(other, verbose=verbose, **combine_kwargs)
+        primary.update_combined()
+        # name which exposure(s) each new whole-line drop removed: 'B' is
+        # spectra[step]; 'A' is the running sum of spectra[0..step-1]
+        for d in primary.dropped_line_exposures[n_dropped_before:]:
+            d['fold'] = step
+            d['exposures_dropped'] = [step] if d['dropped'] == 'B' else list(range(step))
+        if renormalize:
+            primary.normalize_all()
+        combine_debug_chain.append(primary.combine_debug)
+        n_combined_per_fold.append(n)
+
+    primary.combine_debug_chain = combine_debug_chain
+    return primary, n_combined_per_fold
+
+
 def combine_files(empty_obj,objects = []):
     final_wavelength = []
     final_flux = []

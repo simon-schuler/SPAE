@@ -16,7 +16,7 @@ from .spectrum_data import Spectrum_Data
 from .continuum import fit_als_continuum
 from .constants import ELEMENTS
 from .plotting import plot_line_info, plot_comparison_res
-from .combine import combine_files
+from .combine import combine_files, combine_epochs
 from .io_utils import load_object
 from .readers import read_spectrum, SpectrumFormatError, load_maroonx_response, get_maroonx_bands
 from .radial_velocity import measure_effective_rv, measure_rv_from_linelist, RV_REFERENCE_LINES

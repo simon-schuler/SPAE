@@ -17,7 +17,7 @@ from .line_profile import (get_line_window, gauss_model, gfit_direct, gauss_ew, 
                             estimate_local_continuum_sloped, EW_K)
 from .combine import make_line, parabolic_refine, measure_order_alignment
 from .plotting import make_plots_folder, plot_ew_fit
-from .readers import read_spectrum
+from .readers import read_spectrum, detect_format, FORMAT_NORMALIZE_DEFAULTS
 from .radial_velocity import measure_effective_rv, measure_rv_ccf, C_KMS
 from .response_correction import apply_response_correction as _apply_response_correction
 from .overlap_check import check_order_overlaps as _check_order_overlaps
@@ -56,9 +56,16 @@ class Spectrum_Data():
         """
         self.filename = filename
         self.gain = None
+        reader_err = None
+        #reader format name ('ghost', 'keck_hires', ...) -- selects
+        #per-format normalize_all() defaults (FORMAT_NORMALIZE_DEFAULTS)
+        self.instrument = None
         if KECK_file:
-            self.wavelength, self.flux, self.gain = read_spectrum(
-                filename, instrument=instrument, custom_reader=custom_reader, **reader_kwargs)
+            self.instrument = detect_format(filename, instrument=instrument,
+                                            custom_reader=custom_reader)
+            self.wavelength, self.flux, self.gain, reader_err = read_spectrum(
+                filename, instrument=instrument, custom_reader=custom_reader,
+                return_err=True, **reader_kwargs)
         else:
             #split input array into orders
             if order_split[0]:
@@ -120,6 +127,12 @@ class Spectrum_Data():
             #weight (1/err) infinite -- also confirmed on suni.fits: 146
             #pixels, non-contiguous, near one order's far edge.
             self.obs_err[i] = np.maximum(np.sqrt(np.abs(self.flux[i])), 1.0)
+            #a reader that ships a real per-pixel error (e.g. GHOST's VAR
+            #extension -- see readers._read_ghost()) supersedes the
+            #sqrt(counts) estimate above, which is badly wrong for flux that
+            #isn't pure photon counts
+            if reader_err is not None:
+                self.obs_err[i] = np.asarray(reader_err[i], dtype=float)
         #print('empty continuum arrays created', self.continuum)
         #Old way of setting these variables (change back if above code causes problems)
         # self.continuum = np.full((len(self.wavelength),len(self.wavelength[0])), False)
@@ -234,6 +247,12 @@ class Spectrum_Data():
         #reflects a corrected (not originally observed) value. Empty
         #(no-op) until correct_spikes()/combine_spectra() is called.
         self.corrected_pixel_wavelengths = []
+        #lines whose window in ONE exposure was dropped from the combined
+        #spectrum for cross-exposure contamination (see combine_spectra()
+        #point 9): dicts with line/order/other_order/dropped ('A' = this
+        #spectrum's side, 'B' = the other one)/wave_lo/wave_hi. Such a
+        #line is still measured -- from the remaining exposure(s) only.
+        self.dropped_line_exposures = []
 
     def apply_response_correction(self, response_wave, response, min_overlap_fraction=0.5,
                                    min_response_fraction=0.1, response_bands=None, science_bands=None):
@@ -397,12 +416,45 @@ class Spectrum_Data():
         self.corrected_pixel_wavelengths.extend(corrected)
         return corrected
 
-    def normalize_all(self, lam = 2e3, p = 0.01, n_iter = 15, adaptive = True, **als_kwargs):
+    def _normalize_settings(self, **explicit):
+        """fit_als_continuum() settings: package defaults, overridden by this
+        spectrum's format defaults (FORMAT_NORMALIZE_DEFAULTS, e.g. a stiff
+        whole-arm fit for GHOST/DRAGONS), overridden by any argument the
+        caller actually passed (None = not passed). Returns (settings,
+        merged)."""
+        settings = dict(lam=2e3, p=0.01, n_iter=15, adaptive=True)
+        # getattr: Spectrum_Data pickled before self.instrument existed
+        settings.update(FORMAT_NORMALIZE_DEFAULTS.get(getattr(self, 'instrument', None), {}))
+        settings.update({k: v for k, v in explicit.items() if v is not None})
+        merged = settings.pop('merged', False)
+        return settings, merged
+
+    def normalize_all(self, lam = None, p = None, n_iter = None, adaptive = None,
+                      merged = None, **als_kwargs):
+        """
+        Fit and divide out the continuum of every order. Unset arguments
+        fall back to this spectrum's format defaults (see
+        _normalize_settings()), then to lam=2e3, p=0.01, n_iter=15,
+        adaptive=True.
+
+        merged : if True, the "orders" are artificial chunks of ONE merged
+            spectrum (e.g. GHOST/DRAGONS; see readers._read_ghost()) -- the
+            continuum is fit once across the whole de-duplicated spectrum
+            and then split back into the chunks, so no chunk boundary
+            introduces a continuum discontinuity. Defaults to the format's
+            setting (True for 'ghost', False otherwise).
+        """
+        settings, use_merged = self._normalize_settings(
+            lam=lam, p=p, n_iter=n_iter, adaptive=adaptive, merged=merged, **als_kwargs)
+        if use_merged:
+            self._normalize_merged(**settings)
+            return None
+
         #loop through orders
         for i in range(len(self.flux)):
 
             #fit continuum via Asymmetric Least Squares smoothing
-            self.normalize(i, lam=lam, p=p, n_iter=n_iter, adaptive=adaptive, **als_kwargs)
+            self.normalize(i, **settings)
 
             #Replace un-normalized points with value before it
             #This should only be replacing the last point in the
@@ -414,8 +466,29 @@ class Spectrum_Data():
 
         return None
 
-    def normalize(self, order, clip = [-999,-999], lam = 2e3, p = 0.01, n_iter = 15,
-                  adaptive = True, **als_kwargs):
+    def _normalize_merged(self, **settings):
+        """normalize_all(merged=True): one fit over the union of every
+        chunk's pixels (overlapping chunks share the same original pixels,
+        de-duplicated by wavelength), then each chunk takes its own pixels'
+        values back out of it."""
+        wave = np.concatenate([np.asarray(w, dtype=float) for w in self.wavelength])
+        flux = np.concatenate([np.asarray(f, dtype=float) for f in self.flux])
+        err = np.concatenate([np.asarray(e, dtype=float) for e in self.obs_err])
+        wave, idx = np.unique(wave, return_index=True)
+        flux, err = flux[idx], err[idx]
+
+        pred, pred_var = fit_als_continuum(wave, flux, err, **settings)
+
+        for i in range(len(self.wavelength)):
+            j = np.searchsorted(wave, self.wavelength[i])
+            self.pred_all[i] = pred[j]
+            self.pred_var_all[i] = pred_var[j]
+            self.continuum[i] = self.flux[i] >= self.pred_all[i]
+            self.normalized_flux[i] = self.flux[i] / self.pred_all[i]
+        return None
+
+    def normalize(self, order, clip = [-999,-999], lam = None, p = None, n_iter = None,
+                  adaptive = None, **als_kwargs):
         """
         Fit and divide out the continuum for one order via Asymmetric
         Least Squares (AsLS) smoothing (fit_als_continuum(), continuum.py).
@@ -463,8 +536,12 @@ class Spectrum_Data():
         this replaced and why each earlier attempt failed on real data.
 
         lam/p/n_iter/adaptive control the fit; see
-        fit_als_continuum()'s docstring.
+        fit_als_continuum()'s docstring. Unset ones fall back to this
+        spectrum's format defaults, as in normalize_all() -- but this
+        always fits the one order alone, even for a merged format.
         """
+        settings, _ = self._normalize_settings(lam=lam, p=p, n_iter=n_iter,
+                                               adaptive=adaptive, **als_kwargs)
         if clip[0] != -999 and clip[1] != -999:
             #clipped = True
             clipl = np.where(self.wavelength[order] <= clip[0])[0][-1]
@@ -486,8 +563,7 @@ class Spectrum_Data():
         # clean, response-corrected MAROON-X order).
         err = self.obs_err[order][clipl:clipr]
 
-        pred, pred_var = fit_als_continuum(wave, flux, err, lam=lam, p=p, n_iter=n_iter,
-                                           adaptive=adaptive, **als_kwargs)
+        pred, pred_var = fit_als_continuum(wave, flux, err, **settings)
 
         self.continuum[order][clipl:clipr] = flux >= pred
         self.pred_all[order][clipl:clipr] = pred
@@ -553,7 +629,8 @@ class Spectrum_Data():
     def combine_spectra(self, spectB, rv_A=None, rv_B=None, rv_shift=True,
                         min_overlap_fraction=0.5, align=True, align_search_radius=0.1,
                         align_warn_threshold=0.05, cross_exposure_check=True,
-                        cross_exposure_significance=8.0, plot=False, plot_dir='.', verbose=False):
+                        cross_exposure_significance=8.0, drop_contaminated_lines=True,
+                        line_drop_halfwidth=1.35, plot=False, plot_dir='.', verbose=False):
         """
         Co-add this spectrum with a second exposure of the SAME star
         (spectB), to reach a single, higher-S/N combined spectrum.
@@ -634,6 +711,28 @@ class Spectrum_Data():
            edges) rather than the sum, and is recorded in
            self.corrected_pixel_wavelengths -- consulted by
            check_for_flags() to exclude any line measured there.
+        9. Whole-line exposure dropping (drop_contaminated_lines=True,
+           default; needs self.lines loaded via load_lines() BEFORE
+           combining, otherwise point 8's per-pixel replacement is used
+           everywhere). A flagged point within line_drop_halfwidth of a
+           linelist line drops the contaminated exposure across that
+           line's ENTIRE window (line +/- line_drop_halfwidth), not just
+           at the flagged pixel(s): the whole window uses only the clean
+           side's flux/error, rescaled to the summed continuum exactly as
+           in point 8. Every pixel the line is measured from is then a
+           genuinely observed value (from one fewer exposure, with its
+           larger error), so the line is KEPT for EW measurement instead
+           of being excluded by check_for_flags(); it is recorded in
+           self.dropped_line_exposures. If BOTH sides are contaminated
+           within the same line window (or two lines' windows needing
+           opposite sides dropped overlap), no side can be dropped
+           cleanly: point 8's per-pixel replacement is used there and
+           the line's own wavelength is added to
+           self.corrected_pixel_wavelengths, so check_for_flags()
+           excludes it as before. The 1.35 A default covers measure_ew()'s
+           widest auto-widened fit window (widen_window_size=2.5 A, i.e.
+           +/-1.25 A) around a line centre found up to 0.1 A off the
+           rest wavelength.
 
         Parameters
         ----------
@@ -646,6 +745,8 @@ class Spectrum_Data():
         cross_exposure_check, cross_exposure_significance : see point 8;
             the latter passed to check_cross_exposure_spikes() as
             `significance`.
+        drop_contaminated_lines, line_drop_halfwidth : see point 9
+            (line_drop_halfwidth in Angstrom).
         plot, plot_dir : see point 6 above.
         verbose : passed through to apply_rv_shift(); also prints each
             order's match/skip decision, measured alignment residual, and
@@ -665,6 +766,9 @@ class Spectrum_Data():
         inspection before deciding whether to update_combined() (see the
         interactive widget's "Aligned" Load-stage view).
         """
+        if not hasattr(self, 'dropped_line_exposures'):   # objects saved before it existed
+            self.dropped_line_exposures = []
+
         if rv_shift:
             self.apply_rv_shift(rv=rv_A, verbose=verbose)
             spectB.apply_rv_shift(rv=rv_B, verbose=verbose)
@@ -676,6 +780,18 @@ class Spectrum_Data():
         combined_err = np.empty(len(self.flux), dtype=object)
         n_combined = 0
         n_cross_corrected = 0
+        n_lines_dropped = 0
+        n_lines_excluded = 0
+
+        line_waves = None
+        if cross_exposure_check and drop_contaminated_lines:
+            if self.lines is None:
+                print('combine_spectra(): no linelist loaded (load_lines()) -- '
+                      'cross-exposure spikes will be corrected per pixel, and any '
+                      'line measured over one excluded, rather than dropping the '
+                      'contaminated exposure across the whole line')
+            else:
+                line_waves = np.atleast_1d(np.asarray(self.lines, dtype=float))
 
         # Per-order record of the aligned-but-not-yet-summed inputs behind
         # each combined order -- exists purely for inspection (e.g. the
@@ -764,19 +880,91 @@ class Spectrum_Data():
                 # with flux_B_interp/err_B_interp (both built from wave_A[in_range]).
                 if cx_bad.any():
                     combo_idx = np.where(in_range)[0]
-                    for pos in np.where(cx_bad)[0]:
+                    pred_A_in = self.pred_all[i][in_range]
+                    pred_B_interp = interp1d(wave_B, spectB.pred_all[best_j], kind='linear')(query)
+                    # each side rescaled from its own continuum up to the
+                    # SUM's (pred_A + pred_B), since every other combined
+                    # pixel is A+B -- substituting one spectrum's bare flux
+                    # would leave a fake absorption dip of depth ~(the other
+                    # spectrum's share)
+                    pred_sum = pred_A_in + pred_B_interp
+                    only_B_flux = flux_B_interp * pred_sum / pred_B_interp
+                    only_B_err = err_B_interp * pred_sum / pred_B_interp
+                    only_A_flux = flux_A[in_range] * pred_sum / pred_A_in
+                    only_A_err = err_A[in_range] * pred_sum / pred_A_in
+
+                    # point 9: which side to drop across each nearby line's
+                    # whole window
+                    wave_in = wave_A[in_range]
+                    bad_pos = np.where(cx_bad)[0]
+                    drop_lines = []      # (line, window mask over wave_in, 'A'/'B')
+                    conflict_lines = []
+                    if line_waves is not None:
+                        for line in line_waves[(line_waves >= wave_in.min() - line_drop_halfwidth) &
+                                               (line_waves <= wave_in.max() + line_drop_halfwidth)]:
+                            near = bad_pos[np.abs(wave_in[bad_pos] - line) <= line_drop_halfwidth]
+                            if len(near) == 0:
+                                continue
+                            sides = {'A' if cx_a_higher[p] else 'B' for p in near}
+                            win = np.abs(wave_in - line) <= line_drop_halfwidth
+                            if len(sides) == 2:
+                                conflict_lines.append(line)
+                            else:
+                                drop_lines.append((line, win, sides.pop()))
+                        # two lines' windows needing OPPOSITE sides dropped
+                        # can't both be honored where they overlap
+                        mask_A = np.zeros(len(wave_in), dtype=bool)
+                        mask_B = np.zeros(len(wave_in), dtype=bool)
+                        for _, win, side in drop_lines:
+                            (mask_A if side == 'A' else mask_B)[win] = True
+                        clash = mask_A & mask_B
+                        if clash.any():
+                            conflict_lines += [ln for ln, win, _ in drop_lines if (win & clash).any()]
+                            drop_lines = [d for d in drop_lines if not (d[1] & clash).any()]
+
+                    dropped = np.zeros(len(wave_in), dtype=bool)
+                    for line, win, side in drop_lines:
+                        sel = combo_idx[win]
+                        if side == 'A':
+                            cflux[sel], cerr[sel] = only_B_flux[win], only_B_err[win]
+                        else:
+                            cflux[sel], cerr[sel] = only_A_flux[win], only_A_err[win]
+                        dropped |= win
+                        self.dropped_line_exposures.append({
+                            'line': float(line), 'order': i, 'other_order': best_j,
+                            'dropped': side,
+                            'wave_lo': float(wave_in[win].min()), 'wave_hi': float(wave_in[win].max())})
+                        n_lines_dropped += 1
+                        if verbose:
+                            print(f"order {i}: line {line:.3f} -- {side} contaminated, "
+                                  f"{side} dropped over {wave_in[win].min():.2f}-"
+                                  f"{wave_in[win].max():.2f} A")
+                    for line in conflict_lines:
+                        # excluded by check_for_flags() (|cw - line| <= 0.1)
+                        self.corrected_pixel_wavelengths.append(float(line))
+                        n_lines_excluded += 1
+                        if verbose:
+                            print(f"order {i}: line {line:.3f} -- contamination in both "
+                                  f"spectra within its window; corrected per pixel and excluded")
+
+                    # point 8: per-pixel replacement for flagged points not
+                    # already covered by a whole-line drop
+                    for pos in bad_pos:
+                        if dropped[pos]:
+                            continue
                         idx = combo_idx[pos]
                         # use whichever side has the LOWER excess significance
                         # (the less-contaminated one), not the sum of both
                         if cx_a_higher[pos]:
-                            cflux[idx], cerr[idx] = flux_B_interp[pos], err_B_interp[pos]
+                            cflux[idx], cerr[idx] = only_B_flux[pos], only_B_err[pos]
                         else:
-                            cflux[idx], cerr[idx] = flux_A[idx], err_A[idx]
+                            cflux[idx], cerr[idx] = only_A_flux[pos], only_A_err[pos]
                         self.corrected_pixel_wavelengths.append(float(wave_A[idx]))
                         n_cross_corrected += 1
                     if verbose:
-                        print(f"order {i}: {cx_bad.sum()} point(s) cross-exposure-corrected "
-                              f"(significant excess above continuum in at least one spectrum)")
+                        print(f"order {i}: {cx_bad.sum()} point(s) flagged by the cross-exposure "
+                              f"check ({(~dropped[bad_pos]).sum()} corrected per pixel, the rest "
+                              f"inside whole-line drops)")
 
             combined_flux[i], combined_err[i] = cflux, cerr
             n_combined += 1
@@ -805,7 +993,9 @@ class Spectrum_Data():
         self.combined_err = combined_err
         print(f"combine_spectra(): combined {n_combined}/{len(self.flux)} orders "
               f"({len(bad_A)} flagged bad in A, {len(bad_B)} flagged bad in B, "
-              f"{n_cross_corrected} point(s) cross-exposure-corrected)")
+              f"{n_cross_corrected} point(s) cross-exposure-corrected per pixel, "
+              f"{n_lines_dropped} line(s) taken from one spectrum only, "
+              f"{n_lines_excluded} line(s) contaminated in both and excluded)")
         print('Use self.update_combined() when you are happy with the combined flux/error '
               'to override self.flux/self.obs_err.')
         return n_combined
@@ -2136,6 +2326,16 @@ class Spectrum_Data():
                     reasons.append(f'corrected pixel within measurement window ({cw:.3f} A)')
                     print(self.lines[i], f'has a corrected pixel within its measurement window '
                           f'({cw:.3f} A) -- excluded, not just flagged on an uncorrected value')
+            #one exposure dropped over this line's window when combining
+            #(combine_spectra() point 9) -- informational only, NOT a flag:
+            #every pixel there is an observed value, with its error bar
+            #already reflecting the fewer exposures
+            for d in getattr(self, 'dropped_line_exposures', []):
+                if d['wave_lo'] <= self.lines[i] <= d['wave_hi']:
+                    print(self.lines[i], f"measured without combined side {d['dropped']}"
+                          + (f" (exposure(s) {d['exposures_dropped']})" if 'exposures_dropped' in d else '')
+                          + f" over {d['wave_lo']:.2f}-{d['wave_hi']:.2f} A (cross-exposure "
+                          f"contamination) -- kept, not flagged")
             #identification checks - only meaningful once identify_lines()
             #has actually run (lines_id_detected defaults to False either
             #way, so this must be gated on lines_id_run to avoid flagging
