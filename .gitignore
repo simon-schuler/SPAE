@@ -3,6 +3,9 @@ Versions
 notes.txt
 test_notes.txt
 
+# Personal/local Claude Code settings, not meant for the repo
+/.claude/settings.local.json
+
 # External reference material / local run data, not meant for the repo.
 # Anchored to the repo root (leading /) -- git matches gitignore patterns
 # case-insensitively on this machine (core.ignorecase=true), so an
