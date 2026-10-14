@@ -1747,7 +1747,51 @@ other. Worth pulling collaborator branches sooner / more often once this
 kind of parallel restructuring is in flight, rather than letting two
 incompatible rewrites of the same function diverge for weeks.
 
-## 22. Commit reference
+## 22. Merge: `ghost-sb2-combine` -- GHOST reader, multi-epoch combining, combiner fixes
+
+Merged the collaborator's second branch, `ghost-sb2-combine` (forked from
+`abundance_errors`, which it already had merged in at this repo's
+`2520f66`). Unlike §21, this merge was **clean -- no conflicts**, even in
+`spectrum_data.py`, since the collaborator's edits there landed in
+different functions than this repo's Accept/Reject work. Verified
+post-merge against the `Verification/Claude_MOOG/` fixture: Fe I
+average=7.5383 (n=55), C average=8.4495 (n=2), unchanged.
+
+Six commits, by topic:
+
+- **New Gemini GHOST (DRAGONS) reader** (`readers.py`): `_detect_ghost()`/
+  `_read_ghost()`, extending the existing registry pattern (§2).
+  GHOST is a dual-arm (blue/red), bundled-IFU spectrograph; the reader
+  merges the per-arm extensions into one spectrum (`_ghost_sci_hdus()`)
+  with an `ifu=` selector (default `'auto'`) and a velocity-space
+  chunking/padding scheme (`chunk_kms`/`pad_kms`) for combining the arms'
+  overlap region. `detect_format()`/`read_spectrum()`/
+  `_read_spectrum_raw()` dispatch updated to route to it.
+- **Stiff whole-arm normalization** (`spectrum_data.py`, `continuum.py`):
+  `_normalize_settings()`/`_normalize_merged()` added alongside the
+  existing `normalize()`/`normalize_all()` -- a GHOST-specific parameter
+  profile for `fit_als_continuum()` (stiffer `lam`) to handle its merged,
+  whole-arm spectra rather than per-order Keck/GRACES/MAROON-X chunks.
+- **`combine_epochs()`** (`combine.py`): chains the existing
+  `combine_spectra()` (§16-17, pairwise) across an arbitrary number of
+  exposures, with `renormalize=True` re-running normalization on the
+  combined result by default.
+- **MOOG-port physics fix** (`fakeline.py`/`oneline.py`): fixes a COG
+  (curve-of-growth) crash specific to hot, low-microturbulence
+  atmospheres -- does not affect the solar-type `Claude_MOOG` regression
+  fixture (confirmed unchanged above), since that regime isn't exercised
+  by it.
+- **Cross-exposure spike-replacement scale fix**, plus renormalizing
+  between folds (`combine.py`/`spectrum_data.py`) -- refines the §17
+  cosmic-ray/bad-pixel handling.
+- **EW-linelist merge-parsing fix**, keeping the lower-error copy of a
+  line that appears in more than one input list (`run_pipeline_cli.py`).
+- **Drop a whole contaminated exposure for a given line** when combining
+  (`spectrum_data.py`/`combine.py`) -- a coarser fallback alongside the
+  existing per-pixel correction/exclusion mechanisms (§17.2-17.4) for a
+  case too damaged to patch.
+
+## 23. Commit reference
 
 | Commit | Summary |
 |---|---|
@@ -1769,3 +1813,5 @@ incompatible rewrites of the same function diverge for weeks.
 | `a00c5d5` | Re-integrate `axes=` support into the merged `measure_ew()`/`plot_ew_fit()` (§19) |
 | `ea9e6a1` / `9a53ac8` (collaborator, on `abundance_errors`) | EW-error propagation into abundance uncertainties; plotted error bars |
 | `8127d40` | Merge `abundance_errors`; fix `format_moog_ew_line()`'s column layout (§21) |
+| `27db334`/`c563fcf`/`9e07909`/`d9de5d1`/`a18b457`/`079c2a4` (collaborator, on `ghost-sb2-combine`) | GHOST reader; `combine_epochs()`; COG crash fix; combiner fixes (§22) |
+| `3d560b4` | Merge `ghost-sb2-combine`, clean merge (§22) |
