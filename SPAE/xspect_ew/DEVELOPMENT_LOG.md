@@ -1698,7 +1698,56 @@ rejected file (with a `# human-reviewed, rejected`-equivalent file-level
 header, not a per-line comment); a custom CSV `line_formatter=` produced
 correctly-substituted output on the same three files.
 
-## 21. Commit reference
+## 21. Merge: `abundance_errors` -- EW-error propagation into abundance uncertainties
+
+Merged a collaborator's (`AstroJeff`) separate GitHub branch, `abundance_errors`
+(forked from `main` at `8844ef4`, which itself only added a batch driver,
+`run_batch_pipeline.py`, unrelated to xspect_ew), into `pymoog-conversion`.
+Two commits: `ea9e6a1` propagates EW measurement errors all the way through
+to per-species abundance uncertainties (`SPAE/abunds.py`, several
+`SPAE/moog/*` physics modules, `moog/inlines.py`'s linelist readers gaining
+a `state.width_err` array, a new `lineabund.line_abund_err()`, and
+`obj_func()`'s Fe I/II likelihood weighting each line by its own
+EW-propagated error instead of one shared scatter sigma); `9a53ac8` adds
+the resulting error bars to `run_pipeline_cli.py`'s `ep_vs_abundance.png`
+diagnostic plot.
+
+**The only real conflict** was in `spectrum_data.py`'s `make_ew_doc()`,
+because the collaborator's branch forked before this repo's `ew_output.py`/
+`line_formatter=` refactor and per-line Accept/Reject feature (§20)
+existed -- their commit still edited the old, pre-refactor inline
+formatting code directly. Resolved by keeping this branch's structure
+(the `line_formatter` callable, `lines_human_reject`/`rejected_doc`
+routing) and discarding their inline duplicate.
+
+**That inline code, however, carried a real fix this branch's refactor had
+accidentally undone.** The collaborator's own commit message for `ea9e6a1`
+documents it directly: the EW linelist writer was missing the `d0` field
+and using the wrong column widths, shifting every column past `rad` and
+leaving the EW-error column outside `abfind_direct`'s 70-byte fixed-width
+read window -- silently dropping every line's EW uncertainty on read-back.
+This exact bug existed in the pre-refactor code too; the §20/§19 extraction
+into `ew_output.format_moog_ew_line()` was done against an older base and
+reintroduced it (7 variable-width fields instead of the correct 8 fixed
+10-char fields: `wave1,atom1,e,gf,dampnum,d0,width,width_err`, matching
+`moog/inlines.py`'s `_read_fixed()`/`_read_free()`). Applied the same fix
+there, so the bug is fixed in exactly one place regardless of which
+`line_formatter` a caller uses, rather than living on only in the
+collaborator's now-discarded inline version. Verified via a direct round
+trip through `moog.inlines._read_fixed()` (exact value recovery, including
+a non-zero `d0` no longer silently colliding with `width`/`width_err`) and
+by re-running the original `Verification/Claude_MOOG/` validation fixture
+end-to-end post-merge: Fe I average=7.5383 (n=55), C average=8.4495 (n=2)
+-- unchanged from the 2026-07-02 baseline validation.
+
+**Note for next time:** this refactor/fix collision happened because this
+branch's `ew_output.py` extraction and the collaborator's bug fix were
+developed independently on top of the same stale base, each unaware of the
+other. Worth pulling collaborator branches sooner / more often once this
+kind of parallel restructuring is in flight, rather than letting two
+incompatible rewrites of the same function diverge for weeks.
+
+## 22. Commit reference
 
 | Commit | Summary |
 |---|---|
@@ -1718,3 +1767,5 @@ correctly-substituted output on the same three files.
 | `802cf66` | Add interactive `EWWidget` (§18) |
 | `5905744` | Merge `fix_ew_fitting` (new global/local-continuum `measure_ew()`) (§19) |
 | `a00c5d5` | Re-integrate `axes=` support into the merged `measure_ew()`/`plot_ew_fit()` (§19) |
+| `ea9e6a1` / `9a53ac8` (collaborator, on `abundance_errors`) | EW-error propagation into abundance uncertainties; plotted error bars |
+| `8127d40` | Merge `abundance_errors`; fix `format_moog_ew_line()`'s column layout (§21) |
