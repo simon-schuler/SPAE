@@ -17,6 +17,7 @@ _ION_LABELS = {0: 'I', 1: 'II', 2: 'III'}
 _RESULT_DTYPE = np.dtype([
     ('wavelength', 'f8'), ('ID', 'f8'), ('EP', 'f8'), ('logGF', 'f8'),
     ('EWin', 'f8'), ('logRWin', 'f8'), ('abund', 'f8'), ('delavg', 'f8'),
+    ('EWin_err', 'f8'), ('abund_err', 'f8'),
 ])
 
 
@@ -29,7 +30,13 @@ def _species_name(atom1):
 
 
 def _pymoog_to_spae(result):
-    """Convert abfind() result dict to (el_found, abundances) matching read_file format."""
+    """Convert abfind() result dict to (el_found, abundances) matching read_file format.
+
+    Carries per-line EW and abundance uncertainties (ln['ew_err'],
+    ln['abund_err'] from abfind()/line_abund_err()) through as the
+    EWin_err/abund_err fields, so downstream consumers of abunds_func()'s
+    output have access to them without recomputing.
+    """
     groups = defaultdict(list)
     for line in result['lines']:
         groups[line['species']].append(line)
@@ -42,7 +49,8 @@ def _pymoog_to_spae(result):
             ew_ma  = ln['ew_obs']                                  # mÅ
             logrw  = np.log10(ew_ma * 1e-3 / ln['wave'])
             rows.append((ln['wave'], atom1, ln['ep'], ln['loggf'],
-                         ew_ma, logrw, ln['abund'], ln['delavg']))
+                         ew_ma, logrw, ln['abund'], ln['delavg'],
+                         ln['ew_err'], ln['abund_err']))
         el_found.append(_species_name(atom1))
         abundances.append(np.array(rows, dtype=_RESULT_DTYPE))
 
@@ -85,6 +93,8 @@ def rel_abunds(el_found,abundances,sun_el,sun_abs,el):
         if line['wavelength'] - sun_abunds[k]['wavelength'] == 0:
             rel_abunds = np.append(rel_abunds, line)
             rel_abunds[-1]['abund'] -= sun_abunds[k]['abund']
+            rel_abunds[-1]['abund_err'] = np.sqrt(
+                line['abund_err']**2 + sun_abunds[k]['abund_err']**2)
         else:
             print('Stellar and solar linelists do not match at wavelength ' + str(sun_abunds[k]['wavelength']) + '!')
 
@@ -102,6 +112,17 @@ def abs_abunds(el_found,abundances,el):
     star_abunds = abundances[i]
 
     return star_abunds
+
+
+def _ew_weighted_log_likelihood(abund, abund_err, mean):
+    """Gaussian log-likelihood using each line's own EW-propagated abundance
+    error as sigma, in place of one shared line-to-line-scatter sigma.
+    Lines with a non-positive (unknown) abund_err are excluded rather than
+    dividing by zero.
+    """
+    good = abund_err > 0
+    a, s = abund[good], abund_err[good]
+    return np.sum(-(a - mean)**2 / (2*s**2) - np.log(s))
 
 
 # Scale parameters for EP and REW slope penalties added to the log-likelihood.
@@ -156,13 +177,11 @@ def obj_func(x, n_elems, linelist, sun_el=None, sun_abs=None, include_prior=Fals
         abunds_fe2 = rel_abunds(el_found,abundances,sun_el,sun_abs,'Fe II ')
         fe_mean = feh
 
-    fe_std = np.std(np.append(abunds_fe1['abund'], abunds_fe2['abund']))
-
     ep_slope, ep_intercept, ep_r, ep_p, ep_stderr = linregress(abunds_fe1['EP'], abunds_fe1['abund'])
     rew_slope, rew_intercept, rew_r, rew_p, rew_stderr = linregress(abunds_fe1['logRWin'], abunds_fe1['abund'])
 
-    fe1_likely = np.sum(-(abunds_fe1['abund'] - fe_mean)**2 / (2*fe_std**2)) - np.log(fe_std) * len(abunds_fe1['abund'])
-    fe2_likely = np.sum(-(abunds_fe2['abund'] - fe_mean)**2 / (2*fe_std**2)) - np.log(fe_std) * len(abunds_fe2['abund'])
+    fe1_likely = _ew_weighted_log_likelihood(abunds_fe1['abund'], abunds_fe1['abund_err'], fe_mean)
+    fe2_likely = _ew_weighted_log_likelihood(abunds_fe2['abund'], abunds_fe2['abund_err'], fe_mean)
 
     ln_likelihood = (fe1_likely + fe2_likely
                      - (ep_slope  / ep_slope_scale )**2 / 2

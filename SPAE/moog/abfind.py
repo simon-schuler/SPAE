@@ -20,7 +20,7 @@ from .inlines   import inlines, parse_linelist, apply_parsed_lines
 from .eqlib     import eqlib
 from .nearly    import nearly
 from .fakeline  import fakeline
-from .lineabund import lineabund
+from .lineabund import lineabund, line_abund_err
 from .stats     import stats
 from .eqlib     import _sunder
 
@@ -217,8 +217,10 @@ def abfind(state, parsed_lines=None) -> dict:
                 'ep':      float(state.e[l, 0]),
                 'loggf':   float(np.log10(state.gf[l])),
                 'ew_obs':  float(state.width[l]) * 1000.0,    # mÅ
+                'ew_err':  float(state.width_err[l]) * 1000.0,  # mÅ
                 'ew_calc': float(state.widout[l]) * 1000.0,   # mÅ
                 'abund':   float(state.abundout[l]),
+                'abund_err': line_abund_err(state, l),        # dex, EW-propagated
                 'delavg':  float(state.abundout[l] - sp_stats['average']),
             })
 
