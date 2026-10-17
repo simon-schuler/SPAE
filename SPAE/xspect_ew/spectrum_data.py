@@ -2061,7 +2061,7 @@ class Spectrum_Data():
                 self.lines_exp[i] = np.array(ex_params)
             print('extra params:',ex_params)
 
-    def measure_all_ew(self, exclude_lines= [], plot_lines=[], ex_params = {}, window_size = 1.5, save_all = False, fit_continuum = False, auto_widen = True, widen_window_size = 2.5, slope_sig_thresh = 3.0, slope_min_points = 5, slope_internal_sig_thresh = 3.0, plot_window_size = None):
+    def measure_all_ew(self, exclude_lines= [], plot_lines=[], ex_params = {}, window_size = 1.5, save_all = False, fit_continuum = False, auto_widen = True, widen_window_size = 2.5, slope_sig_thresh = 3.0, slope_min_points = 5, slope_internal_sig_thresh = 3.0, plot_window_size = None, skip_lines = ()):
         """
         Measure every loaded line's EW.
 
@@ -2108,7 +2108,15 @@ class Spectrum_Data():
         continuum.py's edge_ignore_aa and its module docstring for a
         real confirmed case), so this is a real reliability choice, not
         just deduplication for its own sake.
+
+        skip_lines : indices (into self.lines) to leave completely
+            untouched -- not measured, and their existing lines_* values
+            not overwritten. Used by interactive.EWWidget's Save EWs & Quit
+            to fill in every line the user never stepped to, without
+            clobbering the hand-reviewed (slider-adjusted) measurements of
+            the lines they did.
         """
+        skip_lines = set(skip_lines)
         if save_all:
             make_plots_folder()
 
@@ -2119,6 +2127,8 @@ class Spectrum_Data():
 
         for order in range(len(self.wavelength)):
             for i in range(len(self.lines)):
+                if i in skip_lines:
+                    continue
                 if self.lines[i] in exclude_lines:
                     self.lines_ew[i] = 0.0
                     self.lines_gauss_Xsquare[i] = np.nan

@@ -1791,7 +1791,93 @@ Six commits, by topic:
   existing per-pixel correction/exclusion mechanisms (§17.2-17.4) for a
   case too damaged to patch.
 
-## 23. Commit reference
+## 23. Widget: Save EWs & Quit
+
+Stage 4 (Measure EW) gained a **Save EWs & Quit** button that ends an
+interactive session by writing the measured EWs as a MOOG-format
+linelist and closing the window -- previously the widget had no way to
+produce output at all; the caller had to call `make_ew_doc()` on the
+returned widget's `.spec` by hand afterward.
+
+**Layout**: the button takes the persistent Next button's top-right slot (same x/width, raised to y=0.91 from 0.895 for room above the Points toggle)
+(Next is always hidden on the last stage), with an editable **Save as**
+box just left of it. Default name `<spectrum name>_ew.txt` in the
+current working directory, or preset via a new `ew_output=` parameter
+on `ew_interactive()`/`EWWidget`; a bare filename typed into the box
+resolves against that same directory. The line label ("Line N/M: ...")
+moved left (center x=0.53 -> 0.425) to sit in the new gap between Back
+and the Save as label -- at its old position a 3-digit line count would
+have run into that label (worst case measured via `get_window_extent()`:
+0.341-0.509, against Back ending at 0.240 and Save as starting at 0.609).
+
+**Unvisited lines are measured, not dropped.** A line the user never
+stepped to still has `lines_ew == 0`, which `make_ew_doc()` treats as
+"never measured" and silently leaves out. The widget now tracks which
+lines it has successfully measured on screen (`_reviewed_lines`); on
+save, every OTHER line is measured by `measure_all_ew()` -- the same
+automated path a script uses (best-order-by-edge-distance selection
+included) -- via a new `skip_lines=` parameter that leaves the reviewed
+lines' `lines_*` values entirely untouched. So a hand-tuned measurement
+(slider-adjusted continuum shift / bounds) is written exactly as last
+shown on screen, and everything else gets the standard automated
+measurement. Then `make_ew_doc()` writes the main file plus its
+`_flagged`/`_rejected` companions exactly as before (§20), with a
+`doc_title` of the spectrum's file stem; a per-file count summary is
+printed and the written paths are kept on `widget.saved_files`.
+
+**Overwrite guard**: if the output file already exists, the first click
+turns the button soft red ("Overwrite? Click again") instead of
+writing; a second click overwrites. Changing the Save as name resets
+it. (A confirm dialog isn't an option in pure `matplotlib.widgets`.)
+
+**Verified** headlessly on the bundled solar `sunr.fits` + 78-line
+`Sun_fe_sample.txt`: after tuning one line's continuum shift (+0.01;
+EW 46.51 -> 43.66 mA) and rejecting another, save wrote 44 lines to the
+main file, 8 to `_flagged`, 1 to `_rejected`, with 25 unmeasured (all
+outside `sunr.fits`'s 4977-6421 A coverage; 44+8+1+25 = 78); the tuned
+line's 43.66 mA survived the auto-measure pass unchanged; the window
+closed; a second session pointed at the same file stopped at the
+overwrite prompt without touching it; and every written line round-
+trips through `SPAE.moog.inlines._read_fixed()` with its EW error
+intact.
+
+**Page titles** (same session, user request): Normalization, Spectrum
+Shift and Measure EW now each show their stage name as a bold title in
+the Back/Next row (`_STAGE_TITLE_POS`, drawn by `_goto_stage()`).
+Normalization/Spectrum Shift: centered between Back and Next. Measure EW:
+that row also holds the line label and the Save as box, so the title is
+right-aligned at x=0.36 with the line label (now regular weight) running
+on from x=0.375 as one line -- a first attempt stacking the title above
+the label pushed the label into the left panel's own two-line title.
+Worst-case clearance measured: title 0.264-0.360, "Line 999/999: ..."
+0.375-0.528, Save as label from 0.609. Load keeps no title (its info line
+already says what's loaded).
+Styled (`_STAGE_TITLE_STYLE`) to read as distinct from the plain black
+"XSpect-EW: <instrument>" header: dark blue (#1f4e79) bold text in a
+rounded pale-blue box edged in the Raw+Fit/Points toggles' blue
+(#7fb8dc). The box (Measure EW: x 0.259-0.365, y 0.896-0.934) stays
+inside the button row's own height and clear of Back and the line label.
+Then (user request) Measure EW's title and line label were re-laid out
+**centered and stacked**: title centered at x=0.425 (between Back and
+the Save as box), line label centered directly under it at y=0.877. Room
+for the label comes from lowering that stage's two plot panels' top
+edge from 0.85 to 0.81 (`_EW_MAIN_TOP`, via a new `top=` option on
+`_add_main_axes()`/`_main_rect_split()`), with the Points toggle moved
+down to match (y=0.817). Measured: label bottom 0.867 vs the left
+panel's two-line title top 0.852; worst-case label width 0.349-0.501,
+clear of Save as (0.609). Normalization/Spectrum Shift are unchanged.
+Follow-up from live review: centering between Back and Save as (0.425)
+read as off-center on the page, so the title and label moved to x=0.53
+-- the same spot as the other pages' titles (title box 0.477-0.583,
+worst-case label 0.454-0.606, which sits below the Save as row so no
+longer competes with it horizontally). The Points toggle went back to
+its original y=0.857 (user preference) instead of following the
+lowered panels down. The three EW-fit sliders (and Reset with them)
+were raised 0.015 (rows now 0.15/0.11/0.07; Reset 0.07-0.12) -- the top
+row tops out at 0.18, 0.01 below the panels' x-axis labels (bottom
+y=0.19, measured).
+
+## 24. Commit reference
 
 | Commit | Summary |
 |---|---|

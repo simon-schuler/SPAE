@@ -16,6 +16,13 @@ Usage, multiple exposures of the same star (Stage 1 lets you inspect each
 one individually or overlaid, and combine them, before continuing):
     ew_interactive(spectra=['exp1.fits', 'exp2.fits'], linelist='linelist_star.txt')
 
+When you're done reviewing lines, Stage 4's "Save EWs & Quit" button
+writes the MOOG-format linelist (plus its _flagged/_rejected companions,
+see Spectrum_Data.make_ew_doc()) and closes the window. The output name
+can be edited in the box beside it, or preset with ew_output=:
+    ew_interactive('spectrum.fits', linelist='linelist_star.txt',
+                   ew_output='star_ew.txt')
+
 Usage (Jupyter notebook):
     %matplotlib widget
     from SPAE.xspect_ew.interactive import ew_interactive
@@ -51,6 +58,25 @@ _STAGES = ['Load', 'Normalization', 'Spectrum Shift', 'Measure EW']
 # docstring note for why this exists (it's a different failure mode from
 # the self._busy reentrancy guard, and neither alone is sufficient).
 _TRANSITION_DEBOUNCE_SECONDS = 0.5
+# Per-stage page title (figure x, y, ha), drawn by _goto_stage() in the
+# Back/Next row. Stages 1-2: centered between Back (ends x=0.24) and Next
+# (starts x=0.82). Stage 3 (Measure EW): the same x=0.53, so the title
+# sits in the same spot on every page, with the line label centered
+# directly under it (y=0.877, see _build_stage_ew()) -- room for which
+# comes from lowering that stage's plot panels to _EW_MAIN_TOP. Load
+# (stage 0) has no title: its info line already says what's loaded.
+_STAGE_TITLE_POS = {1: (0.53, 0.915, 'center'), 2: (0.53, 0.915, 'center'),
+                    3: (0.53, 0.918, 'center')}
+# Measure EW's two plot panels top out here instead of the default 0.85,
+# so their own titles clear the line label stacked under the page title.
+_EW_MAIN_TOP = 0.81
+# Page titles are set apart from the plain black "XSpect-EW: <instrument>"
+# header by color and a box: dark blue text on a rounded pale-blue panel,
+# edged in the same blue as the Raw+Fit/Points toggles (_NORM_VIEW_COLORS
+# 'raw' hover color, below).
+_STAGE_TITLE_STYLE = dict(fontsize=13, weight='bold', color='#1f4e79',
+                          bbox=dict(boxstyle='round,pad=0.35', facecolor='#e8f1fa',
+                                    edgecolor='#7fb8dc', linewidth=1.2))
 _DEFAULT_BTN_COLOR = '0.85'   # matplotlib Button's own default
 _COMBINE_COLOR = '#c9e8b0'
 _BUSY_COLOR = '#ffd966'
@@ -94,7 +120,7 @@ class EWWidget:
     """
 
     def __init__(self, filename=None, spectrum=None, spectra=None, linelist=None,
-                 KECK_file=True, **reader_kwargs):
+                 KECK_file=True, ew_output=None, **reader_kwargs):
         """
         filename/spectrum : a single exposure (path, or an already-
             constructed Spectrum_Data) -- the common single-exposure case.
@@ -106,6 +132,9 @@ class EWWidget:
             you inspect each exposure individually or overlaid, and
             combine them once you've visually confirmed they line up,
             before continuing to Normalize/RV/EW.
+        ew_output : path for Stage 4's Save EWs & Quit (editable in the
+            widget itself before saving). Default: `<spectrum name>_ew.txt`
+            in the current working directory.
         """
         def _as_spectrum(x):
             if isinstance(x, Spectrum_Data):
@@ -143,6 +172,17 @@ class EWWidget:
         self._view_idx = 0 if self._n_exposures == 1 else 'overlay'
 
         self._linelist_path = linelist
+        if ew_output is None:
+            stem = os.path.splitext(self._exposure_names[0])[0]
+            ew_output = os.path.join(os.getcwd(), f'{stem}_ew.txt')
+        self._ew_output = ew_output
+        # Indices of lines the user has actually viewed in Stage 4 (i.e. a
+        # measure_ew() call for them succeeded with whatever slider settings
+        # were on screen) -- Save EWs & Quit keeps those measurements as-is
+        # and only auto-measures the rest. See _on_save_clicked().
+        self._reviewed_lines = set()
+        # Set by _on_save_clicked(): {'main', 'flagged', 'rejected'} -> path.
+        self.saved_files = None
         if linelist is not None:
             self.spec.load_lines(linelist)
 
@@ -295,9 +335,12 @@ class EWWidget:
         # axes patch -- same class of issue as the header/xlabel ones).
         self._main_rect = (0.08, 0.26, 0.88, 0.59)
 
-    def _main_rect_split(self, n):
-        """n side-by-side axes rects spanning the main region."""
+    def _main_rect_split(self, n, top=None):
+        """n side-by-side axes rects spanning the main region (optionally
+        with a lower top edge than the default -- see _add_main_axes())."""
         left, bottom, width, height = self._main_rect
+        if top is not None:
+            height = top - bottom
         gap = 0.03
         w = (width - gap * (n - 1)) / n
         return [(left + i * (w + gap), bottom, w, height) for i in range(n)]
@@ -324,8 +367,11 @@ class EWWidget:
             ax.remove()
         self._dynamic_axes = []
 
-    def _add_main_axes(self, n=1):
-        rects = self._main_rect_split(n) if n > 1 else [self._main_rect]
+    def _add_main_axes(self, n=1, top=None):
+        """top: override the main region's top edge (default 0.85) for a
+        stage that needs extra header room -- Measure EW, see
+        _EW_MAIN_TOP."""
+        rects = self._main_rect_split(n, top)
         axes = [self._fig.add_axes(list(r)) for r in rects]
         for ax in axes:
             self._connect_view_watch(ax)
@@ -548,6 +594,10 @@ class EWWidget:
             self._build_stage_rv()
         elif stage == 3:
             self._build_stage_ew()
+
+        if stage in _STAGE_TITLE_POS:
+            x, y, ha = _STAGE_TITLE_POS[stage]
+            self._add_text(x, y, _STAGES[stage], ha=ha, va='center', **_STAGE_TITLE_STYLE)
 
         self._fig.canvas.draw_idle()
 
@@ -1312,7 +1362,7 @@ class EWWidget:
                   "wavelength scale yet (visit Step 3, Spectrum Shift, first) -- "
                   "measuring against the unshifted wavelength solution.")
 
-        self._ax_fit, self._ax_data = self._add_main_axes(2)
+        self._ax_fit, self._ax_data = self._add_main_axes(2, top=_EW_MAIN_TOP)
         n = len(self.spec.lines)
 
         ax_prev = self._add_control_axes([0.08, 0.135, 0.16, 0.04])
@@ -1350,11 +1400,12 @@ class EWWidget:
         # which spans x=0.535-0.96 (see _main_rect_split(2)) with its own
         # title -- ALWAYS "Local continuum not estimated (fit_continuum=
         # False)" in this widget (fit_continuum isn't exposed here) --
-        # centered on that panel, rendering at x=0.618-0.877, y=0.857-
-        # 0.873 (measured via get_window_extent(), not guessed). x=0.885
-        # clears its right edge (0.877); the row above (Back/Next/Combine
-        # Spectra) starts at y=0.895, so height is kept small to fit
-        # underneath it.
+        # centered on that panel, rendering at x=0.618-0.877, y=0.817-
+        # 0.833 with the panels lowered to _EW_MAIN_TOP (measured via
+        # get_window_extent(), not guessed). x=0.885 clears its right edge
+        # (0.877). Kept at its original y=0.857 (user preference) rather
+        # than following the lowered panels down -- under the Save EWs &
+        # Quit row (bottom y=0.91).
         ax_ew_view = self._add_control_axes([0.885, 0.857, 0.065, 0.033])
         color, hovercolor = (_NORM_VIEW_COLORS['normalized'] if self._ew_connected
                              else _NORM_VIEW_COLORS['raw'])
@@ -1364,13 +1415,13 @@ class EWWidget:
         self._btn_ew_connected.label.set_fontsize(8)
         self._btn_ew_connected.on_clicked(lambda _e: self._toggle_ew_connected())
 
-        # At the top of the window, alongside the persistent header --
-        # bold, but smaller than the "XSpect-EW: <instrument>" text
-        # (fontsize=13, see _build_figure()) so it still reads as
-        # secondary to it. Centered in the gap between Back (ends x=0.24)
-        # and Next/Combine Spectra (starts x=0.82).
-        self._line_label = self._add_text(0.53, 0.915, '', fontsize=11,
-                                           weight='bold', ha='center', va='center')
+        # Centered directly under the page title ("Measure EW", see
+        # _STAGE_TITLE_POS); regular weight and smaller than the bold title
+        # so it reads as secondary to it. Sits below the Save as row
+        # (y=0.91+), so only the left panel's title (x<=0.42) and the
+        # Points toggle (x>=0.885) are horizontal neighbors.
+        self._line_label = self._add_text(0.53, 0.877, '', fontsize=11,
+                                           ha='center', va='center')
 
         # These sliders hold small +/-A NUDGES -- _remeasure_ew() converts
         # the bound ones into the ABSOLUTE wavelengths (offset from this
@@ -1399,7 +1450,10 @@ class EWWidget:
             # roughly its own rendered width; the longest ("right bound
             # (Å)") needs about that much clearance to stay clear of the
             # Next Line button ending at x=0.42 (confirmed via audit).
-            ax_s = self._add_control_axes([0.55, 0.135 - k * 0.04, 0.30, 0.03])
+            # Raised 0.015 from Next Line's row (0.135) on user request --
+            # top row now 0.15-0.18, still 0.01 below the panels' x-axis
+            # label (bottom y=0.19, measured).
+            ax_s = self._add_control_axes([0.55, 0.15 - k * 0.04, 0.30, 0.03])
             sl = self._track(Slider(ax_s, lab, lo, hi, valinit=0.0))
             # No longer hidden -- that was ONLY because these sliders used
             # to sit side by side (the readout of one bled onto the NEXT
@@ -1411,12 +1465,105 @@ class EWWidget:
 
         # (was previously placed at x > 1.0, off the right edge of the
         # figure -- fixed alongside the pager-button relabeling above)
-        ax_reset = self._add_control_axes([0.90, 0.055, 0.06, 0.05])
+        ax_reset = self._add_control_axes([0.90, 0.07, 0.06, 0.05])  # follows the sliders up
         self._btn_ex_reset = self._track(Button(ax_reset, 'Reset'))
         self._btn_ex_reset.on_clicked(lambda _e: self._reset_ex_params())
 
+        # Save EWs & Quit takes the persistent Next button's top-right slot
+        # (same x/width -- Next is always hidden on this, the last stage,
+        # see _goto_stage()), with the editable output path just left of
+        # it. Raised slightly (y=0.91, not Next's 0.895) for breathing room
+        # above the Points/Connected toggle (top 0.89) -- the header title
+        # it now shares a band with ends well to the left (x~0.6).
+        # Green like Next: it's this stage's "go"/finish action.
+        ax_out = self._add_control_axes([0.655, 0.91, 0.155, 0.04])
+        self._tb_ew_output = self._track(TextBox(ax_out, 'Save as: ',
+                                                  initial=os.path.basename(self._ew_output)))
+        self._tb_ew_output.label.set_fontsize(9)
+        self._tb_ew_output.on_submit(self._on_ew_output_submit)
+        ax_save = self._add_control_axes([0.82, 0.91, 0.14, 0.04])
+        self._btn_save = self._track(Button(ax_save, 'Save EWs & Quit',
+                                             color=_COMBINE_COLOR, hovercolor='#a8d98a'))
+        self._btn_save.on_clicked(lambda _e: self._on_save_clicked())
+        # True after a first click found the output file already exists --
+        # the NEXT click overwrites (this viewer can't pop up a confirm
+        # dialog). Cleared whenever the output name changes.
+        self._confirm_overwrite = False
+
         self._build_zoom_strip(lambda: [self._ax_fit, self._ax_data])
         self._remeasure_ew()
+
+    def _on_ew_output_submit(self, text):
+        text = os.path.expanduser(text.strip())
+        if not text:
+            return
+        if not os.path.isabs(text):
+            text = os.path.join(os.path.dirname(self._ew_output) or os.getcwd(), text)
+        self._ew_output = text
+        self._set_save_button('Save EWs & Quit', _COMBINE_COLOR, '#a8d98a')
+        self._confirm_overwrite = False
+
+    def _set_save_button(self, label, color, hovercolor):
+        self._btn_save.label.set_text(label)
+        self._btn_save.color = color
+        self._btn_save.hovercolor = hovercolor
+        self._btn_save.ax.set_facecolor(color)
+        self._fig.canvas.draw_idle()
+
+    def _on_save_clicked(self):
+        """Fill in every line the user never stepped to, write the
+        MOOG-format linelist via make_ew_doc(), and close the window.
+
+        Lines already viewed in this stage (self._reviewed_lines) keep the
+        measurement shown on screen, slider adjustments included; every
+        other line is measured by measure_all_ew(skip_lines=...) -- the
+        same automated path a script would use -- rather than left at
+        EW=0, which make_ew_doc() would silently drop as never measured.
+        """
+        if self._busy or self._too_soon_after_transition():
+            return
+        # Pick up a typed-but-not-Entered name too.
+        self._on_ew_output_submit(self._tb_ew_output.text)
+        path = self._ew_output
+        if os.path.exists(path) and not self._confirm_overwrite:
+            self._confirm_overwrite = True
+            self._set_save_button('Overwrite? Click again', *_ACCEPT_REJECT_COLORS[False])
+            print(f'{path} already exists -- click Save EWs & Quit again to overwrite it, '
+                  f'or change the name in the Save as box.')
+            return
+
+        self._busy = True
+        self._btn_save.label.set_text('Saving...')
+        self._flash_busy(self._btn_save)
+        spec = self.spec
+        try:
+            n_auto = len(spec.lines) - len(self._reviewed_lines)
+            if n_auto > 0:
+                print(f'Auto-measuring {n_auto} line(s) not reviewed in the widget...')
+                spec.measure_all_ew(skip_lines=self._reviewed_lines)
+            stem = os.path.splitext(self._exposure_names[0])[0]
+            spec.make_ew_doc(path, doc_title=f'{stem}; ')
+        except Exception as exc:
+            self._busy = False
+            self._confirm_overwrite = False
+            self._set_save_button('Save failed -- retry', *_ACCEPT_REJECT_COLORS[False])
+            print(f'Save EWs & Quit failed: {exc!r}')
+            raise
+
+        base, ext = path.rsplit('.', 1) if '.' in os.path.basename(path) else (path, None)
+        sibling = (lambda tag: f'{base}_{tag}.{ext}') if ext else (lambda tag: f'{path}_{tag}')
+        self.saved_files = {'main': path, 'flagged': sibling('flagged'),
+                            'rejected': sibling('rejected')}
+        measured = np.asarray(spec.lines_ew) != 0.0
+        rejected = measured & np.asarray(spec.lines_human_reject, dtype=bool)
+        flagged = measured & ~rejected & np.asarray(spec.lines_check_flag, dtype=bool)
+        n_main = int(measured.sum() - rejected.sum() - flagged.sum())
+        print(f'Wrote {n_main} line(s) to {path}')
+        print(f'  {int(flagged.sum())} flagged -> {self.saved_files["flagged"]}')
+        print(f'  {int(rejected.sum())} rejected -> {self.saved_files["rejected"]}')
+        print(f'  {int((~measured).sum())} not measured (no order covers them, or the fit failed)')
+        self._busy = False
+        plt.close(self._fig)
 
     def _step_line(self, delta):
         self._line_idx = (self._line_idx + delta) % len(self.spec.lines)
@@ -1519,6 +1666,7 @@ class EWWidget:
         try:
             self.spec.measure_ew(self._line_idx, order, ex_params=ex_params,
                                   axes=(self._ax_fit, self._ax_data))
+            self._reviewed_lines.add(self._line_idx)
             # measure_ew() -> plot_ew_fit() does its own fit_view.clear()/
             # data_view.clear() internally (plotting.py), which just as
             # much wipes the callback registry as our own ax.clear() calls
@@ -1553,7 +1701,7 @@ class EWWidget:
 
 
 def ew_interactive(filename=None, spectrum=None, spectra=None, linelist=None,
-                    KECK_file=True, **reader_kwargs):
+                    KECK_file=True, ew_output=None, **reader_kwargs):
     """
     Launch the interactive xspect-ew widget. Returns the EWWidget instance --
     keep a reference to it (e.g. `w = ew_interactive(...)`), since letting it
@@ -1566,4 +1714,5 @@ def ew_interactive(filename=None, spectrum=None, spectra=None, linelist=None,
     filename=/spectrum= for the single-exposure case.
     """
     return EWWidget(filename=filename, spectrum=spectrum, spectra=spectra,
-                     linelist=linelist, KECK_file=KECK_file, **reader_kwargs)
+                     linelist=linelist, KECK_file=KECK_file, ew_output=ew_output,
+                     **reader_kwargs)
