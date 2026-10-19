@@ -1901,3 +1901,4 @@ y=0.19, measured).
 | `8127d40` | Merge `abundance_errors`; fix `format_moog_ew_line()`'s column layout (§21) |
 | `27db334`/`c563fcf`/`9e07909`/`d9de5d1`/`a18b457`/`079c2a4` (collaborator, on `ghost-sb2-combine`) | GHOST reader; `combine_epochs()`; COG crash fix; combiner fixes (§22) |
 | `3d560b4` | Merge `ghost-sb2-combine`, clean merge (§22) |
+| `7db9a42` | Save EWs & Quit button; stage page titles and Measure EW layout (§23) |
