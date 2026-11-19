@@ -539,7 +539,8 @@ def run_mcmc_stage(directory, target_common_path, solar_common_path):
             trace_fig.savefig(trace_path, dpi=150)
             print(f'saved {trace_path}')
 
-            analyze_mcmc_stage(directory, target_common_path, sun_el, sun_abs, sampler)
+            analyze_mcmc_stage(directory, target_common_path, sun_el, sun_abs, sampler,
+                                burn_in=BURN_IN, a_frac=A_FRAC)
         finally:
             sys.stdout, sys.stderr = stdout_orig, stderr_orig
     print(f'MCMC fit log: {mcmc_log_path}')
@@ -547,6 +548,7 @@ def run_mcmc_stage(directory, target_common_path, solar_common_path):
 
 
 def main():
+    global N_WALKERS, N_STEPS, BURN_IN, A_FRAC
     parser = argparse.ArgumentParser(description=__doc__,
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('spectrum', nargs='+',
@@ -558,7 +560,28 @@ def main():
                               'for the differential abundance reference. Defaults to the '
                               'bundled SPAE/xspect_ew/data/spectra_sample/Solar/ (all three '
                               'files) if omitted.')
+    parser.add_argument('--n-walkers', type=int, default=None,
+                         help=f'Override N_WALKERS (default {N_WALKERS}); mainly for smoke tests.')
+    parser.add_argument('--n-steps', type=int, default=None,
+                         help=f'Override N_STEPS (default {N_STEPS}); mainly for smoke tests.')
+    parser.add_argument('--burn-in', type=int, default=None,
+                         help=f'Override BURN_IN (default {BURN_IN}); must be < --n-steps.')
+    parser.add_argument('--a-frac', type=float, default=None,
+                         help=f'Override A_FRAC (default {A_FRAC}).')
     args = parser.parse_args()
+
+    # Module-level CONFIG values are read by run_mcmc_stage()/analyze_mcmc_stage(),
+    # so overrides are applied by rebinding them here.
+    if args.n_walkers is not None:
+        N_WALKERS = args.n_walkers
+    if args.n_steps is not None:
+        N_STEPS = args.n_steps
+    if args.burn_in is not None:
+        BURN_IN = args.burn_in
+    if args.a_frac is not None:
+        A_FRAC = args.a_frac
+    if BURN_IN >= N_STEPS:
+        parser.error(f'--burn-in ({BURN_IN}) must be less than --n-steps ({N_STEPS})')
 
     target_paths = [os.path.abspath(p) for p in args.spectrum]
     directories = {os.path.dirname(p) for p in target_paths}
